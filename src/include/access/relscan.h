@@ -48,6 +48,12 @@ typedef struct TableScanDescData
 } TableScanDescData;
 typedef struct TableScanDescData *TableScanDesc;
 
+/* @interma
+各个worker之间是通过共享内存来通信的：
+一般都是分为2部分：shm中的共享对象（ParallelTableScanDescData，DSM动态共享内存机制分配）
+和本地worker的对象（ParallelBlockTableScanDescData）
+*/
+
 /*
  * Shared state for parallel table scan.
  *

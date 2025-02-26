@@ -448,6 +448,12 @@ table_block_parallelscan_nextpage(Relation rel, ParallelBlockTableScanDesc pbsca
 	BlockNumber page;
 	uint64		nallocated;
 
+	/* @interma
+	通过原子操作获取下一个要扫描的块号
+	pg14中是分配一批连续的块号（称为chunk）给每个worker
+	从而保证每个worker都能收益于os prefech
+	*/
+
 	/*
 	 * phs_nallocated tracks how many pages have been allocated to workers
 	 * already.  When phs_nallocated >= rs_nblocks, all blocks have been
