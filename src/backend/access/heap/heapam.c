@@ -1487,7 +1487,7 @@ heap_fetch_extended(Relation relation,
 	if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		ReleaseBuffer(buffer);
+		ReleaseBuffer(buffer);	// @interma pin就是refcount，放在buf_desc->state中
 		*userbuf = InvalidBuffer;
 		tuple->t_data = NULL;
 		return false;

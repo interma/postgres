@@ -179,6 +179,7 @@ ExecScan(ScanState *node,
 	 */
 	if (!qual && !projInfo)
 	{
+		// @interma 没有qualification和projection，直接返回scan tuple
 		ResetExprContext(econtext);
 		return ExecScanFetch(node, accessMtd, recheckMtd);
 	}
@@ -195,6 +196,8 @@ ExecScan(ScanState *node,
 	 */
 	for (;;)
 	{
+		// @interma 因为需要判断quliafication，所以需要放到循环中
+		
 		TupleTableSlot *slot;
 
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
