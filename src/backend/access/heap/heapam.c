@@ -1044,7 +1044,12 @@ continue_page:
  * ----------------------------------------------------------------
  */
 
+/**
+begin scan的核心就是创建一个TableScanDesc 
 
+note: nkeys一般针对索引扫描才设置；对于顺序扫描，nkeys为0
+	因为过滤条件放到获取slot后的过滤函数中ExecQual()
+ */
 TableScanDesc
 heap_beginscan(Relation relation, Snapshot snapshot,
 			   int nkeys, ScanKey key,
@@ -1159,6 +1164,80 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	return (TableScanDesc) scan;
 }
 
+/**
+在 PostgreSQL 中，`heap_rescan` 函数用于重新初始化表扫描（table scan），
+以便在现有的扫描上下文中重新开始扫描操作，而无需关闭并重新打开扫描。
+
+调用 `rescan` 的场景通常出现在以下几种情况下：
+---
+
+### 1. **嵌套循环连接（Nested Loop Join）**
+在嵌套循环连接中，外部表的每一行都会触发对内部表的重新扫描。例如：
+
+```sql
+SELECT * 
+FROM outer_table o
+JOIN inner_table i
+ON o.id = i.id;
+```
+
+在这种情况下，每次处理外部表的一行时，内部表需要重新扫描以匹配当前的外部行。这时会调用 `rescan` 来重置内部表的扫描状态。
+
+---
+
+### 2. **重复使用扫描节点**
+在查询计划中，如果某个扫描节点需要被多次使用（例如在某些子查询或递归查询中），则会调用 `rescan` 来重置扫描状态。例如：
+
+```sql
+SELECT * 
+FROM (SELECT * FROM table WHERE column = 1) subquery
+WHERE subquery.column > 10;
+```
+
+在这种情况下，子查询的扫描可能会被多次使用，每次使用前需要调用 `rescan`。
+
+---
+
+### 3. **参数化查询**
+当查询计划中包含参数化路径（Parameterized Path）时，扫描节点可能需要根据不同的参数值重新扫描。例如：
+
+```sql
+SELECT * 
+FROM table
+WHERE column = $1;
+```
+
+在这种情况下，每次参数 `$1` 的值发生变化时，都会调用 `rescan` 来重新初始化扫描。
+
+---
+
+### 4. **游标（Cursor）操作**
+在使用游标时，可能需要重新扫描表。例如，当游标被重新定位到起始位置时，可能会调用 `rescan` 来重置扫描状态。
+
+```sql
+DECLARE my_cursor CURSOR FOR SELECT * FROM table;
+FETCH ALL FROM my_cursor;
+MOVE BACKWARD ALL IN my_cursor;
+FETCH ALL FROM my_cursor; -- 此时可能触发 rescan
+```
+
+---
+
+### 5. **查询计划的动态调整**
+在某些复杂查询中，查询计划可能会动态调整。例如，在某些情况下，查询优化器可能会决定重新扫描某个表以获取最新的数据或重新评估条件。
+
+---
+
+### 6. **并行扫描中的重新分配**
+在并行扫描中，如果需要重新分配扫描任务（例如由于工作线程的状态变化），可能会调用 `rescan` 来重新初始化扫描。
+
+---
+
+### 总结
+`rescan` 的调用场景主要集中在需要重新初始化扫描状态的情况下，
+例如嵌套循环连接、重复使用扫描节点、参数化查询、游标操作以及并行扫描等。
+通过调用 `rescan`，可以避免重新创建扫描上下文，从而提高性能并减少资源消耗。
+ */
 void
 heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 			bool allow_strat, bool allow_sync, bool allow_pagemode)
@@ -1535,6 +1614,7 @@ heap_fetch(Relation relation,
 	/*
 	 * Fetch and pin the appropriate page of the relation.
 	 */
+	// pin就是refcount，放在buf_desc->state中
 	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
 
 	/*

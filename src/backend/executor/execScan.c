@@ -176,6 +176,7 @@ ExecScan(ScanState *node,
 	 */
 	if (!qual && !projInfo)
 	{
+		// 没有qualification和projection，直接返回scan tuple
 		ResetExprContext(econtext);
 		return ExecScanFetch(node, accessMtd, recheckMtd);
 	}
@@ -192,6 +193,7 @@ ExecScan(ScanState *node,
 	 */
 	for (;;)
 	{
+		// 因为需要判断quliafication，所以需要放到循环中
 		TupleTableSlot *slot;
 
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
@@ -222,6 +224,7 @@ ExecScan(ScanState *node,
 		 * when the qual is null ... saves only a few cycles, but they add up
 		 * ...
 		 */
+		// execQual()用于判断tuple是否满足qual
 		if (qual == NULL || ExecQual(qual, econtext))
 		{
 			/*

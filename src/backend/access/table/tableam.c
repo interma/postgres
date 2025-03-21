@@ -496,6 +496,11 @@ table_block_parallelscan_nextpage(Relation rel,
 	BlockNumber page;
 	uint64		nallocated;
 
+	/**
+	分配一批连续的块号（称为chunk）给每个worker，
+	从而保证每个worker都能收益于os prefech
+	 */
+
 	/*
 	 * The logic below allocates block numbers out to parallel workers in a
 	 * way that each worker will receive a set of consecutive block numbers to
