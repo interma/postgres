@@ -270,7 +270,13 @@ SystemAttributeByName(const char *attname)
  *				XXX END OF UGLY HARD CODED BADNESS XXX
  * ---------------------------------------------------------------- */
 
+/**
+总结
+ - heap_create_with_catalog 是一个高层次的函数，负责创建一个完整的、带有系统目录条目的关系。它会调用 heap_create 来完成物理存储的创建，并在系统目录中注册元数据。
+ - heap_create 是一个底层函数，专注于创建关系的物理存储，不涉及系统目录的操作。
 
+(这里的系统目录指的就是catalog那些系统表)
+ */
 /* ----------------------------------------------------------------
  *		heap_create		- Create an uncataloged heap relation
  *

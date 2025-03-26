@@ -1093,6 +1093,11 @@ ExecInsert(ModifyTableContext *context,
 			 */
 			specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
 
+			/**
+				推测性插入通常用于实现 INSERT ... ON CONFLICT 的逻辑。
+				在这种情况下，系统需要先尝试插入元组，然后检查是否存在冲突（例如违反唯一性约束）。
+				如果没有冲突，插入操作会被确认；如果有冲突，系统可以选择更新现有元组或放弃插入。
+			 */
 			/* insert the tuple, with the speculative token */
 			table_tuple_insert_speculative(resultRelationDesc, slot,
 										   estate->es_output_cid,

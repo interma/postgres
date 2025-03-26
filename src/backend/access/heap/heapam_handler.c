@@ -356,6 +356,11 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	return result;
 }
 
+/**
+	加行锁（LockTupleMode 4类），场景
+	- 更新或删除操作： 在执行 UPDATE 或 DELETE 操作时，需要对目标行加锁，以防止其他事务同时修改或删除该行。
+	- 显式行锁： 当用户通过 SELECT ... FOR UPDATE 或 SELECT ... FOR SHARE 等语句显式请求行锁时，底层会调用类似 heapam_tuple_lock 的函数来实现加锁。
+ */
 static TM_Result
 heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 				  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,

@@ -2759,6 +2759,67 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
 	return false;
 }
 
+/**
+关于crosscheck参数：
+经常用Estate结构中的来填入
+	Snapshot	es_crosscheck_snapshot; // crosscheck time qual for RI
+注释中的 RI 是 Referential Integrity（引用完整性）的缩写
+
+在 PostgreSQL 的 `heap_delete` 函数中，`crosscheck` 参数是一个可选的快照（`Snapshot`），用于在删除元组时执行额外的可见性检查。它的主要作用是确保删除操作符合某些特定的约束条件，通常与外键约束或其他复杂的事务逻辑相关。
+
+---
+
+### 1. **`crosscheck` 参数的作用**
+`crosscheck` 参数的主要功能是提供一个额外的快照，用于验证元组是否在该快照中可见。
+如果元组在 `crosscheck` 快照中不可见，则删除操作会被拒绝，并返回 `TM_Updated` 状态。这种机制通常用于确保事务一致性，避免删除操作破坏其他事务的逻辑。
+
+---
+
+### 2. **典型使用场景**
+#### **(1) 外键约束的级联删除**
+在外键约束的级联删除（`ON DELETE CASCADE`）中，`crosscheck` 参数可以用来确保引用的父表元组在删除时仍然符合外键约束的可见性规则。例如：
+- 当删除父表中的一行时，子表中的引用行可能需要被级联删除。
+- 在这种情况下，`crosscheck` 快照可以用来验证父表的元组是否仍然符合外键约束的可见性要求。
+
+#### **(2) 事务隔离级别的验证**
+在某些事务隔离级别（如可重复读或序列化）下，`crosscheck` 参数可以确保删除操作不会破坏其他事务的视图。例如：
+- 如果另一个事务已经修改了目标元组，使其在 `crosscheck` 快照中不可见，则当前事务的删除操作会被拒绝。
+
+#### **(3) 复杂的业务逻辑**
+在某些复杂的业务逻辑中，`crosscheck` 参数可以用来确保删除操作符合特定的业务规则。例如：
+- 在多表联动操作中，`crosscheck` 快照可以用来验证元组是否符合某些特定的条件。
+
+---
+
+### 3. **`crosscheck` 的工作机制**
+在 `heap_delete` 函数中，当 `crosscheck` 参数不为 `InvalidSnapshot` 时，会对目标元组执行额外的可见性检查：
+- 调用 `HeapTupleSatisfiesVisibility` 函数，使用 `crosscheck` 快照验证元组的可见性。
+- 如果元组在 `crosscheck` 快照中不可见，则删除操作会返回 `TM_Updated` 状态，表示元组已被其他事务更新或删除。
+
+代码片段如下：
+```c
+if (crosscheck != InvalidSnapshot && result == TM_Ok)
+{
+    if (!HeapTupleSatisfiesVisibility(&tp, crosscheck, buffer))
+        result = TM_Updated;
+}
+```
+
+---
+
+### 4. **返回值的处理**
+如果 `crosscheck` 检查失败，`heap_delete` 函数会返回 `TM_Updated`，并填充 `TM_FailureData` 结构体，提供有关失败的详细信息：
+- **`ctid`**: 指向元组的链式更新目标。
+- **`xmax`**: 表示删除元组的事务 ID。
+- **`cmax`**: 表示最后修改元组的命令 ID（仅在 `TM_SelfModified` 情况下可用）。
+
+调用者可以根据返回值和失败数据决定如何处理，例如重试操作或回滚事务。
+
+---
+
+### 5. **总结**
+`crosscheck` 参数在 `heap_delete` 中提供了一种灵活的机制，用于在删除元组时执行额外的可见性检查。它的典型应用场景包括外键约束的级联删除、事务隔离级别的验证以及复杂的业务逻辑。通过结合 `crosscheck` 快照，PostgreSQL 能够确保删除操作的正确性和一致性，同时避免破坏其他事务的逻辑。
+ */
 /*
  *	heap_delete - delete a tuple
  *

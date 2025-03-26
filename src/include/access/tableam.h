@@ -72,6 +72,10 @@ typedef enum ScanOptions
 	SO_NEED_TUPLES = 1 << 10,
 }			ScanOptions;
 
+/**
+	Result codes for table_{update,delete,lock_tuple}
+	update/delete/lock，它们都很相似，都需要考虑到时间上的绝对因素
+ */
 /*
  * Result codes for table_{update,delete,lock_tuple}, and for visibility
  * routines inside table AMs.
@@ -1276,6 +1280,10 @@ extern bool table_index_fetch_tuple_check(Relation rel,
  */
 
 
+/**
+	根据指定的 tid（元组标识符）从表中获取元组，并将其存储到 slot（元组槽）中
+	一般在modifytable（update操作）中被调用
+ */
 /*
  * Fetch tuple at `tid` into `slot`, after doing a visibility test according to
  * `snapshot`. If a tuple was found and passed the visibility test, returns
@@ -1440,6 +1448,12 @@ table_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 												succeeded);
 }
 
+
+/**
+	该函数的主要功能是将多个元组批量插入到指定的表中。
+	通过批量操作，它能够减少对同一页面的多次锁定和解锁操作，同时将多个插入操作的日志（WAL，Write-Ahead Logging）合并为一条记录。
+	这种优化显著提高了插入性能，特别是在需要插入大量数据的场景下(如copy，临时表等)。
+ */
 /*
  * Insert multiple tuples into a table.
  *
