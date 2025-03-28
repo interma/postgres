@@ -1644,6 +1644,11 @@ table_relation_set_new_filelocator(Relation rel,
 												  minmulti);
 }
 
+/**
+table_relation_nontransactional_truncate 是一个静态内联函数，用于以非事务性的方式清空指定表（rel）的所有内容。
+非事务性操作意味着该函数不支持回滚，因此一旦执行，操作的效果将是不可逆的。
+这种设计通常用于特定场景，例如在当前事务中创建的临时存储对象的截断操作。
+ */
 /*
  * Remove all table contents from `rel`, in a non-transactional manner.
  * Non-transactional meaning that there's no need to support rollbacks. This

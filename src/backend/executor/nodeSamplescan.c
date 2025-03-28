@@ -12,6 +12,23 @@
  *
  *-------------------------------------------------------------------------
  */
+
+/**
+Sample Scan 是 PostgreSQL 中用于表采样的功能，通过 TABLESAMPLE 子句实现。
+它允许用户从表中随机抽取部分数据，适用于统计分析、查询优化和测试等场景。
+在 PostgreSQL 的实现中，nodeSamplescan.c 文件定义了 Sample Scan 的核心逻辑，包括初始化、采样和资源释放等操作。
+通过支持多种采样方法和参数，Sample Scan 提供了灵活且高效的数据采样能力
+
+ubuntu=# select * from bar TABLESAMPLE BERNOULLI (20);
+ a
+---
+ 1
+ 7
+ 9
+(3 rows)
+
+*/
+
 #include "postgres.h"
 
 #include "access/relscan.h"

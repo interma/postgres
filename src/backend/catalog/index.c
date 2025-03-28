@@ -3221,7 +3221,11 @@ IndexCheckExclusion(Relation heapRelation,
 	indexInfo->ii_PredicateState = NULL;
 }
 
-
+/**
+validate_index 是 PostgreSQL 中用于支持并发索引构建的核心函数之一。
+并发索引构建允许在*不阻塞表的插入、更新和删除操作的情况下*创建索引，从而提高系统的可用性和并发性能。
+该函数的主要任务是验证索引的完整性(通过两次表扫描)，确保所有符合条件的元组都被正确地索引。
+ */
 /*
  * validate_index - support code for concurrent index builds
  *
