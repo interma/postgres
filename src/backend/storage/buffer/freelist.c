@@ -180,6 +180,13 @@ have_free_buffer(void)
 		return false;
 }
 
+/**
+StrategyGetBuffer 是 PostgreSQL 缓冲区管理器（Buffer Manager）中的一个核心函数，
+用于为 BufferAlloc() 提供下一个候选缓冲区。
+
+其主要目标是找到一个未被任何进程固定（pinned）的缓冲区，以便可以安全地分配给新的请求。
+该函数实现了多种策略来选择缓冲区，包括从自由列表（freelist）中获取缓冲区和使用时钟算法（Clock Sweep Algorithm）扫描缓冲区。
+ */
 /*
  * StrategyGetBuffer
  *

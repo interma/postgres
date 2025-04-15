@@ -327,6 +327,11 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	else
 		scan->rs_nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
 
+	/**
+		这段代码是 PostgreSQL 中用于优化表扫描的逻辑，
+		特别是针对大表的顺序扫描（sequential scan）。
+		它通过判断表的大小和相关标志位，决定是否启用批量读取（bulk-read）访问策略和同步扫描（synchronized scanning），以提高扫描性能。
+	 */
 	/*
 	 * If the table is large relative to NBuffers, use a bulk-read access
 	 * strategy and enable synchronized scanning (see syncscan.c).  Although

@@ -30,6 +30,13 @@ typedef enum NodeTag
 #include "nodes/nodetags.h"
 } NodeTag;
 
+/**
+这段代码和注释定义了一个宏 pg_node_attr，用于在 PostgreSQL 的节点（node）定义中添加额外的元信息。
+这些元信息主要由 gen_node_support.pl 脚本使用，用于生成与节点相关的支持代码，
+例如复制、比较、序列化和反序列化等功能。通过这些属性，开发者可以灵活地控制节点及其字段的行为。
+
+NB: gp7中还没有实现这个宏
+ */
 /*
  * pg_node_attr() - Used in node definitions to set extra information for
  * gen_node_support.pl

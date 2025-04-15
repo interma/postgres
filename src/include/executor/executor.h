@@ -386,6 +386,8 @@ ExecProject(ProjectionInfo *projInfo)
 	 */
 	ExecClearTuple(slot);
 
+	// 虽然 ExecEvalExprSwitchContext 的返回值被丢弃，
+	// 但表达式的执行过程会将所有列的结果存储到 ExprState 的 resultslot 中
 	/* Run the expression, discarding scalar result from the last column. */
 	(void) ExecEvalExprSwitchContext(state, econtext, &isnull);
 
