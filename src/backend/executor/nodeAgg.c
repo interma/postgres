@@ -330,6 +330,7 @@
  */
 typedef struct HashAggSpill
 {
+	// npartitions: 表示分区的数量。溢出的数据被划分为多个分区，每个分区对应一个磁盘文件。
 	int			npartitions;	/* number of partitions */
 	LogicalTape **partitions;	/* spill partition tapes */
 	int64	   *ntuples;		/* number of tuples in each partition */
@@ -2141,6 +2142,21 @@ lookup_hash_entries(AggState *aggstate)
 	}
 }
 
+/**
+ExecAgg 的主要职责是根据聚合策略处理输入数据并生成聚合结果：
+- 分组聚合: 如果查询包含分组键（如 GROUP BY），函数会为每个分组生成一个结果元组。
+- 全局聚合: 如果查询没有分组键，函数会对整个输入数据生成一个结果元组。
+
+NB: 无论是哪种聚合方式，聚合结果都会存储在表达式上下文中，
+以便后续调用 ExecProject生成最终的输出元组并存储到slot中。
+
+#0  ExecProject (projInfo=0xb9bc3e38c9d0) at ../../../src/include/executor/executor.h:363
+#1  0x0000b9bc2b0dc79c in project_aggregates (aggstate=aggstate@entry=0xb9bc3e38bbe0) at nodeAgg.c:1385
+#2  0x0000b9bc2b0de5f8 in agg_retrieve_hash_table_in_memory (aggstate=aggstate@entry=0xb9bc3e38bbe0) at nodeAgg.c:2878
+#3  0x0000b9bc2b0dfdd0 in agg_retrieve_hash_table (aggstate=aggstate@entry=0xb9bc3e38bbe0) at nodeAgg.c:2752
+#4  0x0000b9bc2b0e02dc in ExecAgg (pstate=<optimized out>) at nodeAgg.c:2175
+
+ */
 /*
  * ExecAgg -
  *
@@ -2170,7 +2186,12 @@ ExecAgg(PlanState *pstate)
 			case AGG_HASHED:
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
+
 				/* FALLTHROUGH */
+/**
+AGG_MIXED: 混合聚合策略，同时使用排序和哈希表。
+这种策略通常在输入数据的特性较复杂时使用，例如部分数据适合排序聚合，而另一部分数据适合哈希聚合。
+ */
 			case AGG_MIXED:
 				result = agg_retrieve_hash_table(node);
 				break;
@@ -2180,6 +2201,7 @@ ExecAgg(PlanState *pstate)
 				break;
 		}
 
+		// 通过slot每次返回一个Agg结果元组(TTSVirtual类型)：如TPCHQ1那就是4个结果元组
 		if (!TupIsNull(result))
 			return result;
 	}
@@ -2533,6 +2555,12 @@ agg_retrieve_direct(AggState *aggstate)
 	return NULL;
 }
 
+/**
+它从外部计划节点获取输入元组，将这些元组插入哈希表中，并对聚合函数进行更新。
+最终，它标记哈希表已填充完毕，并初始化哈希表的迭代器以供后续操作。
+
+代码设计注重内存管理（通过上下文重置）和性能优化（通过哈希表操作和溢出处理）
+ */
 /*
  * ExecAgg for hashed case: read input and build hash table
  */
@@ -2763,6 +2791,11 @@ agg_retrieve_hash_table(AggState *aggstate)
 	return result;
 }
 
+/**
+这段代码实现了 agg_retrieve_hash_table 函数，用于从哈希表中检索聚合组（groups）。
+它是哈希聚合（hashed aggregation）执行过程中的关键部分，
+负责*逐步*返回聚合结果，直到所有内存中的和溢出到磁盘的元组都被处理完毕.
+ */
 /*
  * Retrieve the groups from the in-memory hash tables without considering any
  * spilled tuples.
@@ -2787,6 +2820,11 @@ agg_retrieve_hash_table_in_memory(AggState *aggstate)
 	peragg = aggstate->peragg;
 	firstSlot = aggstate->ss.ss_ScanTupleSlot;
 
+	/**
+		aggstate->current_set: 表示当前正在处理的分组集的索引。
+		分组集是 SQL 查询中 GROUP BY 子句的扩展形式，所以这个函数是带着状态的。
+		应该是通过select_current_set函数设置的。
+	 */
 	/*
 	 * Note that perhash (and therefore anything accessed through it) can
 	 * change inside the loop, as we change between grouping sets.

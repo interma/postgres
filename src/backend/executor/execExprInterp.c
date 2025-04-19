@@ -1738,6 +1738,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 		EEO_CASE(EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL)
 		{
+/**
+aggstate 是聚合操作的全局状态，包含所有聚合相关的信息。
+pertrans 表示当前聚合函数的转换状态定义，包括是否按值传递（transtypeByVal）。
+pergroup 是当前组的聚合状态，存储每组的中间结果。
+ */
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =

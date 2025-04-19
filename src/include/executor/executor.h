@@ -343,6 +343,10 @@ ExecEvalExpr(ExprState *state,
  *
  * Same as ExecEvalExpr, but get into the right allocation context explicitly.
  */
+/**
+	ExprState *state: 表示要评估的表达式状态，包含表达式的执行计划和相关元信息。
+	ExprContext *econtext: 提供表达式评估所需的上下文信息，例如当前元组和参数值。
+ */
 #ifndef FRONTEND
 static inline Datum
 ExecEvalExprSwitchContext(ExprState *state,

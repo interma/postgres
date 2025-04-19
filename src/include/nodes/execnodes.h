@@ -110,6 +110,11 @@ typedef struct ExprState
 	/* original expression tree, for debugging only */
 	Expr	   *expr;
 
+	/**
+evalfunc_private 用于存储与 evalfunc 相关的私有状态或上下文信息。
+它为 evalfunc 提供辅助数据，例如缓存、优化信息或其他运行时元数据。
+具体内容由 evalfunc 的实现决定，不同的求值函数可能需要不同的私有数据。
+	 */
 	/* private state for an evalfunc */
 	void	   *evalfunc_private;
 
@@ -2456,6 +2461,13 @@ typedef struct SharedAggInfo
  * ---------------------
  */
 /* these structs are private in nodeAgg.c: */
+/**
+AggStatePerAgg: 指向每个聚合函数的状态数据，可能包括聚合函数的具体实现和相关元信息。
+AggStatePerTrans: 用于管理聚合的过渡状态（transition state），例如 SUM 的累加值或 AVG 的计数器。
+AggStatePerGroup: 存储每个分组的聚合状态，支持 GROUP BY 操作。
+AggStatePerPhase: 用于管理聚合操作的不同阶段（phase），例如分组聚合和哈希聚合的切换。
+AggStatePerHash: 与哈希聚合相关的状态数据，例如哈希表的元信息。
+ */
 typedef struct AggStatePerAggData *AggStatePerAgg;
 typedef struct AggStatePerTransData *AggStatePerTrans;
 typedef struct AggStatePerGroupData *AggStatePerGroup;
