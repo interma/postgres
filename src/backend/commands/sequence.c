@@ -162,6 +162,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 		}
 	}
 
+	// 根据plan树填充参数
 	/* Check and set all option values */
 	init_params(pstate, seq->options, seq->for_identity, true,
 				&seqform, &seqdataform,
@@ -194,6 +195,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 		coldef->is_not_null = true;
 		null[i - 1] = false;
 
+		// List	   *tableElts;		/* column definitions (list of ColumnDef) */
 		stmt->tableElts = lappend(stmt->tableElts, coldef);
 	}
 
@@ -205,6 +207,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	stmt->tablespacename = NULL;
 	stmt->if_not_exists = seq->if_not_exists;
 
+	// 建立类heap表，存储具体的seq数据
 	address = DefineRelation(stmt, RELKIND_SEQUENCE, seq->ownerId, NULL, NULL);
 	seqoid = address.objectId;
 	Assert(seqoid != InvalidOid);
@@ -213,15 +216,25 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	tupDesc = RelationGetDescr(rel);
 
 	/* now initialize the sequence's data */
+
+	// 填入heap表的初始数据：从value和null构造这个tuple
 	tuple = heap_form_tuple(tupDesc, value, null);
+	/**
+	 * 具体的insert逻辑：
+	 * 	通过PageAddItems()等函数将tuple插入到一个page中（随后持久化到磁盘上的heap表）
+	 * 	还有xlog相关操作
+	 */
 	fill_seq_with_data(rel, tuple);
 
 	/* process OWNED BY if given */
 	if (owned_by)
 		process_owned_by(rel, owned_by, seq->for_identity);
 
+	// 同以前的解读：这里的nolock表明事务结束后统一释放锁
 	sequence_close(rel, NoLock);
 
+	// pg_sequence作为元数据表（如对应seq的min/max），
+	// 具体的数据存储（如当前值）在对应的类heap存储seq中
 	/* fill in pg_sequence */
 	rel = table_open(SequenceRelationId, RowExclusiveLock);
 	tupDesc = RelationGetDescr(rel);
@@ -365,6 +378,14 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 
 	/* Initialize first page of relation with special magic number */
 
+	/**
+EB_LOCK_FIRST: 在扩展数据块之前获取锁，以确保操作的安全性和一致性。
+EB_SKIP_EXTENSION_LOCK: 跳过扩展锁的获取，可能用于优化性能，但需要确保调用者已经处理了并发问题。
+
+	ExtendBufferedRel 函数会为缓冲区加上独占锁（exclusive lock）：
+	设置 EB_SKIP_EXTENSION_LOCK 后，ExtendBufferedRel不会获取全局的常规锁（用于防止多个进程同时扩展同一个关系的存储文件），
+	但仍会为返回的缓冲区加上独占锁。
+	 */
 	buf = ExtendBufferedRel(BMR_REL(rel), forkNum, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
 	Assert(BufferGetBlockNumber(buf) == 0);
@@ -394,6 +415,10 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	/* check the comment above nextval_internal()'s equivalent call. */
 	if (RelationNeedsWAL(rel))
 		GetTopTransactionId();
+	/**
+GetTopTransactionId() 的主要作用是确保当前事务已经分配了一个顶层事务 ID（Transaction ID, XID）。
+如果事务尚未分配 XID，该函数会分配一个新的事务 ID
+	 */
 
 	START_CRIT_SECTION();
 
@@ -407,7 +432,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	/* XLOG stuff */
 	if (RelationNeedsWAL(rel) || forkNum == INIT_FORKNUM)
 	{
-		xl_seq_rec	xlrec;
+		xl_seq_rec	xlrec;	// seq的特定xlog结构
 		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
@@ -418,6 +443,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) tuple->t_data, tuple->t_len);
 
+		// seq的RM
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
 
 		PageSetLSN(page, recptr);
@@ -527,6 +553,10 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	/* update the pg_sequence tuple (we could skip this in some cases...) */
 	CatalogTupleUpdate(rel, &seqtuple->t_self, seqtuple);
 
+	/**
+InvokeObjectPostAlterHook 是 PostgreSQL 中用于触发对象修改后钩子（Post-Alter Hook）的函数。
+它的主要作用是在数据库对象（如表、序列等）被修改后，通知相关的扩展或插件，以便它们可以执行自定义的后续操作
+	 */
 	InvokeObjectPostAlterHook(RelationRelationId, relid, 0);
 
 	ObjectAddressSet(address, RelationRelationId, relid);
@@ -581,6 +611,8 @@ DeleteSequenceTuple(Oid relid)
 	CatalogTupleDelete(rel, &tuple->t_self);
 
 	ReleaseSysCache(tuple);
+	// TODO: 这里为什么不使用NoLock模式（等到事务结束再释放）？
+	// 难道和系统表或删除有关？
 	table_close(rel, RowExclusiveLock);
 }
 
@@ -619,6 +651,13 @@ nextval_oid(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(nextval_internal(relid, true));
 }
 
+/**
+返回下一个序列值
+- 缓存值的使用: 如果序列已经缓存了一些值，函数会直接返回缓存中的下一个值，而无需访问磁盘或更新序列元数据。
+- 序列值的计算: 如果缓存值已用尽，函数会从序列的存储中读取当前值，并根据序列的增量（increment）计算下一个值。
+- 日志记录: 如果启用了 WAL（Write-Ahead Logging），函数会记录序列的更新操作，以确保在崩溃恢复时能够正确回放。
+- 并发控制: 函数通过锁机制确保在多事务环境下的操作安全性，避免多个事务同时修改同一序列导致的不一致。
+ */
 int64
 nextval_internal(Oid relid, bool check_permissions)
 {
@@ -665,6 +704,10 @@ nextval_internal(Oid relid, bool check_permissions)
 	 */
 	PreventCommandIfParallelMode("nextval()");
 
+	/**
+elm->last 表示上一次返回的序列值，而 elm->cached 表示当前缓存的最后一个序列值。
+如果两者不相等，说明序列中还有未使用的缓存值，可以直接从缓存中获取下一个值，而无需访问磁盘或更新序列元数据
+	 */
 	if (elm->last != elm->cached)	/* some numbers were cached */
 	{
 		Assert(elm->last_valid);
@@ -686,8 +729,14 @@ nextval_internal(Oid relid, bool check_permissions)
 	cycle = pgsform->seqcycle;
 	ReleaseSysCache(pgstuple);
 
+
 	/* lock page buffer and read tuple */
+	/**
+	这里给buffer加了独占锁（同时也pin了buffer）：
+	read_seq_tuple 函数通过调用 ReadBuffer：它对缓冲区也进行了pin操作
+	 */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
+	
 	page = BufferGetPage(buf);
 
 	last = next = result = seq->last_value;
@@ -700,6 +749,9 @@ nextval_internal(Oid relid, bool check_permissions)
 		fetch--;
 	}
 
+	/**
+每SEQ_LOG_VALS刷一次xlog，平衡了性能和一致性之间的需求
+	 */
 	/*
 	 * Decide whether we should emit a WAL log record.  If so, force up the
 	 * fetch count to grab SEQ_LOG_VALS more values than we actually need to
@@ -806,6 +858,9 @@ nextval_internal(Oid relid, bool check_permissions)
 
 	/* ready to change the on-disk (or really, in-buffer) tuple */
 	START_CRIT_SECTION();
+
+	// NB：We must mark the buffer dirty before doing XLogInsert()
+	// 和WAL语义似乎矛盾了，见自己的代码笔记中的gpt讲解
 
 	/*
 	 * We must mark the buffer dirty before doing XLogInsert(); see notes in
@@ -1829,7 +1884,9 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 }
 
-
+/**
+simple example to demonstrate the use of the redolog
+ */
 void
 seq_redo(XLogReaderState *record)
 {
@@ -1874,6 +1931,7 @@ seq_redo(XLogReaderState *record)
 	PageSetLSN(localpage, lsn);
 
 	memcpy(page, localpage, BufferGetPageSize(buffer));
+	// 让bgwriter待会儿把这个buffer写到磁盘上
 	MarkBufferDirty(buffer);
 	UnlockReleaseBuffer(buffer);
 
@@ -1905,3 +1963,101 @@ seq_mask(char *page, BlockNumber blkno)
 
 	mask_unused_space(page);
 }
+
+/**
+这段代码是 PostgreSQL 中用于管理序列（sequence）的核心实现。序列是一种特殊的数据库对象，通常用于生成唯一的数值（例如主键）。以下是对代码的详细解释：
+
+---
+
+### 1. **序列的日志与缓存**
+- **`SEQ_LOG_VALS`**:
+  定义了预先记录的序列值数量（32）。通过预记录多个值，可以减少每次获取序列值时的日志记录开销。如果发生崩溃，可能会跳过这些预记录的值。
+- **`SEQ_MAGIC`**:
+  定义了序列缓冲区页面的特殊标识符，用于验证页面的正确性。
+
+---
+
+### 2. **序列的元数据结构**
+- **`sequence_magic`**:
+  包含一个 `magic` 字段，用于标识序列缓冲区页面的特殊区域。
+- **`SeqTableData`**:
+  存储每个序列的会话状态，包括：
+  - `relid`: 序列的 OID。
+  - `filenumber`: 序列的文件编号。
+  - `lxid`: 上次操作序列的事务 ID。
+  - `last_valid`: 是否有有效的上次值。
+  - `last` 和 `cached`: 上次返回的值和缓存的值。
+  - `increment`: 序列的增量值。
+
+`SeqTableData` 的实例存储在哈希表 `seqhashtab` 中，用于快速访问。
+
+---
+
+### 3. **序列的创建与初始化**
+- **`DefineSequence`**:
+  用于创建新的序列对象。主要步骤包括：
+  1. 检查是否已存在同名序列（如果指定了 `if_not_exists`）。
+  2. 初始化序列的参数（如起始值、增量、最大值等）。
+  3. 创建序列的元数据和数据文件。
+  4. 如果指定了 `OWNED BY`，设置序列与表的依赖关系。
+
+- **`fill_seq_with_data`**:
+  初始化序列的数据文件。如果序列是未记录的（unlogged），还会初始化 `INIT_FORKNUM`。
+
+---
+
+### 4. **序列的修改与重置**
+- **`AlterSequence`**:
+  修改序列的定义，例如改变增量值或最大值。必要时会重写序列的数据文件以确保事务性。
+- **`ResetSequence`**:
+  将序列重置为初始状态。通过创建新的文件编号实现事务性重置。
+
+---
+
+### 5. **序列值的获取与设置**
+- **`nextval_internal`**:
+  获取序列的下一个值。主要逻辑包括：
+  1. 检查权限和并发限制。
+  2. 如果有缓存值，直接返回缓存值。
+  3. 如果需要新值，从序列文件中读取并更新。
+  4. 如果需要日志记录（WAL），记录额外的值以减少日志开销。
+
+- **`do_setval`**:
+  设置序列的当前值。支持两种模式：
+  1. `iscalled = true`: 更新 `currval` 状态。
+  2. `iscalled = false`: 仅更新序列值。
+
+---
+
+### 6. **序列的依赖管理**
+- **`process_owned_by`**:
+  处理 `OWNED BY` 选项，建立序列与表列之间的依赖关系。确保序列与表具有相同的所有者和命名空间。
+
+---
+
+### 7. **其他功能**
+- **`ResetSequenceCaches`**:
+  清除会话中的序列缓存。
+- **`seq_redo`**:
+  在恢复过程中重做序列的日志记录。
+- **`sequence_options`**:
+  返回序列的参数列表，用于显示或信息查询。
+
+---
+
+### 8. **设计特点**
+- **性能优化**:
+  通过缓存和预记录减少频繁的磁盘 I/O 和日志记录。
+- **事务性**:
+  通过文件编号的更改和日志记录确保序列操作的事务性。
+- **灵活性**:
+  支持多种操作（创建、修改、重置、获取值等）以及复杂的依赖管理。
+
+---
+
+### 9. **总结**
+这段代码展示了 PostgreSQL 对序列的高效实现，结合了性能优化和事务性保障。它支持多种场景下的序列操作，是数据库生成唯一值的重要基础设施。
+ 
+另外的详解：
+https://mp.weixin.qq.com/s/JOgsMPmq3gnYMNkKa5tbCw
+*/

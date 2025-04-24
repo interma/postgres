@@ -1080,6 +1080,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	CommandCounterIncrement();
 }
 
+/**
+由于事件触发器的复杂性，某些语句需要通过 "慢路径" 进行处理，
+以确保触发器的正确执行。这种慢路径通常涉及额外的逻辑检查和触发器调用。
+ */
 /*
  * The "Slow" variant of ProcessUtility should only receive statements
  * supported by the event triggers facility.  Therefore, we always

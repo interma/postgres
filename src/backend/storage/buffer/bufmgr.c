@@ -1189,6 +1189,10 @@ PinBufferForBlock(Relation rel,
 	return BufferDescriptorGetBuffer(bufHdr);
 }
 
+/**
+ReadBuffer时会自动pin buffer（显然）
+在缓冲区已经存在，但需要增加引用计数时才会单独调用PinBuffer
+ */
 /*
  * ReadBuffer_common -- common logic for all ReadBuffer variants
  *
@@ -2223,6 +2227,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * we get the lock.
 	 */
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
+		// 该"常规锁"用来保护对关系的扩展（Extension）操作
 		LockRelationForExtension(bmr.rel, ExclusiveLock);
 
 	/*

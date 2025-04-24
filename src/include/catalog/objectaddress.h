@@ -18,6 +18,10 @@
 #include "storage/lockdefs.h"
 #include "utils/relcache.h"
 
+/**
+classId 字段存储对象的类型（如表、序列、索引等）。
+objectId 字段存储对象的唯一标识符（OID）。
+ */
 /*
  * An ObjectAddress represents a database object of any type.
  */
