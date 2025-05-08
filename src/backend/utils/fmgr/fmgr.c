@@ -1860,6 +1860,11 @@ pg_detoast_datum_slice(struct varlena *datum, int32 first, int32 count)
 	return detoast_attr_slice(datum, first, count);
 }
 
+/**
+检查传入的 varlena 数据是否被压缩或存储在外部（TOASTed）。
+如果是，它会调用 detoast_attr 函数对数据进行解压缩或从外部存储中加载数据；
+如果数据已经是未压缩的本地数据，则直接返回原始数据。
+ */
 struct varlena *
 pg_detoast_datum_packed(struct varlena *datum)
 {

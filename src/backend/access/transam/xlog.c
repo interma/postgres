@@ -408,6 +408,23 @@ typedef struct XLogCtlInsert
 	uint64		CurrBytePos;
 	uint64		PrevBytePos;
 
+/**
+2. 伪共享问题
+伪共享发生在多个线程同时访问同一个缓存行中的不同变量时，即使这些变量彼此独立，处理器仍然需要在缓存一致性协议下频繁同步缓存行。
+这会导致性能下降，尤其是在高并发环境下。
+
+在这段代码中：
+- Curr/PrevBytePos 是 WAL 插入过程中频繁更新的变量。
+- RedoRecPtr 和 full page write 是 WAL 插入过程中频繁读取但很少更新的变量。
+如果这些变量共享同一个缓存行，频繁的读取和更新操作会导致缓存行被多个线程争用，从而引发<伪共享>问题。
+
+3. pad 的作用
+通过引入 pad 数组，代码确保了 Curr/PrevBytePos 和 RedoRecPtr 等变量被分配到不同的缓存行中：
+- 隔离高频更新和低频更新的变量:   将它们分配到不同的缓存行中，可以避免伪共享问题。
+	- Curr/PrevBytePos 是高频更新的变量，
+	- 而 RedoRecPtr 和 full page write 是低频更新的变量。
+- 优化多线程性能: 这种内存布局优化减少了缓存行争用，提高了多线程环境下的性能。
+ */
 	/*
 	 * Make sure the above heavily-contended spinlock and byte positions are
 	 * on their own cache line. In particular, the RedoRecPtr and full page
@@ -445,6 +462,11 @@ typedef struct XLogCtlInsert
 	WALInsertLockPadded *WALInsertLocks;
 } XLogCtlInsert;
 
+/**
+XLogCtlData 是 WAL 系统的共享内存控制块，负责协调多个进程对 WAL 的并发访问。
+它存储了 WAL 的当前状态、缓冲区管理信息、时间线信息以及恢复状态等。
+通过该结构，PostgreSQL 能够高效地管理 WAL 的生成、写入和恢复。
+ */
 /*
  * Total shared-memory state for XLOG.
  */
