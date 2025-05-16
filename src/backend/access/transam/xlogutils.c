@@ -347,6 +347,13 @@ XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
  * If 'get_cleanup_lock' is true, a "cleanup lock" is acquired on the buffer
  * using LockBufferForCleanup(), instead of a regular exclusive lock.
  */
+/**
+函数返回一个 XLogRedoAction 枚举值，指示页面的处理结果：
+	BLK_RESTORED: 页面通过全页面镜像恢复。
+	BLK_DONE: 页面已经包含最新的修改，无需进一步操作。
+	BLK_NEEDS_REDO: 页面需要应用 WAL 记录中的修改。
+	BLK_NOTFOUND: 页面不存在。
+ */
 XLogRedoAction
 XLogReadBufferForRedoExtended(XLogReaderState *record,
 							  uint8 block_id,
@@ -382,6 +389,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
 
 	/* If it has a full-page image and it should be restored, do it. */
+	/* FPI routine */
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
@@ -414,13 +422,20 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		if (forknum == INIT_FORKNUM)
 			FlushOneBuffer(*buf);
 
-		return BLK_RESTORED;
+		return BLK_RESTORED;	// 页面通过全页面镜像FPI恢复。
 	}
 	else
 	{
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
 		if (BufferIsValid(*buf))
 		{
+			/**
+				- 普通独占锁（Exclusive Lock）: 使用 LockBuffer 函数获取，
+					允许对页面进行修改，但不允许其他进程同时访问该页面。
+				- 清理锁（Cleanup Lock）: 使用 LockBufferForCleanup 函数获取，
+					通常用于清理页面中的死元组或进行更高级别的操作。
+					清理锁是独占锁的一种扩展，具有更高的权限。
+			 */
 			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
 			{
 				if (get_cleanup_lock)
@@ -428,6 +443,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				else
 					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 			}
+			// 如果页面的 LSN 大于或等于 WAL 记录的 LSN，说明页面已经包含了最新的修改，返回 BLK_DONE。
 			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 				return BLK_DONE;
 			else
@@ -438,6 +454,16 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	}
 }
 
+/**
+XLogReadBufferExtended:
+	专门用于 WAL 重放（XLOG replay）期间读取页面。
+	主要在崩溃恢复或主备复制的 WAL 日志重放过程中使用。
+	适配了 WAL 重放的特殊需求，例如处理页面不存在的情况或全零页面。
+	
+ReadBufferExtended:
+	用于正常系统操作期间读取页面。
+	适用于普通的表操作（如查询、插入、更新、删除）中访问页面。
+ */
 /*
  * XLogReadBufferExtended
  *		Read a page during XLOG replay

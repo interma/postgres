@@ -354,10 +354,26 @@ typedef struct RmgrData
 	const char *(*rm_identify) (uint8 info);
 	void		(*rm_startup) (void);
 	void		(*rm_cleanup) (void);
+/**
+void (*rm_mask)(char *pagedata, BlockNumber blkno): 掩码函数，
+	用于屏蔽页面中不需要进行一致性检查的部分。这在启用了 wal_consistency_checking 时非常重要。
+void (*rm_decode)(struct LogicalDecodingContext *ctx, struct XLogRecordBuffer *buf): 解码函数，
+	用于逻辑解码场景，将 WAL日志记录转换为逻辑变更事件。
+ */
 	void		(*rm_mask) (char *pagedata, BlockNumber blkno);
 	void		(*rm_decode) (struct LogicalDecodingContext *ctx,
 							  struct XLogRecordBuffer *buf);
 } RmgrData;
+/**
+2. 掩码函数的作用
+掩码函数的主要作用是屏蔽页面中某些动态变化但不影响逻辑一致性的部分。这些部分可能在页面修改后发生变化，但不会影响页面的逻辑内容。例如：
+- 事务状态信息: 页面中的事务状态（如 xmin、xmax）可能会随着事务的提交或回滚而变化，但这些变化不影响页面的逻辑一致性。
+- 空闲空间指针: 页面中的空闲空间指针可能会随着插入或删除操作而变化，但这些变化不影响页面的逻辑内容。
+- 填充字节: 页面中用于对齐的填充字节可能会发生变化，但这些字节对页面的逻辑内容没有影响。
+
+通过屏蔽这些部分，掩码函数确保了 wal_consistency_checking 只关注页面的逻辑一致性，而忽略无关的物理变化。
+ */
+
 
 extern PGDLLIMPORT RmgrData RmgrTable[];
 extern void RmgrStartup(void);

@@ -271,6 +271,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf = &registered_buffers[block_id];
 
 	BufferGetTag(buffer, &regbuf->rlocator, &regbuf->forkno, &regbuf->block);
+	// 这里只是保存page指针，而不是记录整个页面到xlog中
+	// 具体的记录逻辑在XLogRecordAssemble()中
 	regbuf->page = BufferGetPage(buffer);
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;

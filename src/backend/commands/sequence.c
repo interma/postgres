@@ -621,6 +621,12 @@ DeleteSequenceTuple(Oid relid)
  * entry, but we keep it around to ease porting of C code that may have
  * called the function directly.
  */
+/**
+在 hot-standby 模式下不可以调用 nextval，
+因为它是写操作，会抛出类似以下的错误：
+	transaction
+	ERROR:  cannot execute nextval() in a read-only transactio
+ */
 Datum
 nextval(PG_FUNCTION_ARGS)
 {
@@ -734,6 +740,13 @@ elm->last 表示上一次返回的序列值，而 elm->cached 表示当前缓存
 	/**
 	这里给buffer加了独占锁（同时也pin了buffer）：
 	read_seq_tuple 函数通过调用 ReadBuffer：它对缓冲区也进行了pin操作
+	 */
+	/**
+	 * 另外留意这里没通过mvcc机制来读tuple:
+	 * - xmin 通常被设置为 FrozenTransactionId，以确保该元组始终可见
+	 * - xmax 通常被设置为 InvalidTransactionId，表示该元组不会被删除或更新
+	 * 
+	 * 因此导致了一些很trick的机制(hot-standy)，见笔记
 	 */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
 	
@@ -886,6 +899,7 @@ elm->last 表示上一次返回的序列值，而 elm->cached 表示当前缓存
 		 * sequence values if we crash.
 		 */
 		XLogBeginInsert();
+		// REGBUF_WILL_INIT: 这是一个标志，表示缓冲区将被完全重新初始化，因此不需要记录其当前内容
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
 		/* set values that will be saved in xlog */
@@ -894,7 +908,8 @@ elm->last 表示上一次返回的序列值，而 elm->cached 表示当前缓存
 		seq->log_cnt = 0;
 
 		xlrec.locator = seqrel->rd_locator;
-
+		
+		// 只通过maindata部分记录数据就足够了，不需要blockdata（其中永远只有一条tuple）
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqdatatuple.t_data, seqdatatuple.t_len);
 
@@ -1903,6 +1918,7 @@ seq_redo(XLogReaderState *record)
 	if (info != XLOG_SEQ_LOG)
 		elog(PANIC, "seq_redo: unknown op code %u", info);
 
+	// 每次都重新初始化一个新的buffer
 	buffer = XLogInitBufferForRedo(record, 0);
 	page = (Page) BufferGetPage(buffer);
 
@@ -1915,6 +1931,7 @@ seq_redo(XLogReaderState *record)
 	 * are supposed to change will change, even transiently. We must palloc
 	 * the local page for alignment reasons.
 	 */
+	// NB：热备模式下的一个corner case，需要构建localpage来解决，见gpt详解
 	localpage = (Page) palloc(BufferGetPageSize(buffer));
 
 	PageInit(localpage, BufferGetPageSize(buffer), sizeof(sequence_magic));
@@ -1930,6 +1947,8 @@ seq_redo(XLogReaderState *record)
 
 	PageSetLSN(localpage, lsn);
 
+	// 虽然 memcpy 不是原子操作，但它的使用场景是安全的：
+	// 锁的保护: 在 memcpy 操作期间，缓冲区的独占锁确保了没有其他进程可以访问该缓冲区。
 	memcpy(page, localpage, BufferGetPageSize(buffer));
 	// 让bgwriter待会儿把这个buffer写到磁盘上
 	MarkBufferDirty(buffer);

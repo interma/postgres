@@ -884,6 +884,14 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	UpdateDecodingStats(ctx);
 }
 
+/**
+4. 示例场景
+假设有一个表 users，执行了SQL 插入操作，对应的 WAL 日志记录会被 DecodeInsert 函数解析为以下逻辑变更事件：
+	表名: users
+	操作类型: 插入
+	插入的元组: {id: 1, name: 'Alice'}
+这些信息会被传递给逻辑复制的输出插件，用于生成逻辑复制流。
+ */
 /*
  * Parse XLOG_HEAP_INSERT (not MULTI_INSERT!) records into tuplebufs.
  *

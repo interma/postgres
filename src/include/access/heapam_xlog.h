@@ -70,6 +70,13 @@
 /* PD_ALL_VISIBLE was cleared */
 #define XLH_INSERT_ALL_VISIBLE_CLEARED			(1<<0)
 #define XLH_INSERT_LAST_IN_MULTI				(1<<1)
+/**
+XLH_INSERT_IS_SPECULATIVE 表示插入操作是“试探性插入”（speculative insertion）。
+试探性插入是一种特殊的插入模式，通常用于支持唯一约束（unique constraint）或排他性约束（exclusion constraint）的并发检查。
+
+在试探性插入中，元组（tuple）会被暂时插入到堆表中，但其状态是未决的（pending）。
+只有在约束检查通过后，插入才会被正式确认；否则，插入会被回滚。
+ */
 #define XLH_INSERT_IS_SPECULATIVE				(1<<2)
 #define XLH_INSERT_CONTAINS_NEW_TUPLE			(1<<3)
 #define XLH_INSERT_ON_TOAST_RELATION			(1<<4)

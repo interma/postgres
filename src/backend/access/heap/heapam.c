@@ -2229,6 +2229,12 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
 		XLogRegisterBufData(0, (char *) &xlhdr, SizeOfHeapHeader);
 		/* PG73FORMAT: write bitmap [+ padding] [+ oid] + data */
+		/**
+3. 为什么跳过头部
+堆元组的头部（HeapTupleHeader）包含元组的元信息，例如事务状态、行号等。
+这些信息通常已经通过其他方式（如缓冲区的全页面镜像）记录到 WAL 中，
+因此这里只需要记录实际的数据部分，减少 WAL 日志的大小。
+		 */
 		XLogRegisterBufData(0,
 							(char *) heaptup->t_data + SizeofHeapTupleHeader,
 							heaptup->t_len - SizeofHeapTupleHeader);
@@ -9693,6 +9699,8 @@ heap_xlog_delete(XLogReaderState *record)
 		UnlockReleaseBuffer(buffer);
 }
 
+// 用于处理堆表（heap table）插入操作的 WAL（Write-Ahead Logging）重放函数
+// 非常好的示例
 static void
 heap_xlog_insert(XLogReaderState *record)
 {
