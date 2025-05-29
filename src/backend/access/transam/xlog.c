@@ -382,6 +382,20 @@ typedef struct
 typedef union WALInsertLockPadded
 {
 	WALInsertLock l;
+/**
+避免伪共享问题：
+不同线程访问同一个缓存行中的不同变量。
+虽然这些变量是独立的，但由于它们共享同一个缓存行，
+*当一个线程修改其中一个变量时，会导致整个缓存行被标记为无效*。
+其他线程即使只访问缓存行中的未修改部分，也需要重新加载缓存行，从而引发不必要的缓存一致性开销。
+
+为了避免伪共享问题，可以通过以下方法：
+- 缓存行对齐（Padding）:
+	在变量之间插入填充（padding）数据，使得每个变量独占一个缓存行。
+	例如，可以在结构体中插入额外的字节，使得变量的起始地址对齐到缓存行边界。
+- 分离变量（Data Separation）:
+	将可能被不同线程频繁访问的变量分开存储，避免它们共享同一个缓存行。
+ */
 	char		pad[PG_CACHE_LINE_SIZE];
 } WALInsertLockPadded;
 
@@ -396,6 +410,10 @@ static SessionBackupState sessionBackupState = SESSION_BACKUP_NONE;
  */
 typedef struct XLogCtlInsert
 {
+	/**
+	预留空间时使用的spinlock锁，不允许并发插入 WAL 日志
+	后边的WALInsertLocks来控制插入时的并发度，允许多个进程同时插入 WAL 日志。
+	 */
 	slock_t		insertpos_lck;	/* protects CurrBytePos and PrevBytePos */
 
 	/*
@@ -405,7 +423,9 @@ typedef struct XLogCtlInsert
 	 * prev-link of the next record. These are stored as "usable byte
 	 * positions" rather than XLogRecPtrs (see XLogBytePosToRecPtr()).
 	 */
+	// CurrBytePos 表示当前已保留的 WAL 日志的结束位置。下一条 WAL 记录将从这个位置开始插入。
 	uint64		CurrBytePos;
+	// PrevBytePos 表示上一个已插入（或保留）的 WAL 记录的起始位置。
 	uint64		PrevBytePos;
 
 /**
@@ -885,6 +905,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		 * Reserve space for the record in the WAL. This also sets the xl_prev
 		 * pointer.
 		 */
+		// 预留空间，完全互斥
 		ReserveXLogInsertLocation(rechdr->xl_tot_len, &StartPos, &EndPos,
 								  &rechdr->xl_prev);
 
@@ -1523,6 +1544,10 @@ WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt)
  * uninitialized page), and the inserter might need to evict an old WAL buffer
  * to make room for a new one, which in turn requires WALWriteLock.
  */
+/**
+	等待 WAL 插入完成: 该函数会等待所有小于 upto 的 WAL 插入操作完成。
+	这意味着在 upto 之前的所有 WAL 数据都已被完全复制到 WAL 缓冲区中，可以安全地写入磁盘。
+*/
 static XLogRecPtr
 WaitXLogInsertionsToFinish(XLogRecPtr upto)
 {

@@ -31,6 +31,7 @@ extern void standby_desc_invalidations(StringInfo buf,
 /*
  * XLOG message types
  */
+// 下边是3种类型消息的格式
 #define XLOG_STANDBY_LOCK			0x00
 #define XLOG_RUNNING_XACTS			0x10
 #define XLOG_INVALIDATIONS			0x20

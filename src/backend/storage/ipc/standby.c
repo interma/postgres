@@ -1281,7 +1281,11 @@ standby_redo(XLogReaderState *record)
  *
  * Returns the RecPtr of the last inserted record.
  */
-XLogRecPtr
+/**
+用于将当前快照的详细信息记录到 WAL（Write-Ahead Logging）日志中的函数。
+其主要目的是支持热备（Hot Standby）和逻辑解码（Logical Decoding），通过在备库上重建快照状态，使其能够正确处理事务和锁信息
+ */
+ XLogRecPtr
 LogStandbySnapshot(void)
 {
 	XLogRecPtr	recptr;
@@ -1396,6 +1400,74 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 
 	return recptr;
 }
+/**
+函数作用，from GPT
+---
+
+### **1. 函数的作用**
+- **记录快照到 WAL**:
+  该函数的主要目的是将当前快照的详细信息记录到 WAL（Write-Ahead Logging）日志中。这些快照信息包括：
+  - 所有正在运行的事务（Running Transactions）。
+  - 当前持有的 `AccessExclusiveLocks`。
+- **支持备库恢复和逻辑解码**:
+  - 在热备（Hot Standby）模式下，备库通过这些快照信息重建事务状态，从而支持只读查询。
+  - 在逻辑解码（Logical Decoding）中，这些快照信息用于构建一致的事务视图。
+
+---
+
+### **2. 热备模式下的使用**
+- **从关闭检查点启动**:
+  如果从关闭检查点启动恢复，由于没有活动事务，快照是空的，系统可以直接进入 `STANDBY_SNAPSHOT_READY` 状态。
+- **从在线检查点启动**:
+  在更常见的在线检查点情况下，需要通过两到三步的过程来构建正确的恢复快照。这包括逐步收集事务和锁信息，并在备库上重新组装这些信息。
+
+---
+
+### **3. 快照记录的竞争条件**
+- **时间窗口问题**:
+  在主库上派生快照和将其写入 WAL 之间存在时间窗口。在此期间，事务或锁可能会进入或离开快照范围。
+- **解决方案**:
+  - 在派生快照之前开始累积变化。
+  - 在备库应用快照时忽略重复的事务或锁信息。
+  - 这种机制在 `CreateCheckPoint()` 中实现，确保在写入主检查点记录之前，运行事务记录已经写入 WAL。
+
+---
+
+### **4. 恢复过程中的任务**
+在恢复过程中，备库需要完成以下任务：
+1. **推进 `nextXid`**:
+   随着新事务的出现，更新共享的 `nextXid`。
+2. **扩展事务日志（clog）和子事务表（subtrans）**:
+   为每个新事务分配必要的存储。
+3. **跟踪未提交的事务**:
+   记录已知的未提交事务（Known Assigned XIDs）。
+4. **跟踪未提交的锁**:
+   记录未提交事务持有的 `AccessExclusiveLocks`。
+
+---
+
+### **5. 事务提交和锁清理**
+- **移除已完成事务的记录**:
+  在事务提交或中止时，移除相关的事务和锁信息。
+- **处理零事务 ID**:
+  在某些情况下，锁可能与零事务 ID 相关联（例如，WAL 重放旧日志时）。系统需要清理这些无效的锁。
+
+---
+
+### **6. 对逻辑解码的支持**
+- **仅需要事务信息**:
+  对于逻辑解码，只需要运行事务的信息，而不需要锁信息。然而，由于没有单独的开关来控制逻辑解码，锁信息也会被记录。
+
+---
+
+### **7. 返回值**
+- 函数返回最后插入的 WAL 记录的指针（`RecPtr`）。这可以用于跟踪 WAL 日志的写入进度。
+
+---
+
+### **总结**
+`LogStandbySnapshot` 是 PostgreSQL 中支持热备和逻辑解码的重要函数。它通过记录当前快照的事务和锁信息，确保备库能够正确地重建快照状态，从而支持只读查询和逻辑解码的需求。这种设计在性能和数据一致性之间取得了良好的平衡，是 PostgreSQL 高可用性和扩展能力的重要组成部分。
+ */
 
 /*
  * Wholesale logging of AccessExclusiveLocks. Other lock types need not be

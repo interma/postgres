@@ -2566,6 +2566,81 @@ errdetail_recovery_conflict(ProcSignalReason reason)
 
 	return 0;
 }
+/**
+`errdetail_recovery_conflict` 函数的主要作用是为恢复冲突（recovery conflict）添加详细的错误信息（`errdetail()`），以帮助用户理解冲突的来源。恢复冲突通常发生在备库（standby）模式下，当主库的某些操作（如清理、锁定或表空间删除）与备库的查询或事务冲突时，备库需要中止冲突的操作以继续重放 WAL 日志。以下是函数中各类错误的出现场景举例：
+
+---
+
+### **1. `PROCSIG_RECOVERY_CONFLICT_BUFFERPIN`**
+- **场景**:
+  - 主库需要清理某些数据页，但备库上的查询正在访问这些数据页并持有共享缓冲区的 pin。
+- **错误信息**:
+  - `"User was holding shared buffer pin for too long."`
+- **示例**:
+  - 在备库上运行一个长时间的查询，该查询扫描了一个大表的某些页面，而主库试图清理这些页面。
+
+---
+
+### **2. `PROCSIG_RECOVERY_CONFLICT_LOCK`**
+- **场景**:
+  - 主库需要获取某个表或行的独占锁，但备库上的查询持有冲突的共享锁。
+- **错误信息**:
+  - `"User was holding a relation lock for too long."`
+- **示例**:
+  - 在备库上运行一个查询，该查询对某个表持有共享锁，而主库试图对该表执行 `ALTER TABLE` 操作。
+
+---
+
+### **3. `PROCSIG_RECOVERY_CONFLICT_TABLESPACE`**
+- **场景**:
+  - 主库删除了一个表空间，而备库上的查询可能正在使用该表空间中的对象。
+- **错误信息**:
+  - `"User was or might have been using tablespace that must be dropped."`
+- **示例**:
+  - 主库执行了 `DROP TABLESPACE`，而备库上的查询正在访问该表空间中的表。
+
+---
+
+### **4. `PROCSIG_RECOVERY_CONFLICT_SNAPSHOT`**
+- **场景**:
+  - 主库清理了某些旧版本的行（VACUUM 操作），而备库上的查询需要访问这些行版本。
+- **错误信息**:
+  - `"User query might have needed to see row versions that must be removed."`
+- **示例**:
+  - 在备库上运行一个长时间的查询，该查询依赖于一个旧快照，而主库的 `VACUUM` 操作清理了这些旧版本的行。
+
+---
+
+### **5. `PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT`**
+- **场景**:
+  - 主库需要无效化一个逻辑复制槽，而备库正在使用该逻辑复制槽。
+- **错误信息**:
+  - `"User was using a logical replication slot that must be invalidated."`
+- **示例**:
+  - 主库删除了一个逻辑复制槽，而备库上的逻辑解码进程正在使用该槽。
+
+---
+
+### **6. `PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK`**
+- **场景**:
+  - 备库上的事务与恢复进程之间发生了死锁，导致恢复无法继续。
+- **错误信息**:
+  - `"User transaction caused buffer deadlock with recovery."`
+- **示例**:
+  - 备库上的事务持有某些资源，而恢复进程需要这些资源才能继续重放 WAL 日志。
+
+---
+
+### **7. `PROCSIG_RECOVERY_CONFLICT_DATABASE`**
+- **场景**:
+  - 主库删除了一个数据库，而备库上仍有用户连接到该数据库。
+- **错误信息**:
+  - `"User was connected to a database that must be dropped."`
+- **示例**:
+  - 主库执行了 `DROP DATABASE`，而备库上仍有用户会话连接到该数据库。
+
+  */
+
 
 /*
  * bind_param_error_callback

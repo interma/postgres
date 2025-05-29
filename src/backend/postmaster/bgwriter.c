@@ -284,6 +284,19 @@ BackgroundWriterMain(char *startup_data, size_t startup_data_len)
 			 * start of a record, whereas last_snapshot_lsn points just past
 			 * the end of the record.
 			 */
+/**
+主机上的运行事务发生变化时，并不总是需要调用 LogStandbySnapshot。只有在满足以下两个条件时才会调用：
+- 距离上次快照记录的时间间隔已超过预设值。
+- 自上次快照记录以来，WAL 日志中有新的“重要”记录被插入。
+
+Note：
+备库在恢复过程中需要获取当前事务的快照信息，以便正确处理事务状态和锁定信息。
+只需要recovery时获取一次即可，因为备库随后可以通过重放 WAL 日志中的其他记录（如事务提交或中止记录）来更新事务状态。
+见standy_redo->ProcArrayApplyRecoveryInfo()
+
+这里定期记录快照可以优化恢复过程，并确保备库能够"快速"恢复，因为我们并不知道备库什么时候被建立。
+*/
+
 			if (now >= timeout &&
 				last_snapshot_lsn <= GetLastImportantRecPtr())
 			{

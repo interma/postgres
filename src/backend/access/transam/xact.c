@@ -772,6 +772,7 @@ AssignTransactionId(TransactionState s)
 			XLogRegisterData((char *) unreportedXids,
 							 nUnreportedXids * sizeof(TransactionId));
 
+			// 为了备库判断：事务已经开始运行
 			(void) XLogInsert(RM_XACT_ID, XLOG_XACT_ASSIGNMENT);
 
 			nUnreportedXids = 0;

@@ -144,6 +144,10 @@ static bool SyncRepQueueIsOrderedByLSN(int mode);
  * to be flushed if synchronous_commit is set to the higher level of
  * remote_apply, because only commit records provide apply feedback.
  */
+/**
+主机等待备机同步复制结束（然后主机才能提交事务），调用栈一般为：
+	commitTxn -> recordTransactionCommit -> SyncRepWaitForLSN
+ */
 void
 SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 {
@@ -204,7 +208,7 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	 * Set our waitLSN so WALSender will know when to wake us, and add
 	 * ourselves to the queue.
 	 */
-	MyProc->waitLSN = lsn;
+	MyProc->waitLSN = lsn;	// 设置当前进程的waitLSN为传入的lsn值，表示等待该LSN的同步复制完成。
 	MyProc->syncRepState = SYNC_REP_WAITING;
 	SyncRepQueueInsert(mode);
 	Assert(SyncRepQueueIsOrderedByLSN(mode));
@@ -216,6 +220,7 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 		char		buffer[32];
 
 		sprintf(buffer, "waiting for %X/%X", LSN_FORMAT_ARGS(lsn));
+		// 比较有趣：设置ps命令输出时的描述性标题，最终是通过setproctitle()函数实现的。
 		set_ps_display_suffix(buffer);
 	}
 
@@ -285,6 +290,7 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 		 * Wait on latch.  Any condition that should wake us up will set the
 		 * latch, so no need for timeout.
 		 */
+		// 预期walsender进程会在同步复制完成后设置MyLatch，唤醒当前进程。
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH, -1,
 					   WAIT_EVENT_SYNC_REP);
 
@@ -859,6 +865,11 @@ SyncRepGetStandbyPriority(void)
  * the walsender's LSN.
  *
  * The caller must hold SyncRepLock in exclusive mode.
+ */
+/**
+ * 一般由walsender进程调用，唤醒等待同步复制的主机进程。
+ * 调用栈一般为：
+ * ProcessStandbyReplyMessage -> SyncRepReleaseWaiters -> SyncRepWakeQueue
  */
 static int
 SyncRepWakeQueue(bool all, int mode)

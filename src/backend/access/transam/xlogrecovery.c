@@ -2171,6 +2171,31 @@ CheckTablespaceDirectory(void)
  * reached and we have a valid starting standby snapshot, tell postmaster
  * that it can start accepting read-only connections.
  */
+/**
+recovery时达到一致性状态的检查，对这个一致性的解释是：
+要达到一致性状态，必须满足以下条件：
+
+1. 达到 minRecoveryPoint（检查点或base backup中获取的）
+minRecoveryPoint 是恢复过程中必须重放的最小 WAL 日志位置。
+在恢复模式下，数据库必须至少重放到 minRecoveryPoint，以确保所有必要的日志记录都已被应用。
+如果 minRecoveryPoint 尚未达到，恢复过程将继续，直到满足此条件。
+2. 完成基础备份的恢复
+如果数据库是从基础备份（Base Backup）恢复的，则必须重放所有与备份相关的 WAL 日志，直到达到备份结束点（backupEndPoint）。
+backupEndPoint 是基础备份完成时的 WAL 日志位置，表示备份数据的一致性点。
+3. 检查未初始化的页面
+在 WAL 日志重放过程中，可能会出现对未初始化页面的引用。
+在达到一致性状态之前，必须确保所有未初始化的页面都已正确处理。
+4. 检查表空间目录
+在恢复过程中，可能会创建临时的表空间目录（如 pg_tblspc）。
+在达到一致性状态之前，必须确保这些目录已被正确清理。
+5. 生成有效的备用快照（Standby Snapshot）
+在备库模式下，数据库必须生成一个有效的备用快照，以支持只读查询。
+备用快照包含所有活动事务的快照信息，用于确保查询的一致性。
+
+
+只有达到一致性状态后：hot standby 模式可以开始接受只读连接。
+
+ */
 static void
 CheckRecoveryConsistency(void)
 {
@@ -2184,6 +2209,7 @@ CheckRecoveryConsistency(void)
 	if (XLogRecPtrIsInvalid(minRecoveryPoint))
 		return;
 
+	// 可能是standby模式下的恢复
 	Assert(InArchiveRecovery);
 
 	/*
@@ -2264,6 +2290,7 @@ CheckRecoveryConsistency(void)
 
 		LocalHotStandbyActive = true;
 
+		// 通知postmaster，热备库模式已经准备好，可以接受只读连接了
 		SendPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY);
 	}
 }

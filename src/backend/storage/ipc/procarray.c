@@ -76,6 +76,7 @@ typedef struct ProcArrayStruct
 	/*
 	 * Known assigned XIDs handling
 	 */
+	// KnownAssignedXIDs 是一个数组，用于跟踪在备库（standby）模式下从主库接收到的未提交事务的事务 ID（XID
 	int			maxKnownAssignedXids;	/* allocated size of array */
 	int			numKnownAssignedXids;	/* current # of valid entries */
 	int			tailKnownAssignedXids;	/* index of oldest valid element */
@@ -265,7 +266,10 @@ typedef enum KAXCompressReason
 	KAX_STARTUP_PROCESS_IDLE,	/* startup process is about to sleep */
 } KAXCompressReason;
 
-
+/**
+	协同工作: procArray 和 allProcs 是 PostgreSQL 并发控制的两个核心组件。
+	procArray 提供了全局视图，用于跟踪活动事务，而 allProcs 提供了每个进程的详细状态信息。
+*/
 static ProcArrayStruct *procArray;
 
 static PGPROC *allProcs;
@@ -1086,6 +1090,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	/*
 	 * If our snapshot is already valid, nothing else to do...
 	 */
+	// 这段代码检查当前的备库快照状态（standbyState），并在快照已经处于有效状态时立即返回，无需执行进一步的操作
 	if (standbyState == STANDBY_SNAPSHOT_READY)
 		return;
 

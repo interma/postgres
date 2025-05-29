@@ -84,6 +84,10 @@ char		postgres_exec_path[MAXPGPATH];	/* full path to backend */
 /* note: currently this is not valid in backend processes */
 #endif
 
+/**
+MyProcNumber 是 PostgreSQL 内部的逻辑编号，*用于标识当前进程在共享内存procArray中的位置*。
+它是一个内部变量，通常不会直接暴露给用户，因此无法通过标准的 SQL 查询直接获取 MyProcNumber。
+ */
 ProcNumber	MyProcNumber = INVALID_PROC_NUMBER;
 
 ProcNumber	ParallelLeaderProcNumber = INVALID_PROC_NUMBER;
