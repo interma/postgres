@@ -72,6 +72,15 @@ static TypeFuncClass get_type_func_class(Oid typid, Oid *base_typeid);
  * in some cases where the tuple descriptor comes from a transient
  * RECORD datatype.
  */
+/**
+InitMaterializedSRF 是 PostgreSQL 内部用于初始化“物化模式”下集合返回函数（Set-Returning Function, SRF）状态的辅助函数。
+所谓物化模式，指的是函数一次性生成所有结果并存储在内存结构（如 Tuplestore）中，然后逐步返回给调用者。
+该函数主要负责为 SRF 的执行环境分配和初始化必要的资源。
+
+具体来说，InitMaterializedSRF 会对传入的 ReturnSetInfo 结构体进行合理性检查，确保其处于正确的调用上下文。
+随后，它会创建一个 Tuplestore（用于存放所有结果行）和一个 TupleDesc（描述结果行结构），
+并将它们保存到 ReturnSetInfo 中，供后续调用使用。
+ */
 void
 InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags)
 {

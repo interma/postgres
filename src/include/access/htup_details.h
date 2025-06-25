@@ -119,6 +119,13 @@
  * MAXALIGN.
  */
 
+
+/**
+注释说明了复合类型（如行类型）的 Datum 结构与磁盘上的堆元组结构基本一致，这样可以复用同一套构建和解析元组的代码。
+但两者需求略有不同：Datum 不需要事务可见性信息，而需要长度和类型信息。
+为节省空间，PostgreSQL 通过字段重叠（overlay）的方式，让 xmin/cmin/xmax/cmax/xvac 这些事务相关字段与 Datum 相关字段共用内存区域。
+通常，内存中构建的元组会先初始化为 Datum 格式，插入表时再覆盖为事务格式。
+ */
 typedef struct HeapTupleFields
 {
 	TransactionId t_xmin;		/* inserting xact ID */
@@ -152,6 +159,11 @@ typedef struct DatumTupleFields
 
 struct HeapTupleHeaderData
 {
+/**
+在这里，t_choice 可以存储两种类型的数据：HeapTupleFields 或 DatumTupleFields。
+这意味着，t_choice 既可以作为堆元组（Heap Tuple）的字段，也可以作为通用数据（Datum）的字段。
+具体使用哪一种，取决于外部逻辑的选择。
+ */
 	union
 	{
 		HeapTupleFields t_heap;

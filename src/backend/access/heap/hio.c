@@ -616,6 +616,7 @@ loop:
 		if (otherBuffer == InvalidBuffer)
 		{
 			/* easy case */
+			// try to use BI = bulk-insert strategy
 			buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);

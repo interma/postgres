@@ -7555,17 +7555,17 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	/* Write out all dirty data in SLRUs and the main buffer pool */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);
 	CheckpointStats.ckpt_write_t = GetCurrentTimestamp();
-	CheckPointCLOG();
+	CheckPointCLOG();			//  Write dirty CLOG pages to disk
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
-	CheckPointBuffers(flags);
+	CheckPointBuffers(flags);	// 脏页
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
 	CheckpointStats.ckpt_sync_t = GetCurrentTimestamp();
-	ProcessSyncRequests();
+	ProcessSyncRequests();		// 处理之前各个write注册过来的sync请求
 	CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();
 

@@ -97,6 +97,12 @@ ExecInitTableFunctionResult(Expr *expr,
  *
  * This is used by nodeFunctionscan.c.
  */
+/**
+ExecMakeTableFunctionResult 是 PostgreSQL 执行器中的一个函数，
+用于执行表函数（table function），并将其结果“物化”到一个 Tuplestore 对象中。
+所谓表函数，就是返回多行多列结果的 SQL 或 PL/pgSQL 函数。
+该函数的主要作用是将表函数的所有输出行一次性收集到内存或临时文件中，便于后续顺序或随机访问。
+ */
 Tuplestorestate *
 ExecMakeTableFunctionResult(SetExprState *setexpr,
 							ExprContext *econtext,

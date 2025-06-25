@@ -76,7 +76,11 @@
  *
  * The entire MdfdVec array is palloc'd in the MdCxt memory context.
  */
-
+/**
+这段注释和结构体定义解释了 PostgreSQL 磁盘存储管理器（magnetic disk storage manager，简称 md）的分段文件管理机制。
+由于操作系统对单个文件大小有限制（通常为 2GB），PostgreSQL 采用将一个大表或索引拆分为多个“段文件”（segment file）的方式，每个段文件的大小不超过 RELSEG_SIZE（在 pg_config.h 中配置）。
+这样可以突破单文件大小的限制，支持超大关系型数据表。
+ */
 typedef struct _MdfdVec
 {
 	File		mdfd_vfd;		/* fd number in fd.c's pool */
@@ -456,6 +460,11 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
  * EOF).  Note that we assume writing a block beyond current EOF
  * causes intervening file space to become filled with zeroes.
  */
+/**
+mdextend 函数用于向指定的关系（如表或索引）追加一个新的数据块。
+它的语义与 mdwrite 类似，都是向指定位置写入数据，但 mdextend 专门用于扩展关系文件，即在文件末尾或之后的位置写入新块。
+写入超出当前文件末尾的块时，假定中间未分配的空间会自动用零填充。
+ */
 void
 mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 const void *buffer, bool skipFsync)
@@ -509,8 +518,9 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				 errhint("Check free disk space.")));
 	}
 
+	// 写入成功后，如果不是临时关系且未跳过 fsync，则将该段注册为“脏段”，以便后续同步到磁盘。
 	if (!skipFsync && !SmgrIsTemp(reln))
-		register_dirty_segment(reln, forknum, v);
+		register_dirty_segment(reln, forknum, v);	// 将fsync注册给checkpointer
 
 	Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
 }
@@ -821,6 +831,8 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		size_t		transferred_this_segment;
 		size_t		size_this_segment;
 
+		// 尝试打开relfilenode，返回MdfdVec结构
+		// 它是段文件管理结构，其中包含标准库FILE结构，进入到FD层就是fd文件句柄了
 		v = _mdfd_getseg(reln, forknum, blocknum, false,
 						 EXTENSION_FAIL | EXTENSION_CREATE_RECOVERY);
 
@@ -833,6 +845,7 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				RELSEG_SIZE - (blocknum % ((BlockNumber) RELSEG_SIZE)));
 		nblocks_this_segment = Min(nblocks_this_segment, lengthof(iov));
 
+		// buffers to iovec: 支持一次读n个block
 		iovcnt = buffers_to_iovec(iov, buffers, nblocks_this_segment);
 		size_this_segment = nblocks_this_segment * BLCKSZ;
 		transferred_this_segment = 0;
@@ -842,6 +855,7 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 * we hit EOF rather than assuming that a short read means we hit the
 		 * end.
 		 */
+		// 显然要循环读，pread不保证一次读完
 		for (;;)
 		{
 			TRACE_POSTGRESQL_SMGR_MD_READ_START(forknum, blocknum,
@@ -932,7 +946,7 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 #ifdef CHECK_WRITE_VS_EXTEND
 	Assert((uint64) blocknum + (uint64) nblocks <= (uint64) mdnblocks(reln, forknum));
 #endif
-
+// 逻辑和mdreadv基本一致
 	while (nblocks > 0)
 	{
 		struct iovec iov[PG_IOV_MAX];
@@ -1011,6 +1025,7 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		}
 
 		if (!skipFsync && !SmgrIsTemp(reln))
+		// 注册fsync请求给checkpointer
 			register_dirty_segment(reln, forknum, v);
 
 		nblocks -= nblocks_this_segment;
@@ -1592,6 +1607,10 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
  * segment, according to "behavior".  Note: skipFsync is only used in the
  * EXTENSION_CREATE case.
  */
+/**
+该函数根据给定的关系对象（reln）、分叉类型（forknum）、块号（blkno）等参数，查找并返回包含该块的文件段（MdfdVec 结构体指针）。
+如果目标文件段不存在，函数的行为由 behavior 参数决定：可以报错（ereport）、返回 NULL，或者创建新的文件段。
+ */
 static MdfdVec *
 _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			 bool skipFsync, int behavior)
@@ -1644,7 +1663,8 @@ _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 
 		if (nblocks > ((BlockNumber) RELSEG_SIZE))
 			elog(FATAL, "segment too big");
-
+		
+		// create new segments as needed
 		if ((behavior & EXTENSION_CREATE) ||
 			(InRecovery && (behavior & EXTENSION_CREATE_RECOVERY)))
 		{

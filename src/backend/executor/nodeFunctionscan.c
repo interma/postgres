@@ -91,6 +91,7 @@ FunctionNext(FunctionScanState *node)
 		if (tstore == NULL)
 		{
 			node->funcstates[0].tstore = tstore =
+				// 留意这里会"物化"表函数的结果到一个 Tuplestore 中
 				ExecMakeTableFunctionResult(node->funcstates[0].setexpr,
 											node->ss.ps.ps_ExprContext,
 											node->argcontext,

@@ -25,6 +25,8 @@ PG_MODULE_MAGIC;
 /*
  * Record structure holding the to be exposed cache data.
  */
+// BufferCachePagesRec 结构体用于保存单个缓冲区页的详细信息，
+// 包括 buffer id、所属表空间、数据库、块号、是否有效、是否脏页、使用计数和被多少后端进程引用等。
 typedef struct
 {
 	uint32		bufferid;
@@ -55,6 +57,30 @@ typedef struct
 	BufferCachePagesRec *record;
 } BufferCachePagesContext;
 
+/**
+主要的导出函数有：
+pg_buffercache_pages：返回所有缓冲区页的详细信息。
+	它会遍历所有缓冲区，锁定每个 buffer header，收集相关元数据，并以行集的方式返回。
+	对于无效或未使用的 buffer，只返回 bufferid，其余字段为 NULL。
+pg_buffercache_summary：返回缓冲区的汇总统计，
+	包括已用、未用、脏页、被引用页数，以及平均使用计数。
+	它遍历所有缓冲区，统计各类状态，**无需加锁**，因为统计本身允许轻微的不一致。
+pg_buffercache_usage_counts：
+	统计各个 usage count（LRU 算法相关）的缓冲区数量、脏页数量和被引用数量，并以多行形式返回。
+pg_buffercache_evict：
+	尝试驱逐指定 buffer id 的缓冲区页，仅超级用户可用，且只允许驱逐未被引用的缓冲区。
+ */
+
+/**
+锁相关：
+在 pg_buffercache_pages 函数中，为了保证每个缓冲区元数据（如 buffer id、表空间、块号、usage count、脏页标记等）的自洽性，
+会对每个 buffer header 加锁（调用 LockBufHdr 和 UnlockBufHdr）。这样可以确保读取到的单个 buffer 的状态是原子的，不会被并发修改。
+但由于没有对整个缓冲池加全局锁，所以不同 buffer 之间的快照可能并不一致。
+
+而在 pg_buffercache_summary 和 pg_buffercache_usage_counts 这类汇总统计函数中，
+不会对 buffer header 加锁，而是直接用原子操作读取状态（如 pg_atomic_read_u32(&bufHdr->state)）。
+这是因为这些统计本身允许有轻微的不一致（比如统计过程中 buffer 状态发生变化），这样可以大幅提升性能，避免加锁带来的开销和阻塞。
+ */
 
 /*
  * Function returning data from the shared buffer cache - buffer number,
@@ -155,6 +181,7 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 
 			bufHdr = GetBufferDescriptor(i);
 			/* Lock each buffer header before inspecting. */
+			// 这里给BufferDesc加锁
 			buf_state = LockBufHdr(bufHdr);
 
 			fctx->record[i].bufferid = BufferDescriptorGetBuffer(bufHdr);
@@ -188,6 +215,7 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 
 	if (funcctx->call_cntr < funcctx->max_calls)
 	{
+		// funcscan每次调用时i++
 		uint32		i = funcctx->call_cntr;
 		Datum		values[NUM_BUFFERCACHE_PAGES_ELEM];
 		bool		nulls[NUM_BUFFERCACHE_PAGES_ELEM];
@@ -258,6 +286,7 @@ pg_buffercache_summary(PG_FUNCTION_ARGS)
 	int32		buffers_pinned = 0;
 	int64		usagecount_total = 0;
 
+	// 通过函数参数构建返回类型的元组描述符
 	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
@@ -302,7 +331,9 @@ pg_buffercache_summary(PG_FUNCTION_ARGS)
 		nulls[4] = true;
 
 	/* Build and return the tuple. */
+	// 内存中构造的datum tuple格式
 	tuple = heap_form_tuple(tupledesc, values, nulls);
+	// 将tuple转换为Datum类型（复合类型），返回
 	result = HeapTupleGetDatum(tuple);
 
 	PG_RETURN_DATUM(result);
@@ -312,12 +343,19 @@ Datum
 pg_buffercache_usage_counts(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	// #define BM_MAX_USAGE_COUNT	5
 	int			usage_counts[BM_MAX_USAGE_COUNT + 1] = {0};
 	int			dirty[BM_MAX_USAGE_COUNT + 1] = {0};
 	int			pinned[BM_MAX_USAGE_COUNT + 1] = {0};
 	Datum		values[NUM_BUFFERCACHE_USAGE_COUNTS_ELEM];
 	bool		nulls[NUM_BUFFERCACHE_USAGE_COUNTS_ELEM] = {0};
 
+	/**
+		Helper function to build the state of a set-returning function used
+ 		in the context of a single call with materialize mode.
+
+		它来自动生成一个集合返回函数的状态：包括返回结果的tupledesc
+	 */
 	InitMaterializedSRF(fcinfo, 0);
 
 	for (int i = 0; i < NBuffers; i++)
@@ -332,6 +370,7 @@ pg_buffercache_usage_counts(PG_FUNCTION_ARGS)
 		if (buf_state & BM_DIRTY)
 			dirty[usage_count]++;
 
+		// refcount>0 means the buffer is pinned
 		if (BUF_STATE_GET_REFCOUNT(buf_state) > 0)
 			pinned[usage_count]++;
 	}
@@ -346,12 +385,41 @@ pg_buffercache_usage_counts(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 
+/**
+这里为什么返回0能达到返回多条tuple记录的效果？比如：
+ubuntu=# SELECT * FROM pg_buffercache_usage_counts();
+ usage_count | buffers | dirty | pinned
+-------------+---------+-------+--------
+           0 |   14487 |     0 |      0
+           1 |    1331 |     0 |      0
+           2 |     127 |     0 |      0
+           3 |      60 |     0 |      0
+           4 |      27 |     0 |      0
+           5 |     352 |     1 |      0
+(6 rows)
+
+这是因为：
+pg_buffercache_usage_counts 是一个集合返回函数（Set-Returning Function, SRF），并且采用了“物化模式”（materialize mode）实现。
+在 PostgreSQL 的 C 扩展开发中，集合返回函数有两种常见实现方式：一种是每次调用返回一条记录，另一种是一次性将所有结果写入 tuplestore，然后一次性返回。
+
+在本函数中，调用了 InitMaterializedSRF(fcinfo, 0)，这会初始化一个 tuplestore，并将所有结果通过 tuplestore_putvalues 写入 tuplestore。当所有结果都写入后，直接 return (Datum) 0;，
+PostgreSQL 的执行框架会自动从 tuplestore 中逐条取出结果并返回给 SQL 层。
+
+这种写法的本质是：
+- 你只需要负责把所有结果写入 tuplestore，
+- 返回值本身并不重要（通常写成 (Datum) 0 只是占位），
+- PostgreSQL 的 SRF 执行机制会自动处理后续的结果集输出。
+因此，return (Datum) 0; 在这里并不是返回一条数据，而是告诉 PostgreSQL “结果已经全部写入 tuplestore，可以开始返回结果集了”。
+这是物化集合返回函数的标准写法。
+ */
+
 	return (Datum) 0;
 }
 
 /*
  * Try to evict a shared buffer.
  */
+// 尝试驱逐指定 buffer id 的缓冲区页，仅超级用户可用，且只允许驱逐未被引用的缓冲区。
 Datum
 pg_buffercache_evict(PG_FUNCTION_ARGS)
 {

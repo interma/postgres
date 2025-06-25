@@ -3476,6 +3476,7 @@ BgBufferSync(WritebackContext *wb_context)
  * (BUF_WRITTEN could be set in error if FlushBuffer finds the buffer clean
  * after locking it, but we don't care all that much.)
  */
+// SyncOneBuffer() is only called by checkpointer and bgwriter
 static int
 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 {
@@ -3774,6 +3775,8 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  * If the caller has an smgr reference for the buffer's relation, pass it
  * as the second parameter.  If not, pass NULL.
  */
+// 需要注意的是，这个写操作只是把数据交给了内核缓冲区，数据并不一定立即落盘
+// 最后调用的是smgrwrite，而不是sync
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)

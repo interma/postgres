@@ -412,6 +412,10 @@ ProcessSyncRequests(void)
 				char		path[MAXPGPATH];
 
 				INSTR_TIME_SET_CURRENT(sync_start);
+/**
+在 ProcessSyncRequests 函数中，最后实际调用的系统调用是由 syncsw[entry->tag.handler].sync_syncfiletag 这个函数指针完成的。对于大多数普通数据文件（如表、索引等），这个指针最终会调用 mdsyncfiletag，
+而 mdsyncfiletag 内部会调用 FileSync，而 FileSync 又会调用操作系统的 fsync 系统调用。
+ */
 				if (syncsw[entry->tag.handler].sync_syncfiletag(&entry->tag,
 																path) == 0)
 				{
