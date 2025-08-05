@@ -267,7 +267,11 @@ static volatile FastPathStrongRelationLockData *FastPathStrongRelationLocks;
 static HTAB *LockMethodLockHash;
 static HTAB *LockMethodProcLockHash;
 static HTAB *LockMethodLocalHash;
-
+/**
+LockMethodLockHash：用于存储锁对象（Lock）的哈希表，通常用于全局管理数据库中的锁资源。
+LockMethodProcLockHash：用于存储进程锁（ProcLock）的哈希表，跟踪每个后台进程或会话持有的锁。
+LockMethodLocalHash：用于存储本地锁信息的哈希表，通常用于当前进程或会话的锁状态管理。
+ */
 
 /* private state for error cleanup */
 static LOCALLOCK *StrongLockInProgress;

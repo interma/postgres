@@ -159,7 +159,14 @@ typedef enum
  *
  * See PROC_HDR for details.
  */
-struct PGPROC
+/**
+结构体成员涵盖了进程的
+	信号量、事务 ID、虚拟事务 ID、数据库/角色/临时命名空间 OID、
+	锁等待信息、同步复制状态、锁管理相关链表、子事务缓存、组提交/组状态更新支持、
+	快速路径锁、锁组支持等。
+整体设计保证了高并发下的事务和锁管理高效、可靠，是 PostgreSQL 并发控制和资源管理的基础。
+ */
+ struct PGPROC
 {
 	/* proc->links MUST BE FIRST IN STRUCT (see ProcSleep,ProcWakeup,etc) */
 	dlist_node	links;			/* list link if process is in a list */
@@ -260,6 +267,8 @@ struct PGPROC
 	 * linked into one of these lists, according to the partition number of
 	 * their lock.
 	 */
+	// partition_number = 锁对象哈希值 % 分区总数。
+	// 这样可以保证同一类锁总是落在同一个分区，便于加锁和管理，同时实现负载均衡和高并发。
 	dlist_head	myProcLocks[NUM_LOCK_PARTITIONS];
 
 	XidCacheStatus subxidStatus;	/* mirrored with

@@ -462,6 +462,24 @@ pg_lock_status(PG_FUNCTION_ARGS)
  *
  * We need not consider predicate locks here, since those don't block anything.
  */
+/**
+这段注释介绍了 PostgreSQL 的 `pg_blocking_pids` 函数的功能和实现思路。
+该函数用于返回阻塞指定进程（PID）的所有进程 PID 的数组。所谓阻塞，
+- 既包括“硬阻塞”（即有进程持有与目标进程当前请求冲突的锁），
+- 也包括“软阻塞”（即有进程也在等待同一个锁，并且排在目标进程前面）。
+
+在并行查询场景下，目标 PID 可能属于一个锁组（lock group），
+此时函数会返回阻塞该组任意成员的所有进程的 PID，并且这些 PID 是阻塞方锁组的组长 PID。
+这样，调用者可以方便地将结果与 `pg_backend_pid()` 查询到的客户端 PID 列表进行比对，
+即使在并行查询期间也能正确识别阻塞关系。
+
+由于并行查询可能导致多个等待者被同一个进程阻塞，或者多个阻塞者属于同一个锁组，
+因此结果数组中可能会有重复的 PID。该函数不会去重这些重复项。
+
+最后，注释还说明谓词锁（predicate lock）不会导致阻塞，因此无需在此函数中考虑。
+ */
+
+// 参数1个：blocked_pid，即它已经被阻塞，函数返回那些pid阻塞了它
 Datum
 pg_blocking_pids(PG_FUNCTION_ARGS)
 {

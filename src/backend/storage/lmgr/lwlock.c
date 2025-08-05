@@ -126,6 +126,20 @@ StaticAssertDecl(LW_VAL_EXCLUSIVE > (uint32) MAX_BACKENDS,
  * All these names are user-visible as wait event names, so choose with care
  * ... and do not forget to update the documentation's list of wait events.
  */
+/**
+这段注释解释了 PostgreSQL 中 LWLock（轻量级锁）“tranche”机制的分类和用途。
+tranche 是 LWLock 的分组标识，用于区分不同类型或用途的锁。共有三类 tranche：
+
+1. 第一类是 lwlocklist.h 文件中定义的每个具名锁，每个锁都有自己的 tranche。
+	这些名字会被收集到 BuiltinTrancheNames 数组中。
+2. 第二类是一些内置*锁组*的预定义 tranche，这些组在 lwlock.h 的 BuiltinTrancheIds 枚举中列出，
+	对应的名字也在 BuiltinTrancheNames 数组中。
+3. 第三类是扩展模块可以通过 RequestNamedLWLockTranche 或 LWLockRegisterTranche 动态创建的新 tranche，
+	这些名字会记录在 LWLockTrancheNames 数组中。
+
+所有这些 tranche 名称最终会作为等待事件（wait event）对外展示，因此命名要谨慎，
+并且要同步更新文档中的事件列表。这种机制有助于锁的分组管理、性能分析和可观测性。
+ */
 static const char *const BuiltinTrancheNames[] = {
 #define PG_LWLOCK(id, lockname) [id] = CppAsString(lockname),
 #include "storage/lwlocklist.h"

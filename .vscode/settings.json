@@ -1,0 +1,14 @@
+{
+    "files.associations": {
+        "tuple": "c",
+        "bitset": "cpp",
+        "typeinfo": "c",
+        "postgres.h": "c",
+        "elog.h": "c",
+        "pg_sequence.h": "c",
+        "sequence.h": "c",
+        "transam.h": "c",
+        "table.h": "c",
+        "atomics.h": "c"
+    }
+}

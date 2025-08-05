@@ -491,6 +491,7 @@ pgss_shmem_request(void)
 		prev_shmem_request_hook();
 
 	RequestAddinShmemSpace(pgss_memsize());
+	// 给扩展用的自定义lwlock tranche
 	RequestNamedLWLockTranche("pg_stat_statements", 1);
 }
 
@@ -533,6 +534,8 @@ pgss_shmem_startup(void)
 	if (!found)
 	{
 		/* First time through ... */
+		// 扩展的用锁lwlock方式
+		// 之前已经自定义好了RequestNamedLWLockTranche("pg_stat_statements", 1);
 		pgss->lock = &(GetNamedLWLockTranche("pg_stat_statements"))->lock;
 		pgss->cur_median_usage = ASSUMED_MEDIAN_INIT;
 		pgss->mean_query_len = ASSUMED_LENGTH_INIT;
