@@ -9,6 +9,9 @@
         "sequence.h": "c",
         "transam.h": "c",
         "table.h": "c",
-        "atomics.h": "c"
+        "atomics.h": "c",
+        "procsignal.h": "c",
+        "smgr.h": "c",
+        "relfilelocator.h": "c"
     }
 }

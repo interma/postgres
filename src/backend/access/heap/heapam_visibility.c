@@ -1779,6 +1779,7 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		case SNAPSHOT_DIRTY:
 			return HeapTupleSatisfiesDirty(htup, snapshot, buffer);
 		case SNAPSHOT_HISTORIC_MVCC:
+			// Only usable on tuples from catalog tables!
 			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer);
 		case SNAPSHOT_NON_VACUUMABLE:
 			return HeapTupleSatisfiesNonVacuumable(htup, snapshot, buffer);

@@ -576,4 +576,7 @@ extern Datum Float8GetDatum(float8 X);
 #define NON_EXEC_STATIC static
 #endif
 
+//@interma: for extension to refer header file
+#define PG_VERSION_NUM 170000
+
 #endif							/* POSTGRES_H */

@@ -370,6 +370,15 @@ GetCatalogSnapshot(Oid relid)
  *		catalog with the specified OID, even while historic snapshots are set
  *		up.
  */
+/**
+`GetNonHistoricCatalogSnapshot` 函数用于获取一个足够新的快照（snapshot），专门用于扫描指定 OID 的系统目录表，即使在当前已经设置了历史快照的情况下也能正常工作。
+
+在 PostgreSQL 中，快照是 MVCC（多版本并发控制）机制的核心，它决定了事务能看到哪些数据版本。通常情况下，事务会使用一致的快照来保证数据的一致性视图。但是，当系统需要进行逻辑复制、时间点恢复或其他需要历史数据的操作时，可能会设置历史快照（historic snapshot），这些快照可能会"看到"过时的系统目录信息。
+
+然而，在某些情况下，即使在使用历史快照的上下文中，系统也需要访问最新的系统目录信息（如表结构、索引定义、权限信息等），以确保操作的正确性。`GetNonHistoricCatalogSnapshot` 就是为这种场景设计的，它会返回一个"非历史"的快照，确保能够看到系统目录表的最新状态，避免因使用过时的元数据而导致的错误或不一致。
+
+函数接受一个 `Oid relid` 参数，指定需要扫描的系统目录表的对象标识符，并返回一个适合该表扫描的最新快照。这种设计保证了系统在处理历史数据时仍能正确访问当前的元数据信息。
+ */
 Snapshot
 GetNonHistoricCatalogSnapshot(Oid relid)
 {
