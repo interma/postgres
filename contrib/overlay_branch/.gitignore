@@ -1,0 +1,21 @@
+# Object files (now live under src/)
+src/*.o
+src/*.bc
+src/*.so
+
+# Top-level shared library build outputs
+*.so
+*.dll
+*.dylib
+overlay_branch-*.sql
+
+# PGXS / Make build artifacts
+Makefile.regress
+regression.*
+test_output/
+tmp_check/
+log/
+results/
+
+# Meson build artifacts
+meson-private/
