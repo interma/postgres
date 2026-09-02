@@ -1,0 +1,6 @@
+# overlay_branch extension
+comment = 'Overlay Branch - speculative database state using table overlay and delta store'
+default_version = '1.0'
+module_pathname = '$libdir/overlay_branch'
+relocatable = false
+schema = 'public'
