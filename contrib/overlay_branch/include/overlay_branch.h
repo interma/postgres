@@ -48,6 +48,7 @@ typedef struct BranchContext
 	bool		is_active;		/* whether we are inside a branch */
 	char		mode[16];		/* "live" or "snapshot" */
 	TimestampTz	created_at;		/* branch creation time */
+	Oid			owner;			/* branch owner (from pg_branch.owner) */
 } BranchContext;
 
 /* ----------
@@ -62,6 +63,7 @@ typedef struct DeltaTuple
 	char		op;				/* 'I', 'U', or 'D' */
 	char	   *old_version;	/* base version for conflict check */
 	bytea	   *tuple_data;		/* serialized new tuple (NULL for delete) */
+	bool		emitted;		/* Step4b: has this entry been output in the main pass? */
 } DeltaTuple;
 
 /* ----------
@@ -95,10 +97,10 @@ extern void		overlay_branch_discard_internal(const char *branch_name);
  */
 extern void		overlay_delta_insert(int32 branch_id, Oid relid,
 									  const char *key, char op,
-									  const char *old_version, bytea *tuple_data);
+									  const char *old_version, const char *tuple_json_cstr);
 extern void		overlay_delta_update(int32 branch_id, Oid relid,
 									  const char *key, char op,
-									  const char *old_version, bytea *tuple_data);
+									  const char *old_version, const char *tuple_json_cstr);
 extern bool		overlay_delta_lookup(int32 branch_id, Oid relid,
 									  const char *key, DeltaTuple *out_tuple);
 extern List    *overlay_delta_list_for_rel(int32 branch_id, Oid relid);
@@ -120,8 +122,36 @@ extern void		overlay_modify_delete(Relation rel, TupleTableSlot *slot);
  * ----------
  */
 extern char    *overlay_serialize_pk(Relation rel, TupleTableSlot *slot);
-extern bytea   *overlay_serialize_tuple(Relation rel, TupleTableSlot *slot);
+extern char    *overlay_serialize_tuple(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_tuple_version(Relation rel, TupleTableSlot *slot);
 extern bool		overlay_relation_has_pk(Relation rel);
+
+/* ----------
+ * Step7 HARD GUARD: shared helper for checking rel eligibility inside an
+ * active branch.  Returns NULL if ok, otherwise returns a malloc'd cstring
+ * explaining why the guard fired (caller ereports it with a uniform
+ * HINT to leave branch mode).
+ *
+ * We also expose individual predicate helpers so both ExecutorRun (per-DML)
+ * and ProcessUtility (per-DDL) hooks can compose the same error messages.
+ *
+ *  Guard level order (cheapest → most expensive; any one true → ERROR):
+ *    G1: relkind != RELKIND_RELATION       (分区表/视图/matview/外部/序列/组合/TOAST)
+ *    G2: rel is partition child            (rd_rel->relispartition)
+ *    G3: rel has triggers (excluding internal) → ri_Triggers != NIL or
+ *        trigdesc != NULL && any NOT tgisinternal
+ *    G4: rel is FK-referenced / has FKs    (rd_att->constr has FK / ref FK count>0)
+ *    G5: NO PRIMARY KEY                    (overlay_relation_has_pk == false)
+ * ----------
+ */
+extern bool overlay_guard_rel_ok(Relation rel, char **reason);
+extern void overlay_guard_ensure_branch_or_main_active(void); /* prerequisite */
+extern void overlay_guard_ereport_fail(const char *operation, const char *relname, const char *reason);
+
+/* Step7 ProcessUtility guard: T_TruncateStmt / T_DropStmt / T_AlterTable /
+ * T_CreateStmt / T_IndexStmt / T_VacuumStmt / T_ClusterStmt / T_RenameStmt etc.
+ * — any DDL on user rels inside branch mode. */
+extern bool overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
+											 char **objname, char **reason);
 
 #endif							/* OVERLAY_BRANCH_H */

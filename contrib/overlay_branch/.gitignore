@@ -7,7 +7,6 @@ src/*.so
 *.so
 *.dll
 *.dylib
-overlay_branch-*.sql
 
 # PGXS / Make build artifacts
 Makefile.regress
