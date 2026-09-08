@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "overlay_branch.h"
+#include "branch_scan.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -52,7 +53,7 @@
 #endif
 
 /* Fully qualified table / schema names (control file pins schema = 'overlay_branch') */
-#define OBSCHEMA        "overlay_branch"
+/* OBSCHEMA defined in overlay_branch.h public header */
 #define OBTABLE_DELTA   OBSCHEMA ".pg_branch_delta"
 #define OBTABLE_BRANCH  OBSCHEMA ".pg_branch"
 
@@ -73,6 +74,58 @@ static bool overlay_branch_enabled = true;
 BranchContext *CurrentBranchContext = NULL;
 static bool ob_in_apply_operation = false;
 static bool ob_in_guc_setconfig = false;
+
+/* ---------- Recursion guard flags (4-layer Bypass stack; see branch_scan.c Planner hook) ---------- */
+static bool ob_in_overlay_helper = false;
+static bool ob_in_write_redirect = false;
+
+/* --- Layer 1: apply_operation (write replay into MAIN) bypass --- */
+bool
+overlay_in_apply_operation(void)
+{
+	return ob_in_apply_operation;
+}
+
+/* --- Layer 2: shared 2-pass helper (overlay_main_plus_delta / BranchScan LazyMaterialize) --- */
+bool
+overlay_in_overlay_helper(void)
+{
+	return ob_in_overlay_helper;
+}
+
+void
+overlay_overlay_helper_enter(void)
+{
+	ob_in_overlay_helper = true;
+}
+
+void
+overlay_overlay_helper_exit(void)
+{
+	ob_in_overlay_helper = false;
+}
+
+/* --- Layer 3: Step 4a write-redirection ExecutorRun hook ---
+ *      Internal SPI CMD_SELECT queries (WHERE-row lookup) must scan
+ *      raw MAIN heap (SeqScan/IndexScan), NEVER the overlay CustomScan —
+ *      otherwise write-redirect code hard-casts SeqScanState offsets = SIGSEGV. */
+bool
+overlay_in_write_redirect(void)
+{
+	return ob_in_write_redirect;
+}
+
+void
+overlay_write_redirect_enter(void)
+{
+	ob_in_write_redirect = true;
+}
+
+void
+overlay_write_redirect_exit(void)
+{
+	ob_in_write_redirect = false;
+}
 
 /* ================================================================
  * Saved hook values (for chaining in future)
@@ -108,13 +161,13 @@ static bool ob_relid_is_user_table(Oid relid, Relation *outrel, char **relname_o
 static const char *ob_utility_opname(NodeTag tag);
 
 /* ---------- SPI one-shot helper (used by Step 2/3/4 internal SPI paths) ---------- */
-static int	ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount);
+int	ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount);
 
 /* ---------- Slot / junk-attribute helpers (Step 4 UPDATE/DELETE redirect) ---------- */
 static inline AttrNumber rel_attno_to_slot_idx(TupleDesc slotdesc, AttrNumber rel_attno);
 static char *slot_get_ctid_cstr(TupleTableSlot *slot);
 static TupleTableSlot *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr);
-static TupleTableSlot *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data);
+TupleTableSlot *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data);
 
 /* ---------- Step5 apply per-op per-pass helpers ---------- */
 static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt);
@@ -215,6 +268,8 @@ _PG_init(void)
 	ProcessUtility_hook = overlay_ProcessUtility;
 
 	elog(DEBUG1, "overlay_branch: module loaded");
+
+	branch_scan_init();
 }
 
 /* ================================================================
@@ -776,8 +831,13 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 		queryDesc->planstate != NULL &&
 		IsA(queryDesc->planstate, ModifyTableState))
 	{
-		ModifyTableState *mt = (ModifyTableState *) queryDesc->planstate;
-		ModifyTable *plan = (ModifyTable *) mt->ps.plan;
+		/* C90: declarations BEFORE any executable statement. */
+		ModifyTableState *mt = NULL;
+		ModifyTable      *plan = NULL;
+		overlay_write_redirect_enter();
+		PG_TRY();
+		mt = (ModifyTableState *) queryDesc->planstate;
+		plan = (ModifyTable *) mt->ps.plan;
 
 		/* ---- Step7 DML hard guard.
 		 *
@@ -881,6 +941,7 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 			}
 		}
 
+
 		if (mt->mt_nrels == 1 && list_length(plan->resultRelations) == 1)
 		{
 			ResultRelInfo *rri = mt_state_result_rel(mt, 0);
@@ -913,6 +974,7 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 			if ((cmd == CMD_UPDATE || cmd == CMD_DELETE) &&
 				overlay_should_redirect(rel))
 			{
+
 				PlanState  *subplan;
 				uint64		ndone = 0;
 				TupleTableSlot *junk_slot;
@@ -1048,13 +1110,14 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 				}
 
 				queryDesc->estate->es_processed = ndone;
-				return;			/* NEVER fall through to standard ExecutorRun;
+				goto ob_write_redirect_done;			/* NEVER fall through to standard ExecutorRun;
 								 * the main table must stay UNTOUCHED. */
 			}
 
 			/* --- CMD_INSERT: if target qualifies, redirect fully. --- */
 			if (cmd == CMD_INSERT && overlay_should_redirect(rel))
 			{
+
 				PlanState  *subplan;
 				uint64		ninserted = 0;
 				TupleTableSlot *slot;
@@ -1105,11 +1168,16 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 				}
 
 				queryDesc->estate->es_processed = ninserted;
-				return;			/* DO NOT fall through to standard ExecutorRun;
+				goto ob_write_redirect_done;			/* DO NOT fall through to standard ExecutorRun;
 								 * we've already handled the write ourselves,
 								 * main table must stay untouched. */
 			}
 		}
+		PG_CATCH();
+			overlay_write_redirect_exit();
+			PG_RE_THROW();
+		PG_END_TRY();
+		overlay_write_redirect_exit();
 	}
 
 	/* Fallback: chaining or standard executor for:
@@ -1117,12 +1185,26 @@ overlay_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 	 *   - non-DML queries
 	 *   - multi-target / partitioned DML (MVP unsupported)
 	 *   - tables that fail overlay_should_redirect predicate
+	 *     (IMPORTANT: catalog tables inside overlay_branch schema
+	 *      fall here.  If we erroneously returned above when WR
+	 *      didn't handle them, their SPI INSERT/UPDATE/DELETE
+	 *      would silently not persist.)
 	 *   - CMD_UPDATE/DELETE on catalog/tables we don't redirect
 	 */
 	if (prev_ExecutorRun)
 		prev_ExecutorRun(queryDesc, direction, count, execute_once);
 	else
 		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+	return;
+
+ob_write_redirect_done:
+	/* Handled entirely by write-redirection (INSERT/U/D branch inside WR
+	 * body explicitly goto'd here): we have already written delta rows and
+	 * MUST NOT fall through to standard ExecutorRun — the main table must
+	 * stay UNTOUCHED.
+	 */
+	overlay_write_redirect_exit();
+	return;
 }
 
 /* ----------------------------------------------------------------
@@ -1497,12 +1579,7 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 		ReturnSetInfo  *rsinfo;
 		TupleDesc		exp_desc;
 		int32			branch_id;
-		List		   *delta_list;
 		List		   *result_slots;
-		StringInfoData	sql;
-		char		   *q_relname;
-		int				ret;
-		int				natts;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -1515,7 +1592,7 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 		relid = PG_GETARG_OID(0);
 		rel = table_open(relid, AccessShareLock);
 		reldesc = RelationGetDescr(rel);
-		natts = reldesc->natts;
+		(void) reldesc;
 
 		/* ----- Must be called with column-def list FROM ... AS (col type, ...) ----- */
 		rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -1540,161 +1617,28 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 							RelationGetRelationName(rel))));
 
 		branch_id = overlay_branch_get_current_id();
-		delta_list = overlay_delta_list_for_rel(branch_id, relid);
-
-		/* ----- Pass 1: seqscan main table → merge with delta ----- */
-		q_relname = quote_qualified_identifier(
-			get_namespace_name(RelationGetNamespace(rel)),
-			RelationGetRelationName(rel));
-		initStringInfo(&sql);
-		appendStringInfo(&sql, "SELECT * FROM %s", q_relname);
-		pfree(q_relname);
-
-		ret = ob_spi_one_shot(sql.data, true, 0);
-		pfree(sql.data);
-
-		if (ret != SPI_OK_SELECT)
+		/* Delegate overlay merge to shared 2-pass helper so that
+		 * SRF overlay_main_plus_delta and BranchScan CustomScan share
+		 * bit-exact identical merge semantics.  CRITICAL: raise the
+		 * B1.5 overlay-helper bypass flag before invoking the helper
+		 * so the helper\'s *internal* SPI MAIN seqscan does NOT
+		 * re-trigger the planner CustomScan injection (which would
+		 * recurse and SIGSEGV).  Wrap with PG_TRY so that ANY error
+		 * (ereport, SPI failure, or allocation bug) always restores
+		 * the bypass flag — otherwise a single failed helper call
+		 * would permanently disable overlay reads for this session. */
+		overlay_overlay_helper_enter();
+		PG_TRY();
 		{
-			SPI_finish();
-			table_close(rel, AccessShareLock);
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("overlay_main_plus_delta: SPI main seqscan failed ret=%d", ret)));
+			result_slots = ob_compute_overlay_slots(relid, branch_id);
 		}
-
-		result_slots = NIL;
-
-		/* --- Copy SPI main rows into persistent relation-only slots & merge --- */
-		if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
+		PG_CATCH();
 		{
-			HeapTuple  *htups = SPI_tuptable->vals;
-			TupleDesc	td_spi = SPI_tuptable->tupdesc;
-			uint64		n = SPI_processed;
-
-			/* CRITICAL: all `result_slots` List nodes and all lappend()
-			 * allocations MUST live in TopMemoryContext.  Pass1 runs
-			 * happens *inside* an active SPI connection, and if we
-			 * allocate list cells in SPIMemoryContext they get freed + 0x7F
-			 * poisoned by `SPI_finish()` below (L1054) then Pass2
-			 * dereferences a dangling List* and we SIGABRT on
-			 * Assert("IsPointerList(list)") in lappend().  Switch once
-			 * before any list-building starts. */
-			MemoryContextSwitchTo(TopMemoryContext);
-
-			for (uint64 i = 0; i < n; i++)
-			{
-				HeapTuple		htup = htups[i];
-				TupleTableSlot *main_slot;
-				TupleTableSlot *output_slot;
-				char		   *pk_key;
-				DeltaTuple	   *match = NULL;
-				ListCell	   *lc;
-
-				/* Build a persistent (TopMCxt) relation-only slot for main row.
-				 * Use an INDEPENDENT COPY of the tuple descriptor — the
-				 * slot must survive past table_close(rel) below, and if we
-				 * just borrow rel->rd_att the Cassert build poisons it on
-				 * close, producing 0x7F7F7F7F atttypids on per-call access. */
-				{
-					TupleDesc	slot_desc = CreateTupleDescCopy(reldesc);
-
-					main_slot = MakeSingleTupleTableSlot(slot_desc,
-														 &TTSOpsVirtual);
-				}
-				ExecClearTuple(main_slot);
-				for (int a = 0; a < natts; a++)
-				{
-					bool			isnull;
-					Form_pg_attribute ratt = TupleDescAttr(reldesc, a);
-					Datum			d;
-
-					d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
-					main_slot->tts_isnull[a] = isnull;
-					if (!isnull)
-					{
-						int16		typlen;
-						bool		typbyval;
-						get_typlenbyval(ratt->atttypid, &typlen, &typbyval);
-						d = datumCopy(d, typbyval, typlen);
-					}
-					main_slot->tts_values[a] = d;
-				}
-				ExecStoreVirtualTuple(main_slot);
-				main_slot->tts_nvalid = natts;
-
-				/* serialize_pk to match delta entries (returns TopMCxt cstr) */
-				pk_key = overlay_serialize_pk(rel, main_slot);
-
-				/* Linear scan delta List.  For MVP (< 1000 delta rows)
-				 * this is totally fine and avoids any risk of getting
-				 * the PG hash table API wrong (hash_create/HASHCTL etc). */
-				foreach(lc, delta_list)
-				{
-					DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-					if (strcmp(dt->key, pk_key) == 0)
-					{
-						match = dt;
-						break;
-					}
-				}
-
-				if (match == NULL)
-				{
-					/* Pure passthrough */
-					output_slot = main_slot;
-				}
-				else if (match->op == DELTA_OP_DELETE)
-				{
-					/* Tombstone — drop the main row entirely */
-					ExecDropSingleTupleTableSlot(main_slot);
-					match->emitted = true;
-					output_slot = NULL;
-				}
-				else
-				{
-					/* op='U' (override) or op='I' (shouldn't coincide,
-					 * but if it does delta wins per Live Branch
-					 * semantics — latest main + branch delta). */
-					if (match->tuple_data == NULL)
-						ereport(ERROR,
-								(errcode(ERRCODE_DATA_CORRUPTED),
-								 errmsg("overlay_main_plus_delta: delta op=%c for key=%s has NULL tuple_data",
-										match->op, match->key)));
-					output_slot = reconstruct_slot_from_delta(rel, match->tuple_data);
-					ExecDropSingleTupleTableSlot(main_slot);
-					match->emitted = true;
-				}
-				pfree(pk_key);
-
-				if (output_slot != NULL)
-					result_slots = lappend(result_slots, output_slot);
-			}
-
-			/* ----- Pass 2: delta INSERT rows that were NOT in main ----- */
-			{
-				ListCell   *lc;
-
-				foreach(lc, delta_list)
-				{
-					DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-
-					if (!dt->emitted && dt->op == DELTA_OP_INSERT)
-					{
-						TupleTableSlot *new_slot;
-
-						if (dt->tuple_data == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_DATA_CORRUPTED),
-									 errmsg("overlay_main_plus_delta: delta INSERT key=%s has NULL tuple_data",
-											dt->key)));
-						new_slot = reconstruct_slot_from_delta(rel, dt->tuple_data);
-						result_slots = lappend(result_slots, new_slot);
-						dt->emitted = true;
-					}
-				}
-			}
+			overlay_overlay_helper_exit();
+			PG_RE_THROW();
 		}
-		SPI_finish();
+		PG_END_TRY();
+		overlay_overlay_helper_exit();
 
 		/* Save stuff for per-call returns */
 		funcctx->user_fctx = result_slots;
@@ -2619,7 +2563,7 @@ overlay_branch_discard_internal(const char *branch_name)
  * statement.  Returns SPI_execute result code.  Caller is still
  * responsible for SPI_finish().
  */
-static int
+int
 ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount)
 {
 	int			cret;
@@ -2681,7 +2625,7 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 	ereport(DEBUG1,
 			(errmsg_internal("ODI[dbg] calling SPI, sql=%s", sql.data)));
 
-	ret = ob_spi_one_shot(sql.data, false, 0);
+	ret = ob_spi_one_shot(sql.data, false, 1);
 
 	ereport(DEBUG1,
 			(errmsg_internal("ODI[dbg] SPI_execute ret=%d processed=%lu",
@@ -2975,7 +2919,7 @@ overlay_delta_delete_all(int32 branch_id)
 					 "DELETE FROM " OBTABLE_DELTA " WHERE branch_id = %d",
 					 branch_id);
 
-	ret = ob_spi_one_shot(sql.data, false, 0);
+	ret = ob_spi_one_shot(sql.data, false, 1);
 	if (ret != SPI_OK_DELETE)
 	{
 		SPI_finish();
@@ -3194,7 +3138,7 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
  * ExecDropSingleTupleTableSlot when done).
  * ----------------------------------------------------------------
  */
-static TupleTableSlot *
+TupleTableSlot *
 reconstruct_slot_from_delta(Relation rel, bytea *tuple_data)
 {
 	StringInfoData sql;

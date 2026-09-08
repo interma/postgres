@@ -139,6 +139,102 @@ FROM public.products;
 -- 4.2 Branch state is 'applied' (can no longer be re-applied or discarded).
 SELECT state FROM public.pg_branch WHERE branch_name='agent_workspace';
 
+-- =====================================================================
+-- ===== Part 5: BranchScan MVP (SELECT * FROM table automatically
+-- ===== returns MAIN⊕branch-delta — no more SRF boilerplate).
+-- =====================================================================
+
+-- 5.0 Teardown so we can repurpose the sandbox: drop existing extension
+--     (drops products table too), then reinstall from scratch with a
+--     tiny BranchScan-only fixture table.
+DROP EXTENSION overlay_branch CASCADE;
+CREATE EXTENSION overlay_branch;
+
+CREATE TABLE public.bs_user (id INT4 PRIMARY KEY, name TEXT, color TEXT);
+INSERT INTO public.bs_user VALUES
+  (10, 'apple',  'red'),
+  (20, 'banana', 'yellow'),
+  (30, 'cherry', 'red');
+
+-- 5.1 MAIN mode: BranchScan MUST NOT inject (IndexScan/SeqScan win normally).
+RESET overlay_branch.current;
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_user WHERE id = 10;
+
+SELECT string_agg(id::text||'='||name||':'||color, ',' ORDER BY id) AS s51_main
+FROM public.bs_user;
+
+-- 5.2 Create + enter branch 'bs_user_b'.
+SELECT overlay_branch.create_branch('bs_user_b') AS id_bs_user_b;
+SELECT overlay_branch.use_branch('bs_user_b');
+
+-- 5.3 Assertion A: Planner MUST inject Custom Scan for a plain SELECT.
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_user;
+
+-- 5.4 Asserion B: Aggregate walks CustomScan (count(*)).
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT count(*) FROM public.bs_user;
+
+-- 5.5 Write 3 mutations into the branch (redirected to delta).
+DELETE FROM public.bs_user WHERE id = 20;
+UPDATE public.bs_user SET color = 'green' WHERE id = 10;
+INSERT INTO public.bs_user VALUES (40, 'date', 'brown');
+
+-- 5.6 MAIN heap must not have changed (RESET to MAIN then verify —
+--     this exercises the guard that Planner skips CustomScan when
+--     there is no active branch).
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN string_agg(id::text||'='||name||':'||color, ',' ORDER BY id)
+                = '10=apple:red,20=banana:yellow,30=cherry:red'
+         THEN 'PASS:BS_MAIN_UNTOUCHED'
+         ELSE 'FAIL:'||COALESCE(string_agg(id::text||'='||name||':'||color, ',' ORDER BY id),'NULL')
+       END AS s56_main_unchanged
+FROM public.bs_user;
+
+-- 5.7 Back into the branch.  Now 2 independent assertions that the
+--     transparent BranchScan returns EXACTLY the same overlay as the
+--     SRF workhorse that Step4 shipped with.
+SELECT overlay_branch.use_branch('bs_user_b');
+
+-- 5.7a SRF baseline (the known-correct 2-pass implementation).
+SELECT string_agg((r).id::text||'='||(r).name||':'||(r).color, ',' ORDER BY (r).id) AS srf_row_picture
+FROM overlay_branch.overlay_main_plus_delta('public.bs_user')
+  AS r(id int4, name text, color text);
+
+-- 5.7b Transparent BranchScan (NEW for Slice2/3).
+SELECT string_agg(id::text||'='||name||':'||color, ',' ORDER BY id) AS cs_row_picture
+FROM public.bs_user;
+
+-- 5.7c Equality assertion — this is the BranchScan MVP contract.
+SELECT CASE
+         WHEN (SELECT string_agg((r).id::text||'='||(r).name||':'||(r).color, ',' ORDER BY (r).id)
+               FROM overlay_branch.overlay_main_plus_delta('public.bs_user')
+                 AS r(id int4, name text, color text))
+              =
+              (SELECT string_agg(id::text||'='||name||':'||color, ',' ORDER BY id)
+               FROM public.bs_user)
+         THEN 'PASS:BS_EQUIVALENT_TO_SRF'
+         ELSE 'FAIL:BS_MISMATCH'
+       END AS s57c_equivalence;
+
+-- 5.7d Counts match.
+SELECT (SELECT count(*) FROM overlay_branch.overlay_main_plus_delta('public.bs_user')
+          AS r(id int4, name text, color text)) AS srf_n,
+       (SELECT count(*) FROM public.bs_user) AS cs_n;
+
+-- 5.7e WHERE id=10 returns the UPDATED tuple (green not red).
+SELECT CASE WHEN color = 'green' AND id = 10 THEN 'PASS:BS_OVERRIDE_VISIBLE'
+            ELSE 'FAIL:'||id::text||':'||COALESCE(color,'NULL') END AS s57e_override
+FROM public.bs_user WHERE id = 10;
+
+-- 5.7f ORDER BY walks through Sort → CustomScan (ensures the MVP path
+--      override has not leaked an IndexScan into the transparent SELECT).
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_user ORDER BY id DESC;
+SELECT id, name FROM public.bs_user ORDER BY id DESC;
+
+-- 5.8 Final cleanup (keep this idempotent with the Part 0 guard).
+RESET overlay_branch.current;
+DROP TABLE public.bs_user;
+
 -- ===== Final cleanup =====
-DROP TABLE public.products;
+DROP TABLE IF EXISTS public.products;
 DROP EXTENSION overlay_branch CASCADE;

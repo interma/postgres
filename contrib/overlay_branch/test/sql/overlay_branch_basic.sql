@@ -273,6 +273,15 @@ DELETE FROM public.t WHERE id = 2;
 UPDATE public.t SET v = 'v-b1-UPDATED' WHERE id = 1;
 INSERT INTO public.t VALUES (4, 'v-b1-NEW');
 
+-- NOTE: BranchScan MVP now injects CustomScan for ordinary SELECT * FROM t
+-- whenever the overlay_branch.current GUC points at an ACTIVE branch,
+-- transparently returning MAIN⊕delta instead of just raw MAIN heap rows.
+-- The zero-pollution checks (C3a) below ASSERT that MAIN heap itself
+-- remains unchanged (3 baseline rows), so they MUST run in MAIN mode.
+-- We temporarily switch back, run C3a/C3b, then re-enter b_live for C3c.
+RESET overlay_branch.current;
+SELECT current_branch() AS cur_before_c3a;
+
 -- === C3a. ZERO-POLLUTION LAW: Main MUST remain baseline 3, id=1 STILL 'v-base-1' ===
 SELECT id, v FROM public.t ORDER BY id;
 SELECT CASE WHEN COUNT(*) = 3 THEN 'PASS:3' ELSE 'FAIL:EXPECTED 3 GOT '||COUNT(*)::text END
@@ -297,6 +306,11 @@ FROM public.pg_branch_delta
 WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live')
   AND relid = 'public.t'::regclass
 ORDER BY key;
+
+-- Re-enter b_live so C3c (SRF) and all later sections behave identically
+-- to the pre-BranchScan baseline.
+SELECT use_branch('b_live');
+SELECT current_branch() AS cur_after_reenter_b_live;
 
 -- === C3c. MAIN EVENT: overlay_main_plus_delta SRF — Live Branch semantics
 --    Expected EXACTLY 3 rows (id=2 COMPLETELY ABSENT — D tombstone skipped):
@@ -633,6 +647,108 @@ SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=RACE-MAIN-WR
   ELSE 'FAIL:S5F2_MAIN_DIRTY' END AS s5_f2_full_snap
 FROM public.t;
 
+-- =====================================================================
+-- ========== Part 6: BranchScan MVP (CustomScan transparently merges
+-- ========== MAIN⊕delta for plain SELECT).
+-- =====================================================================
+
+-- 6.0 Teardown / reinstall extension so the Part 6 fixture table
+--     `public.bs_basic` cannot possibly collide with Part C's public.t,
+--     Step 5's guard_part tables, or Part 7 Step4's tables.
+DROP EXTENSION overlay_branch CASCADE;
+CREATE EXTENSION overlay_branch;
+
+CREATE TABLE public.bs_basic (
+  id   INT4 PRIMARY KEY,
+  amt  NUMERIC(10,2),
+  tag  TEXT
+);
+INSERT INTO public.bs_basic VALUES
+  (1,  10.50, 'alpha'),
+  (2,  20.00, 'beta'),
+  (3,  30.75, 'gamma'),
+  (7,  70.00, 'eta');
+
+-- 6.1 MAIN mode: sanity — plain IndexScan wins, no CustomScan.
+RESET overlay_branch.current;
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 1;
+SELECT count(*) AS bs_baseline_main_count FROM public.bs_basic;
+
+-- 6.2 Open a dedicated branch and inject exactly the 4 representative
+--     mutations (I/U/D + no-op).
+SELECT create_branch('bs_basic_b1') AS bs_id_b1;
+SELECT use_branch('bs_basic_b1');
+
+DELETE FROM public.bs_basic WHERE id = 3;
+UPDATE public.bs_basic SET amt = 99.99, tag = 'BETA!' WHERE id = 2;
+INSERT INTO public.bs_basic VALUES (9, 900.00, 'inserted-niner');
+-- id=1 and id=7 intentionally NOT touched (purely-MAIN passthrough).
+
+-- 6.3 MAIN-heap zero-pollution check (run in MAIN mode).
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN string_agg(id::text, ',' ORDER BY id) = '1,2,3,7'
+              AND string_agg(amt::text, ',' ORDER BY id) = '10.50,20.00,30.75,70.00'
+         THEN 'PASS:BS_MAIN_ZERO_POLLUTION'
+         ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||amt::text, ',' ORDER BY id),'NULL')
+       END AS bs63_main_pollution
+FROM public.bs_basic;
+
+-- 6.4 Delta physics pre-check (3 rows: 2U/3D/9I).
+SELECT use_branch('bs_basic_b1');
+SELECT count(*) AS bs64_delta_count
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='bs_basic_b1')
+  AND relid = 'public.bs_basic'::regclass;
+
+-- 6.5 Core equivalence: SRF (proven-correct) vs. transparent BranchScan.
+WITH srf AS (
+  SELECT string_agg((r).id::text||':'||(r).amt::text||':'||COALESCE((r).tag,'NULL'), '|' ORDER BY (r).id) AS pic
+  FROM overlay_branch.overlay_main_plus_delta('public.bs_basic')
+    AS r(id int4, amt numeric, tag text)
+), cs AS (
+  SELECT string_agg(id::text||':'||amt::text||':'||COALESCE(tag,'NULL'), '|' ORDER BY id) AS pic
+  FROM public.bs_basic
+)
+SELECT CASE
+         WHEN srf.pic = cs.pic THEN 'PASS:BS_EQUIV_SRF_BRANCHSCAN'
+         ELSE 'FAIL_SRF<>'||COALESCE(cs.pic,'NULL')||' BASE='||COALESCE(srf.pic,'NULL')
+       END AS bs65_equiv,
+       srf.pic AS srf_pic,
+       cs.pic  AS cs_pic
+FROM srf, cs;
+
+-- 6.6 Plan shapes for 4 representative SELECT shapes.
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic;                     -- plain CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT count(*) FROM public.bs_basic;               -- Aggregate + CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 2;         -- Filter + CustomScan (MVP: qual NOT pushed)
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic ORDER BY amt DESC;   -- Sort + CustomScan (no IndexScan leak)
+
+-- 6.7 Row-level spot checks against the 4 expected tuples:
+--      (1, 10.50, alpha)        — untouched MAIN passthrough
+--      (2, 99.99, BETA!)        — UPDATE override
+--      (7, 70.00, eta)          — untouched MAIN passthrough
+--      (9, 900.00, inserted-niner) — pure-delta INSERT
+--      id=3 COMPLETELY GONE (DELETE tombstone)
+
+SELECT CASE WHEN count(*) = 4 THEN 'PASS:BS_4_TUPLES' ELSE 'FAIL:'||count(*) END AS bs67_n
+FROM public.bs_basic;
+
+SELECT CASE WHEN EXISTS(SELECT 1 FROM public.bs_basic WHERE id = 3)
+            THEN 'FAIL:ID3_STILL_PRESENT'
+            ELSE 'PASS:ID3_TOMBSTONE_SKIPPED' END AS bs67_tombstone;
+
+SELECT id, amt, tag FROM public.bs_basic ORDER BY id;
+
+-- 6.8 Re-verify MAIN (BranchScan is per-transient active-branch, must be
+--     completely gone after RESET so the same SELECT id=3 in MAIN mode
+--     returns the original tuple — zero pollution).
+RESET overlay_branch.current;
+SELECT CASE WHEN tag = 'gamma' THEN 'PASS:ID3_BACK_IN_MAIN'
+            ELSE 'FAIL:'||COALESCE(tag,'NULL') END AS bs68_id3_main_back
+FROM public.bs_basic WHERE id = 3;
+
 -- ========== Final cleanup ==========
 DROP TABLE public.t;
+DROP TABLE IF EXISTS public.bs_basic;
 DROP EXTENSION overlay_branch CASCADE;

@@ -3,7 +3,8 @@
 MODULE_big = overlay_branch
 OBJS = \
 	$(WIN32RES) \
-	src/overlay_branch.o
+	src/overlay_branch.o \
+	src/branch_scan.o
 
 EXTENSION = overlay_branch
 DATA = overlay_branch--1.0.sql
