@@ -80,6 +80,16 @@ typedef struct DeltaTuple
  * ----------
  */
 extern char *overlay_branch_current_name;
+extern bool overlay_branch_enabled;
+
+/* ----------
+ * Recursion-guard globals (owned by overlay_branch.c; written
+ * directly by use_internal/apply_internal in branch_lifecycle.c
+ * to avoid layering extra trivial setters/getters).
+ * ----------
+ */
+extern bool ob_in_apply_operation;
+extern bool ob_in_guc_setconfig;
 
 /* ----------
  * Global branch context (for the current session)
@@ -164,43 +174,45 @@ extern bool overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 											 char **objname, char **reason);
 
 /* ----------
- * Shared internals exposed to branch_scan.c
- * ----------
- *    overlay_in_apply_operation(): read-only getter for static
- *        ob_in_apply_operation flag (planner hook bypass).
- *
- *    overlay_in_overlay_helper(): shared helper recursion guard.
- *        `ob_compute_overlay_slots_internal` runs the Pass1 MAIN
- *        seqscan via SPI, which would otherwise re-enter the
- *        Planner hook (branch still "active") and cause infinite
- *        recursion.  Caller sets true around the SPI scan, Planner
- *        hook short-circuits on true.  Pair: _enter / _exit.
- *
- *    ob_spi_one_shot(): SPI connect/execute/finish one-shot helper
- *        (previously static in overlay_branch.c, made extern so
- *        branch_scan.c 2-pass helper can use it).
- *
- *    reconstruct_slot_from_delta(): reconstruct bytea tuple_data into
- *        a fresh TTSOpsVirtual slot with independent CreateTupleDescCopy
- *        of rel. (TopMemoryContext palloc.) */
+ * Shared internals exposed to branch_scan.c / write_redirect.c /
+ * branch_lifecycle.c
+ * ---------- */
 extern bool             overlay_in_apply_operation(void);
 extern bool             overlay_in_overlay_helper(void);
 extern void             overlay_overlay_helper_enter(void);
 extern void             overlay_overlay_helper_exit(void);
-/* ----------
- *  overlay_in_write_redirect(): 4th recursion guard.
- *      Step 4a's write-redirection ExecutorRun hook performs its own
- *      internal SPI CMD_SELECT queries to locate WHERE-matching rows
- *      for UPDATE / DELETE.  Those are legitimate CMD_SELECT (so our
- *      `commandType != CMD_SELECT` B-1 guard does NOT skip them) yet
- *      they must scan the raw MAIN heap, never the overlay CustomScan.
- *      Pair: _enter / _exit.  The ExecutorRun hook wraps its intercept
- *      branch PG_TRY with enter/exit so Planner hook short-circuits.
- */
 extern bool             overlay_in_write_redirect(void);
 extern void             overlay_write_redirect_enter(void);
 extern void             overlay_write_redirect_exit(void);
 extern int              ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount);
 extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data);
+
+/* ----------
+ * Slot/fetch helpers (delta_store.c) — used by write_redirect.c
+ * to translate junk-slot attnos → clean relation slots via ctid.
+ * ----------
+ */
+extern AttrNumber       rel_attno_to_slot_idx(TupleDesc slotdesc, AttrNumber rel_attno);
+extern char            *slot_get_ctid_cstr(TupleTableSlot *slot);
+extern TupleTableSlot  *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr);
+
+/* ----------
+ * write_redirect.c entry point — thin dispatch from
+ * overlay_ExecutorRun in main overlay_branch.c.  mt_state_result_rel
+ * is also exposed because the original forward-decl was static.
+ * ----------
+ */
+#include "executor/execdesc.h"      /* QueryDesc + ScanDirection */
+struct ModifyTableState;            /* forward decl */
+struct ResultRelInfo;
+typedef void (*ExecutorRun_hook_type_fn)(QueryDesc *queryDesc,
+										 ScanDirection direction,
+										 uint64 count, bool execute_once);
+extern bool             overlay_executor_run_intercept(QueryDesc *queryDesc,
+													   ScanDirection direction,
+													   uint64 count,
+													   bool execute_once,
+													   ExecutorRun_hook_type_fn prev_ExecutorRun);
+extern struct ResultRelInfo *mt_state_result_rel(struct ModifyTableState *mt, int i);
 
 #endif							/* OVERLAY_BRANCH_H */

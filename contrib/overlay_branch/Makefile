@@ -4,7 +4,10 @@ MODULE_big = overlay_branch
 OBJS = \
 	$(WIN32RES) \
 	src/overlay_branch.o \
-	src/branch_scan.o
+	src/branch_scan.o \
+	src/delta_store.o \
+	src/write_redirect.o \
+	src/branch_lifecycle.o
 
 EXTENSION = overlay_branch
 DATA = overlay_branch--1.0.sql
