@@ -20,25 +20,28 @@
 |------|------|
 | [设计草案](doc/design.md) | 完整架构与设计决策：四层模型 (Branch Context / Write Redirect / BranchScan / Delta Store)、核心语义、V1 范围与未来扩展方向 |
 | [目标 SQL 与输出示例](doc/example_sql.md) | **用户视角的最终目标接口**：CREATE/USE/DISCARD/APPLY BRANCH 全套 SQL + 期望输出、BranchScan 叠加效果演示、Apply 成功与冲突路径、Live Branch 语义演示 |
-| [V1/V2 开发进度跟踪](doc/progress_tracker.md) | V1 (手动 SRF) 与 V2 (BranchScan 透明 CustomScan)  |
+| [开发进度跟踪](doc/progress_tracker.md) | V1 (手动 SRF) 与 V2 (BranchScan 透明 CustomScan)  |
 
 ## 目录结构
 
 ```
 overlay_branch/
-├── include/               # C 头文件 (类型声明、函数声明)
-├── src/                   # C 源代码
-│   ├── overlay_branch.c   #   模块 init / GUC / 钩子 / V1 SQL-callable 函数
-│   └── branch_scan.c      #   V2 Planner set_rel_pathlist_hook / CustomScan 执行器 / 2-pass helper
-├── test/                  # 回归测试 (2 条 baseline)
-│   ├── sql/               #   测试输入 SQL
-│   └── expected/          #   期望输出基线 (0 diff)
-├── doc/                   # 设计文档 (详见上面表格中的三个文档)
-├── overlay_branch.control # 扩展控制文件
-├── overlay_branch--1.0.sql# CREATE EXTENSION 安装脚本
-├── Makefile               # in-tree / PGXS 双模式构建
-├── meson.build            # Meson 构建定义
-└── README.md              # 本文件
+├── include/                    # C 头文件
+│   ├── overlay_branch.h        #   公共类型、宏、对外函数声明
+│   └── branch_scan.h           #   BranchScan / Planner hook 相关声明
+├── src/                        # C 源代码
+│   ├── overlay_branch.c        #   模块入口 (_PG_init)、GUC、全部 SQL-callable 函数
+│   ├── delta_store.c           #   Delta 存储 CRUD、主键序列化/反序列化、MAIN heap 访问辅助
+│   ├── write_redirect.c        #   写重定向 (INSERT/UPDATE/DELETE → delta)、RETURNING、pure-delta ExecQual 过滤
+│   ├── branch_scan.c           #   透明读：Planner hook 注入 BranchScan、CustomScan 两阶段合并执行器
+│   └── branch_lifecycle.c      #   Branch 生命周期：create / use / apply / discard
+├── test/                       # regress回归测试
+├── doc/                        # 设计文档与示例
+├── overlay_branch.control      # 扩展控制文件
+├── overlay_branch--1.0.sql     # CREATE EXTENSION 安装脚本
+├── Makefile                    # in-tree / PGXS 双模式构建
+├── meson.build                 # Meson 构建定义
+└── README.md                   # 本文件
 ```
 
 ## 构建 & 安装

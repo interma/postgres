@@ -898,7 +898,7 @@ ob_build_pk_where_clause(Relation rel, const char *pk_json_array)
 			elog(DEBUG1, "bpk[dbg] 5a3 i=%d attname=%s", i, NameStr(att->attname));
 			qname = quote_literal_cstr(NameStr(att->attname));
 			elog(DEBUG1, "bpk[dbg] 5a4 i=%d qname=%s", i, qname);
-			qtype = quote_literal_cstr(format_type_be(att->atttypid));
+			qtype = quote_literal_cstr(format_type_with_typemod(att->atttypid, att->atttypmod));
 			elog(DEBUG1, "bpk[dbg] 5a5 i=%d qtype=%s", i, qtype);
 			if (pk_texts[i] != NULL)
 				qval = quote_literal_cstr(pk_texts[i]);
@@ -989,6 +989,7 @@ ob_fetch_main_current_slot(Relation rel, const char *where_clause)
 
 	ret = ob_spi_one_shot(sql.data, true, 1);
 	pfree(sql.data);
+
 	if (ret == SPI_OK_SELECT && SPI_processed == 1 &&
 		SPI_tuptable && SPI_tuptable->vals && SPI_tuptable->vals[0])
 	{
@@ -1100,6 +1101,18 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply DELETE on %s: cannot build WHERE for pk=%s",
 						RelationGetRelationName(rel), dt->key)));
+
+	/* Pure-delta origin: old_version == NULL means this row never existed
+	 * on MAIN (it was INSERTed then DELETEd entirely inside the branch).
+	 * There is nothing to DELETE on MAIN; skipping prevents false-positive
+	 * "row no longer present" conflict errors. */
+	if (dt->old_version == NULL)
+	{
+		elog(DEBUG1, "delpass[dbg] A4 pure-delta DELETE (no MAIN baseline) → NOP skip pk=%s",
+			 dt->key);
+		pfree(where_clause);
+		return;
+	}
 
 	elog(DEBUG1, "delpass[dbg] B fetch_main_slot");
 	main_slot = ob_fetch_main_current_slot(rel, where_clause);
@@ -1249,7 +1262,7 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 							 quote_identifier(NameStr(att->attname)));
 			appendStringInfo(&colspec, "%s %s",
 							 quote_identifier(NameStr(att->attname)),
-							 format_type_be(att->atttypid));
+							 format_type_with_typemod(att->atttypid, att->atttypmod));
 			first = false;
 		}
 

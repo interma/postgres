@@ -41,6 +41,15 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* ---------------------------------------------------------------
+ * Bypass helpers: all internal SPI calls that must hit the MAIN
+ * physical heap (NOT the overlay view) must push/pop
+ * overlay_overlay_helper_enter() / exit() so the BranchScan planner
+ * hook skips CustomScan injection for that internal query.
+ * --------------------------------------------------------------- */
+extern void overlay_overlay_helper_enter(void);
+extern void overlay_overlay_helper_exit(void);
+
 /* Fully qualified table names (control file pins schema = 'overlay_branch').
  * OBSCHEMA 定义在公共头 overlay_branch.h */
 #define OBTABLE_DELTA   OBSCHEMA ".pg_branch_delta"
@@ -176,8 +185,14 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		TupleDesc			td  = SPI_tuptable->tupdesc;
 		bool				isnull;
 		Datum				d;
+		MemoryContext		oldmc;
 
 		found = true;
+
+		/* 必须和 list_for_rel 一样在 TopMemoryContext 分配，
+		 * 否则 datumCopy / TextDatumGetCString 的 palloc 都在
+		 * SPI proc 上下文，SPI_finish() 一调用就全部悬垂！ */
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
 		memset(out_tuple, 0, sizeof(DeltaTuple));
 
 		d = SPI_getbinval(tup, td, 1, &isnull);
@@ -189,6 +204,7 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		d = SPI_getbinval(tup, td, 3, &isnull);
 		if (!isnull)
 		{
+			/* ZERO-based: SPI col 3 (key TEXT) → attrs[2]. */
 			Form_pg_attribute katt = TupleDescAttr(td, 2);
 			int16		typlen;
 			bool		typbyval;
@@ -217,6 +233,7 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		d = SPI_getbinval(tup, td, 5, &isnull);
 		if (!isnull)
 		{
+			/* SPI col 5 (old_version TEXT) = attrs[4]. */
 			Form_pg_attribute vatt = TupleDescAttr(td, 4);
 			int16		typlen;
 			bool		typbyval;
@@ -231,6 +248,7 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		d = SPI_getbinval(tup, td, 6, &isnull);
 		if (!isnull)
 		{
+			/* SPI col 6 (tuple_data BYTEA) = attrs[5]. */
 			Form_pg_attribute batt = TupleDescAttr(td, 5);
 			int16		typlen;
 			bool		typbyval;
@@ -241,6 +259,8 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		}
 		else
 			out_tuple->tuple_data = NULL;
+
+		MemoryContextSwitchTo(oldmc);
 	}
 
 	SPI_finish();
@@ -486,6 +506,8 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 	char	   *q_relname;
 	char	   *q_ctid;
 
+	overlay_overlay_helper_enter();
+
 	initStringInfo(&sql);
 	q_relname = quote_qualified_identifier(
 		get_namespace_name(RelationGetNamespace(rel)),
@@ -504,6 +526,7 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 		SPI_tuptable == NULL || SPI_tuptable->vals == NULL)
 	{
 		SPI_finish();
+		overlay_overlay_helper_exit();
 		elog(ERROR, "fetch_tuple_by_ctid: SPI SELECT-by-ctid failed (ret=%d rows=%lu) ctid=%s",
 			 ret, SPI_processed != 0 ? (unsigned long) SPI_processed : 0UL,
 			 ctid_cstr);
@@ -515,7 +538,6 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 		TupleDesc	td_spi = SPI_tuptable->tupdesc;
 		MemoryContext oldmc;
 
-		/* 整个 slot 在 TopMCxt 分配，才能活过 SPI_finish() */
 		oldmc = MemoryContextSwitchTo(TopMemoryContext);
 		out_slot = MakeSingleTupleTableSlot(reldesc, &TTSOpsVirtual);
 		ExecClearTuple(out_slot);
@@ -539,11 +561,11 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 		}
 		ExecStoreVirtualTuple(out_slot);
 		out_slot->tts_nvalid = reldesc->natts;
-		/* 拷贝物理 tupaddr（用于 overlay_tuple_version） */
 		out_slot->tts_tid = htup->t_self;
 		MemoryContextSwitchTo(oldmc);
 	}
 	SPI_finish();
+	overlay_overlay_helper_exit();
 	return out_slot;
 }
 
@@ -579,7 +601,8 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data)
 			appendStringInfoChar(&cols, ',');
 		appendStringInfo(&cols, "%s %s",
 						 quote_identifier(NameStr(ratt->attname)),
-						 format_type_be(ratt->atttypid));
+						 format_type_with_typemod(ratt->atttypid,
+												  ratt->atttypmod));
 	}
 
 	/* 用 PG 自带 bytea output 生成 '\xHHHH' 字面量，兼容所有 varlena 格式 */
@@ -757,6 +780,18 @@ overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
 
 			getTypeOutputInfo(typid, &outfuncoid, &typeIsVarlena);
 			valstr = OidOutputFunctionCall(outfuncoid, pk_datums[i]);
+			/* BPCHAR r-trim: PG bpchar→text cast silently strips trailing
+			 * blanks, so P0 fast-path (which casts via ::text) would
+			 * produce 'AB12' for a char(8) value 'AB12    '.  To match we
+			 * r-trim the WRITE-side output string (bpcharout keeps the
+			 * full N-blank-padded length).  Since bpchar equality ignores
+			 * trailing blanks anyway, this preserves PK semantics. */
+			if (typid == BPCHAROID)
+			{
+				int len = strlen(valstr);
+				while (len > 0 && valstr[len-1] == ' ')
+					valstr[--len] = '\0';
+			}
 			q = quote_literal_cstr(valstr);
 			appendStringInfo(&arr_sql, "%s::text", q);
 			pfree(q);
@@ -943,7 +978,6 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 	if (rel == NULL || slot == NULL)
 		return NULL;
 
-	/* slot 有 junk ctid 就用它，否则用 tts_tid 回退 */
 	ctid_cstr = slot_get_ctid_cstr(slot);
 	if (ctid_cstr == NULL)
 	{
@@ -959,6 +993,8 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 				 ItemPointerGetOffsetNumber(ip));
 		ctid_cstr_allocated = true;
 	}
+
+	overlay_overlay_helper_enter();
 
 	initStringInfo(&sql);
 	q_relname = quote_qualified_identifier(
@@ -1006,6 +1042,7 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 	}
 
 	SPI_finish();
+	overlay_overlay_helper_exit();
 	if (ctid_cstr_allocated && ctid_cstr)
 		pfree(ctid_cstr);
 	else if (ctid_cstr)
@@ -1179,4 +1216,194 @@ overlay_debug_delta_delete_all(PG_FUNCTION_ARGS)
 
 	overlay_delta_delete_all(branch_id);
 	PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * Planner 侧 PK 辅助函数（BranchScan PK IndexScan 适配新增）
+ * ================================================================ */
+
+/*
+ * overlay_get_pk_single_attno
+ *
+ *   快速返回（MVP 限定：单列表的 PRIMARY KEY 列的 attno + 列名。
+ *   复合 PK（indnatts>1）返回 false，Planner 就走全量路径。
+ *   out_pk_attno 是 1-based 真实 attno（匹配 rd_index->indkey.values[i]）；
+ *   out_pk_colname 指向 relcache 内的 NameData（caller 不得 pfree）。
+ */
+bool
+overlay_get_pk_single_attno(Relation rel,
+							AttrNumber *out_pk_attno,
+							const char **out_pk_colname)
+{
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pk_index_oid = InvalidOid;
+	Relation	pk_rel = NULL;
+	bool		found = false;
+
+	if (rel == NULL)
+		return false;
+	if (out_pk_attno) *out_pk_attno = 0;
+	if (out_pk_colname) *out_pk_colname = NULL;
+
+	indexoids = RelationGetIndexList(rel);
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		if (idxrel->rd_index && idxrel->rd_index->indisprimary)
+		{
+			pk_index_oid = idxoid;
+			pk_rel = idxrel;
+			break;
+		}
+		index_close(idxrel, AccessShareLock);
+	}
+	list_free(indexoids);
+
+	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
+		return false;
+
+	/* MVP: 仅支持单列 PK */
+	if (pk_rel->rd_index->indnatts == 1)
+	{
+		AttrNumber	pk_attno = pk_rel->rd_index->indkey.values[0];
+		TupleDesc	reldesc = RelationGetDescr(rel);
+		Form_pg_attribute pkatt;
+
+		if (pk_attno > 0 && pk_attno <= reldesc->natts)
+		{
+			pkatt = TupleDescAttr(reldesc, pk_attno - 1);
+			if (out_pk_attno)
+				*out_pk_attno = pk_attno;
+			if (out_pk_colname)
+				*out_pk_colname = NameStr(pkatt->attname);
+			found = true;
+		}
+	}
+
+	index_close(pk_rel, AccessShareLock);
+	return found;
+}
+
+/*
+ * overlay_serialize_pk_from_single_datum
+ *
+ *   从单个 Datum（MVP 单列 PK 场景）构造与 overlay_serialize_pk
+ *   完全字节兼容的 JSON array ::text 序列化串。
+ *
+ *   CRITICAL TYPE COERCION NOTE (see p0_pk_oidx_deparse_strategy.md §4):
+ *   The caller passes `con->constvalue` with its OWN declared type
+ *   `consttype` (as the parser saw it), which is almost never equal to
+ *   `pkatt->atttypid` in real queries:
+ *
+ *     CREATE TABLE t(id bigint PRIMARY KEY);
+ *     SELECT * FROM t WHERE id = 2;  -- Const.consttype = INT4OID !!
+ *
+ *   Calling getTypeOutputInfo(INT8OID) + OidOutputFunctionCall on a
+ *   4-byte int4 Datum makes int8out deref 8 bytes, where the upper 4
+ *   bytes are stack garbage → key becomes "[\"140703...\"]" while the
+ *   slot-side overlay_serialize_pk() correctly produces "[\"2\"]" →
+ *   O(1) delta lookup misses ALL UPDATE/DELETE tombstones for the row.
+ *
+ *   FIX (2 stages, coercion-safe):
+ *     Stage 1: stringify the literal with ITS OWN type output fn
+ *       4-byte int4 Datum → "2"; varchar Datum → "alpha"; etc.
+ *       Dereference size always matches consttype's layout → no garbage.
+ *     Stage 2: SQL-level
+ *       CAST ('<literal_str>' AS <pk_coltype>) ::text
+ *       Let PG's parser itself perform the canonical coercion (int4 →
+ *       int8, bpchar blank-padding, numeric rounding, custom type casts
+ *       …).  The resulting ::text representation is byte-identical to
+ *       what the WRITE side emits for the same stored-in-table value.
+ */
+char *
+overlay_serialize_pk_from_single_datum(Relation rel,
+									   AttrNumber pk_attno,
+									   Datum pk_val,
+									   bool pk_isnull,
+									   Oid consttype)
+{
+	TupleDesc	reldesc;
+	Form_pg_attribute pkatt;
+	Oid			pk_typid;
+	StringInfoData arr_sql;
+	int			ret;
+	char	   *result;
+	MemoryContext oldmc;
+
+	Assert(rel != NULL);
+	reldesc = RelationGetDescr(rel);
+	pkatt = TupleDescAttr(reldesc, pk_attno - 1);
+	pk_typid = pkatt->atttypid;
+
+	initStringInfo(&arr_sql);
+	appendStringInfoString(&arr_sql, "SELECT to_jsonb(ARRAY[");
+
+	if (pk_isnull)
+	{
+		appendStringInfoString(&arr_sql, "NULL::text");
+	}
+	else
+	{
+		Oid			lit_outfuncoid;
+		bool		lit_typeIsVarlena;
+		char	   *litstr;
+		char	   *q;
+		const char *pktypname;
+
+		/* Stage 1: use the CONST'S OWN type to stringify its Datum. */
+		getTypeOutputInfo(consttype, &lit_outfuncoid, &lit_typeIsVarlena);
+		litstr = OidOutputFunctionCall(lit_outfuncoid, pk_val);
+
+		/* Stage 2: SQL-level literal quote + CAST onto PK type.
+		 *
+		 * IMPORTANT: we MUST cast to ::text after the CAST onto the real
+		 * PK type, so that to_jsonb(ARRAY[...]) treats every element as
+		 * TEXT — matching overlay_serialize_pk() (the WRITE side), which
+		 * always uses `quote_literal_cstr(OidOutputFunctionCall(...))
+		 * ::text` per element.  Without this trailing `::text`, numeric
+		 * types would be JSON *numbers* (`[10]`) vs WRITE-side JSON
+		 * *strings* (`["10"]`) → byte mismatch → every P0 O(1) lookup
+		 * misses!
+		 *
+		 * BUG#1 BPCHAR CAVEAT: PG's bpchar→text cast silently r-trims
+		 * trailing blanks, so CAST('AB12' AS char(8))::text yields
+		 * 'AB12' (4 chars).  To match, the WRITE-side datum_out-based
+		 * bpchar value is also r-trimmed before jsonb-ification (see
+		 * overlay_serialize_pk's "BPCHAR r-trim" comment).  Since PG
+		 * treats 'AB12'::char(8) = 'AB12    '::char(8) as true anyway,
+		 * r-trimming on both sides preserves PK equality semantics. */
+		q = quote_literal_cstr(litstr);
+		pktypname = format_type_with_typemod(pk_typid, pkatt->atttypmod);
+
+		appendStringInfo(&arr_sql, "CAST (%s AS %s)::text",
+						 q, pktypname);
+		pfree(q);
+		pfree(litstr);
+	}
+	appendStringInfoString(&arr_sql, "])::text");
+
+	ret = ob_spi_one_shot(arr_sql.data, true, 1);
+	pfree(arr_sql.data);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_serialize_pk_from_single_datum: SPI to_jsonb failed (ret=%d rows=%lu)",
+						ret, (unsigned long) SPI_processed)));
+	}
+	{
+		const char *spival = SPI_getvalue(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc, 1);
+
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		result = pstrdup(spival != NULL ? spival : "");
+		MemoryContextSwitchTo(oldmc);
+	}
+	SPI_finish();
+	return result;
 }

@@ -17,7 +17,7 @@ PGFILEDESC = "overlay_branch - speculative database state using table overlay an
 override CPPFLAGS += -I$(srcdir)/include
 
 # Regression tests live in test/{sql,expected}
-REGRESS = overlay_branch_basic overlay_branch_user
+REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test \
 	--outputdir=./test_output \

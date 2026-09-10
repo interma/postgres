@@ -1,4 +1,4 @@
-# overlay_branch 开发进度跟踪 (V1 & V2 MVP Steps)
+# overlay_branch 开发进度跟踪
 
 > 本文档作为开发进度与交付物清单，对应 README 里提到的 Step 拆分。
 > **V1 = 手动 SRF 模式**（读分支必须手动调 `overlay_main_plus_delta()`）；
@@ -6,6 +6,11 @@
 >
 > 编号说明：1/2/3/4/5/7/8 对应实际交付的里程碑；Step 6 被并入 Step 7 的
 > Hard Guard 和推迟到 V3 的多 session MVCC pin，因此留空（详见文末"关于 Step 6 留空"）。
+>
+> **整体状态（2026-09-10，V3 前基础打牢快照）**：
+> - P0/P1/P2 + 加固测试 **全部完成**；
+> - `make check REGRESS="overlay_branch_basic overlay_branch_user overlay_branch_advanced"` **3/3 ALL PASSED, 0 diffs**；
+> - **V3 (multi-session MVCC + snapshot mode)**：**永久 deferred**，不在当前代码路线图内，所有实现只保证单 session Live Branch 语义。
 
 ---
 
@@ -102,12 +107,18 @@ Pass 2 (Pure delta INSERT):
 
 | Step | 标题 | 状态 | 交付物入口 |
 |------|------|------|-----------|
-| V2 Plan | BranchScan CustomScan 设计评审 | ✅ | [doc/branchscan_plan.md](branchscan_plan.md) |
+| V2 Plan | BranchScan CustomScan 设计评审 | ✅ | [doc/branchscan.md Part A](branchscan.md#part-a--branchscan-设计与实施计划) |
 | V2-1 | Planner 拦截 + `set_rel_pathlist_hook` 6 层 guard | ✅ | [src/branch_scan.c Plan hook](../src/branch_scan.c#L274-L406) |
 | V2-2 | ExecCustomScan 生命周期 (ExtendedCSS + Lazy Materialize) | ✅ | [ExecCustomScan wrapper](../src/branch_scan.c#L462-L645) |
 | V2-3 | SRF & CustomScan 单源化 2-Pass helper | ✅ | [ob_compute_overlay_slots_internal](../src/branch_scan.c#L98-L268) |
 | V2-4 | Projection + qual 过滤 (WHERE / CASE WHEN / 部分列) | ✅ | ExecBranchScan: ResetExprContext → ExecQual → ExecProject |
 | V2-5 | Regression PART 5/6 新增 + 基线全绿 | ✅ | `overlay_branch_user.sql` Part 5 / `overlay_branch_basic.sql` Part 6 |
+| V2-P0 | PK=Const O(1) 快路径 (MAIN IndexScan + Delta O(1) lookup) + bpchar rtrim + format_type_with_typmod 链路 | ✅ | branchscan.md Part B / delta_store.c overlay_delta_lookup + overlay_serialize_pk_from_single_datum |
+| V2-P1 | RETURNING 子句投影回发（retslots palloc 首次分配修复 repalloc(NULL) UB） | ✅ | write_redirect.c RETURNING 段 |
+| V2-P2 | WHERE 非 PK 条件下推 + P0/P2 精确去重 | ✅ | branchscan.md Part B §3-§6 / branch_scan.c deparse |
+| V2-P3 | WR pure delta DML 8-phase ExecQual pass（3 种下推 qual 存储位置全覆盖） | ✅ | [V2-P3 详述](#v2-p3--wr-pure-delta-dml-8-phase-execqual-pass) / write_redirect.c |
+| V2-R1 | 加固测试 Section L-Q (26+ 新断言) | ✅ | overlay_branch_advanced.sql Section L~Q (L1210-L1502) |
+| V2-† | Delta O(1) lookup MemoryContext 生命周期硬约束 | ✅ | branchscan.md Part C |
 
 ---
 
@@ -196,6 +207,88 @@ Pass 2 (Pure delta INSERT):
   - DELETE id=2 tombstone 正确不出现
   - RESET MAIN → id=3 gamma 正确还原（6.8 列名 v→tag 历史笔误已修）
 - 基线 cp `test_output/results/*.out → test/expected/*.out`；pg_regress ok1 ok2 0 diff
+
+---
+
+## V2-P3 — WR pure delta DML 8-phase ExecQual pass
+
+> **背景 Gap**：CMD_UPDATE/DELETE ModifyTable 主循环**只扫 MAIN heap**（通过 ctid/IndexScan 走的物理页），所以分支里 `INSERT id=4` 写完之后再 `DELETE WHERE id=4` 时，主循环 0 行 → delta 里 id=4 还活着 → 下一次 BranchScan 还能看到 id=4（= DELETE 静默没生效）。
+>
+> 解决方案：主循环之后单独走 Phase D–H，遍历纯 delta INSERT 候选并重跑 WHERE 条件 ExecQual，命中的再写 tombstone（V2 DELETE）或（V3）UPDATE delta。
+
+```
+PHASE A — MAIN loop（unchanged）:
+   foreach main-loop tuple by subplan outerPlan:
+       serialize pk → SPI SELECT * FROM rel WHERE ctid='(blk,off)' 取 old_version
+       CMD_DEL → delta(op=D, old_version, key)
+       CMD_UPD → merge SET new tuple → delta(op=U, old_version, key, tuple)
+       pk 加入 EMITTED set
+
+PHASE B — (reserved for pure delta UPDATE; MVP = NOP, see Phase C guard)
+
+PHASE C — cmd guard (MVP safety, 绝不静默脏 UPDATE 数据):
+   if cmd != CMD_DELETE: break    (pure delta UPDATE V2 impl 不进入)
+
+PHASE D — candidate 构建 (Bug10 MemoryContext UAF 根因):
+   cand_inserts = overlay_delta_list_for_rel WHERE op=I AND NOT EMITTED
+   深拷贝 raw_rows 必须分配  queryDesc->estate->es_query_cxt
+     （NOT CurrentMemoryContext — 那是 subplan per-tuple child，subplan done 后会被释放）
+
+PHASE E — qual 下钻 (Bug12 5 bitmap FAIL 根因):
+   scan_ps = subplan
+   while outerPlanState(scan_ps) != NULL AND scan_ps->qual == NULL:
+       scan_ps = outerPlanState(scan_ps)
+   qual_scan  = scan_ps->qual
+   qual_extra = NULL
+   switch nodeTag(scan_ps):
+     T_IndexScanState      → qual_extra = indexqualorig
+     T_BitmapHeapScanState → qual_extra = bitmapqualorig  （IN 列表 / 非 PK AND / 复合 PK prefix 多用）
+     T_IndexOnlyScanState → qual_extra = recheckqual
+
+PHASE F — ExecQual 逻辑 AND:
+   foreach slot in cand_inserts:
+       passes = true;
+       if (qual_scan  != NULL) passes &= ExecQual(qual_scan,  econtext)
+       if (passes && qual_extra != NULL) passes &= ExecQual(qual_extra, econtext)
+
+PHASE G — MVP SAFETY GUARD (最关键 防全表 DML nuke):
+   if (qual_scan == NULL && qual_extra == NULL) continue   # 无 WHERE 直接 skip
+   if (!passes) continue
+   CMD_DELETE → delta(op=D, old_version=NULL, key=pk)     # pure delta origin 不存 old_version
+
+PHASE H — cleanup (es_query_cxt 自动清理)
+```
+
+### 挖出的 3 个根因（Section L-Q 26 断言主动发现）
+
+| # | 典型 FAIL | 根因 | 定位 Phase | 已修复 PASS 的 Section |
+|---|---|---|---|---|
+| Bug10 | N 系列 Step 5 SIGSEGV / 0xc0 | raw_rows 分配在 CurrentMCxt（subplan per-tuple）→ subplan done 后释放 UAF | Phase D | N.1-N.5, P.1-P.4, M.1-M.2 |
+| Bug11 | apply pure delta DELETE "row not present on MAIN" CONFLICT | DELETE delta old_version==NULL 是「分支自 INSERT 自 DELETE」，MAIN 本来没这行 → apply 应 NOP skip | branch_lifecycle.c apply 段 | O.3 apply pure DELETE NOP |
+| Bug12 | `grp=C AND score=333` / `id IN (2,4)` / 复合 PK prefix `a=20` DELETE 全幸存（NOP） | 这些 WHERE 选 BitmapHeapScan，qual 存在 bitmapqualorig 未取 → guard qual_scan + qual_extra 都 NULL → SAFE NOP 但功能不对 | Phase E switch | N.4, P.2-P.4, Q.2 |
+
+---
+
+## V2-R1 — 加固测试 Section L-Q（advanced.sql L1210-L1502）
+
+共 26+ 条新增断言，覆盖 V3 前最容易踩的边界：
+
+| Section | 场景设计 | 目的（V3 风险暴露点） |
+|---------|---------|---------------------|
+| **L**  | pure delta UPDATE × (single PK / IN list / non-PK) | 确认 pure delta UPDATE 是 MVP NOP（不静默改值）；CMD_UPDATE 入口 guard `if cmd != CMD_DELETE continue 生效 |
+| **M** | PK 列 typmod: NUMERIC(10,2) + BPCHAR(6) | 验证 `format_type_with_typmod（取代 format_type_be）在 WR / P0 / apply 链路一致；BPCHAR 等值比较 rtrim 两端对齐 |
+| **N** | 6 pure delta rows × (grp text non-PK / score<80 range / grp='C' AND score=333 bitmap AND + RETURNING × N.5 count 断言 | Bug10/12 真实验收；BitmapHeapScanState.bitmapqualorig 生效；count 断言防 silent 多删 |
+| **O** | apply/discard 边界: INSERT→DELETE→RE-BORN INSERT→apply / discard pure / apply pure DELETE NOP | Rebirth 三段 UPSERT 覆盖；O.3 Bug11 false-positive 冲突 NOP 验收 |
+| **P** | 空 MAIN heap 全链路 4 行 pure INSERT | **0 MAIN row + 100% delta 最极端；IN (2,4) ScalarArrayOp + exact PKEY=3 + RETURNING + apply 1 row 写回 MAIN |
+| **Q** | 复合 PRIMARY KEY (a,b) × exact (a=10 AND b='pd-b') + prefix (a=20) | composite PK JSON 数组顺序；prefix 选 BitmapHeapScan 不丢 qual（Q.2 真删 a=20） |
+
+验收：
+```
+ok 1 - overlay_branch_basic    67ms
+ok 2 - overlay_branch_user     33ms
+ok 3 - overlay_branch_advanced 145ms
+# All 3 tests passed, 0 regression.diffs
+```
 
 ---
 

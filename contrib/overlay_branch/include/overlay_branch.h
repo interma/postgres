@@ -145,6 +145,15 @@ extern char    *overlay_serialize_tuple(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_tuple_version(Relation rel, TupleTableSlot *slot);
 extern bool		overlay_relation_has_pk(Relation rel);
 
+extern bool		overlay_get_pk_single_attno(Relation rel,
+											 AttrNumber *out_pk_attno,
+											 const char **out_pk_colname);
+extern char    *overlay_serialize_pk_from_single_datum(Relation rel,
+													   AttrNumber pk_attno,
+													   Datum pk_val,
+													   bool pk_isnull,
+													   Oid consttype);
+
 /* ----------
  * Step7 HARD GUARD: shared helper for checking rel eligibility inside an
  * active branch.  Returns NULL if ok, otherwise returns a malloc'd cstring

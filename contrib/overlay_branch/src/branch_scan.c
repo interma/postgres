@@ -13,8 +13,10 @@
 #include "access/heapam.h"
 #include "access/table.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_operator.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/nodeCustom.h"
@@ -23,19 +25,25 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "nodes/primnodes.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
+#include "parser/parse_oper.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/typcache.h"
+#include "utils/syscache.h"
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
@@ -88,6 +96,13 @@ typedef struct ExtendedCustomScanState
     Oid           relid;
     int32         branch_id;
     bool          materialized;
+    /* P0 PK-IndexScan MVP: 从 Planner hook 透传的快速路径信息 */
+    bool          has_pk_pred;
+    char         *pk_where_sql;
+    char         *pk_serialized_key;
+    /* P2 general non-PK qual pushdown: 已 deparse 的 SQL WHERE 片段 */
+    bool          has_general_where;
+    char         *general_where_sql;
 } ExtendedCustomScanState;
 
 /* css MUST be a valid CustomScanState* whose embedding is ExtendedCustomScanState.
@@ -98,9 +113,29 @@ typedef struct ExtendedCustomScanState
 
 /* ================================================================
  * SHARED 2-pass helper (called by BOTH SRF and CustomScan Executor)
+ *
+ *   PK-predicate fast-path (P0 MVP):
+ *     has_pk_pred = true
+ *     pk_where_sql = non-empty SQL fragment like "id = 10::integer"
+ *     pk_serialized_key = non-empty JSON array string like '["10"]'
+ *   → SPI MAIN 查询用 WHERE 子句（不是 SELECT * FROM table 全表）
+ *   → Delta 用 overlay_delta_lookup 精确匹配（不是 list_for_rel 全量）
+ *
+ *   General non-PK qual pushdown (P2 MVP):
+ *     has_general_where = true
+ *     general_where_sql = deparse_expression() 产出的一个或多个 AND 子句，
+ *                        例如 "color = 'green'::text AND amt < 100::numeric"
+ *   → SPI MAIN 查询把这段追加 (PK 和 general 均存在时用 "AND (general)")
+ *   → Delta 侧仍走 list_for_rel 全量（非 PK 条件无法按主键 key 索引），
+ *     但 MAIN 侧行数已大幅减少，通常 10x~100x 收益。
  * ================================================================ */
 static List *
-ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tupdesc)
+ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tupdesc,
+                                  bool has_pk_pred,
+                                  const char *pk_where_sql,
+                                  const char *pk_serialized_key,
+                                  bool has_general_where,
+                                  const char *general_where_sql)
 {
     Relation    rel;
     TupleDesc   reldesc;
@@ -111,20 +146,55 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
     const char *q_relname;
     char       *q_qualified;
     StringInfoData sql;
+    bool        any_where;
     int         ret;
 
     rel = table_open(relid, AccessShareLock);
     reldesc = RelationGetDescr(rel);
     natts = reldesc->natts;
 
-    delta_list = overlay_delta_list_for_rel(branch_id, relid);
+    /* P0 PK-IndexScan MVP: 选 delta 加载策略 */
+    if (has_pk_pred && pk_serialized_key != NULL && pk_serialized_key[0] != '\0')
+    {
+        DeltaTuple *singleton;
+
+        singleton = (DeltaTuple *) palloc0(sizeof(DeltaTuple));
+        if (overlay_delta_lookup(branch_id, relid, pk_serialized_key, singleton))
+            delta_list = list_make1(singleton);
+        else
+        {
+            pfree(singleton);
+            delta_list = NIL;
+        }
+    }
+    else
+        delta_list = overlay_delta_list_for_rel(branch_id, relid);
 
     q_nspname = get_namespace_name(RelationGetNamespace(rel));
     q_relname = RelationGetRelationName(rel);
     q_qualified = quote_qualified_identifier(q_nspname, q_relname);
     initStringInfo(&sql);
+    any_where = false;
+
+    /* Build the SPI SELECT with any combination of pushdown conditions. */
     appendStringInfo(&sql, "SELECT * FROM %s", q_qualified);
     pfree(q_qualified);
+
+    if (has_pk_pred && pk_where_sql != NULL && pk_where_sql[0] != '\0')
+    {
+        appendStringInfo(&sql, " WHERE (%s)", pk_where_sql);
+        any_where = true;
+    }
+    if (has_general_where && general_where_sql != NULL && general_where_sql[0] != '\0')
+    {
+        if (any_where)
+            appendStringInfo(&sql, " AND (%s)", general_where_sql);
+        else
+        {
+            appendStringInfo(&sql, " WHERE (%s)", general_where_sql);
+            any_where = true;
+        }
+    }
 
     /* ----- Guard: run the internal MAIN seqscan *outside* the Planner
      * hook overlay (otherwise infinite recursion: helper → SPI SELECT
@@ -155,15 +225,26 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
     PG_END_TRY();
     overlay_overlay_helper_exit();
 
-    if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
     {
-        HeapTuple  *htups = SPI_tuptable->vals;
-        TupleDesc   td_spi = SPI_tuptable->tupdesc;
-        uint64      n = SPI_processed;
+        HeapTuple  *htups = NULL;
+        TupleDesc   td_spi = NULL;
+        uint64      n = 0;
         MemoryContext oldcxt;
 
+        if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
+        {
+            htups = SPI_tuptable->vals;
+            td_spi = SPI_tuptable->tupdesc;
+            n = SPI_processed;
+        }
+
+        /* All result slots (from MAIN or delta INSERT) go in
+         * TopMemoryContext so they outlive this helper call.  Switch
+         * here regardless of whether MAIN has rows (SPI_processed==0
+         * case: delta INSERT-only result set still needs correct cxt). */
         oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
+        /* Pass 1: MAIN baseline rows, merged with delta side-effects. */
         for (uint64 i = 0; i < n; i++)
         {
             HeapTuple        htup = htups[i];
@@ -200,10 +281,11 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
 
             pk_key = overlay_serialize_pk(rel, main_slot);
 
+            match = NULL;
             foreach(lc, delta_list)
             {
                 DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-                if (strcmp(dt->key, pk_key) == 0)
+                if (dt->key != NULL && pk_key != NULL && strcmp(dt->key, pk_key) == 0)
                 {
                     match = dt;
                     break;
@@ -237,6 +319,11 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
                 result_slots = lappend(result_slots, output_slot);
         }
 
+        /* Pass 2: pure delta INSERTs (rows created inside the branch
+         * that have no MAIN baseline counterpart).  MUST run even when
+         * n == 0: otherwise queries like "WHERE pk = <newkey>" fail
+         * because MAIN has 0 rows but Pass2 used to be nested inside
+         * the (n>0) block. */
         {
             ListCell *lc;
             foreach(lc, delta_list)
@@ -279,17 +366,17 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
     if (overlay_in_apply_operation())
         return;
-    /* B1.25: Skip inside Step 4a write-redirection context.
-     * The ExecutorRun write-redirection hook (overlay_ExecutorRun) runs
-     * its own internal CMD_SELECT queries via SPI to locate WHERE-
-     * matching rows for UPDATE / DELETE.  Those are CMD_SELECT (so
-     * B-1 below passes them through) but they MUST scan raw MAIN heap
-     * via standard nodes (SeqScan / IndexScan), NEVER through the
-     * overlay CustomScan — otherwise the write-redir code hard-casts
-     * scan states to SeqScanState (wrong offsets = SIGSEGV signal 11).
-     * Guard flag is set / cleared around the entire intercept block
-     * of overlay_ExecutorRun using PG_TRY / PG_CATCH so it is always
-     * restored even on ereport(ERROR). */
+    /* B1.24 REDUNDANT SAFETY GUARD: always skip BranchScan injection
+     * for WRITE-side scan subplans.  The *primary* guard that keeps
+     * UPDATE / DELETE / INSERT subplans on raw SeqScan (not CustomScan)
+     * is B-1 further down: `if (ct != CMD_SELECT) return;`.  However we
+     * additionally check overlay_in_write_redirect() here, so that even if
+     * a future refactor accidentally changes B-1, WR subplans are still
+     * driven by physical ctid.  Pure-delta DML (UPDATE/DELETE of rows
+     * that only exist in the delta table, i.e. INSERTed in-branch) is
+     * documented as MVP-out-of-scope until WRITE subplans can run with
+     * ExecQual evaluation against reconstructed delta slots — see
+     * write_redirect.c "NOTE: pure-delta INSERT rows" comment. */
     if (overlay_in_write_redirect())
         return;
     /* B1.5: Skip if we are *inside* the shared 2-pass helper itself.
@@ -343,16 +430,253 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
             return;
     }
     {
+        /* 把 reln 的生命周期扩大到整个 CustomPath 构建块：先前置的
+         * has_pk 检查 + 新增的 PK 等值条件识别都要访问 relcache。 */
         Relation    reln = table_open(rte->relid, NoLock);
-        bool        has_pk = overlay_relation_has_pk(reln);
-        table_close(reln, NoLock);
-        if (!has_pk)
-            return;
-    }
-    {
-        CustomPath *cpath = makeNode(CustomPath);
+        CustomPath *cpath;
         Cost        min_cost = 1.0e-6;
         ListCell   *lc;
+        /* P0: PK-IndexScan MVP — 尝试从 baserestrictinfo 识别
+         * 单列 PK = Const 等值条件。命中则快速路径：SPI MAIN 查用
+         * WHERE pk=val，delta 用 overlay_delta_lookup（O(1)）。
+         * custom_private 传递协议（List 长度 6）：
+         *   [0] String  → rte->relid 十进制字符串（不再解析，仅留兼容性占位）
+         *   [1] Integer → has_pk_pred_flag (0 或 1)
+         *   [2] String  → pk_where_sql_cstr（空串当 flag=0）
+         *   [3] String  → serialized_pk_key（空串当 flag=0）
+         *   [4] Integer → has_general_where_flag (0 或 1, P2 non-PK pushdown)
+         *   [5] String  → general_where_sql（deparse_expression 的输出，空串当 flag=0）
+         * 读取端：先拿 RT-index→rte→relid 的标准路径，再按 index 解包。 */
+        AttrNumber  pk_attno = 0;
+        const char *pk_colname = NULL;
+        bool        has_pk_pred = false;
+        char       *pk_where_sql = NULL;
+        char       *pk_serialized_key = NULL;
+        bool        has_general_where = false;
+        char       *general_where_sql = NULL;
+
+        if (!overlay_relation_has_pk(reln))
+        {
+            table_close(reln, NoLock);
+            return;
+        }
+
+        if (overlay_get_pk_single_attno(reln, &pk_attno, &pk_colname))
+        {
+            ListCell   *rc;
+            foreach(rc, rel->baserestrictinfo)
+            {
+                RestrictInfo *rinfo = (RestrictInfo *) lfirst(rc);
+                OpExpr      *opexpr;
+                Node        *left, *right;
+                Var         *var;
+                Const       *con;
+                Oid         eqop;
+                bool        var_on_left;
+
+                if (!IsA(rinfo, RestrictInfo))
+                    continue;
+                if (!IsA(rinfo->clause, OpExpr))
+                    continue;
+                opexpr = (OpExpr *) rinfo->clause;
+                if (list_length(opexpr->args) != 2)
+                    continue;
+                left  = (Node *) linitial(opexpr->args);
+                right = (Node *) lsecond(opexpr->args);
+
+                /* 识别 Var-Const 或 Const-Var 形式 */
+                if (IsA(left, Var) && IsA(right, Const))
+                {
+                    var = (Var *) left;
+                    con = (Const *) right;
+                    var_on_left = true;
+                }
+                else if (IsA(left, Const) && IsA(right, Var))
+                {
+                    con = (Const *) left;
+                    var = (Var *) right;
+                    var_on_left = false;
+                }
+                else
+                    continue;
+
+                /* Var 必须指向本 rel 的 PK 列 */
+                if (var->varno != rti)
+                    continue;
+                if (var->varattno != pk_attno)
+                    continue;
+                if (var->varlevelsup != 0)
+                    continue;
+
+                /* 操作符必须是该 PK 类型的 btree 等值操作符（=）。
+                 * 用 typcache 拿该类型的默认 btree eq op OID。 */
+                {
+                    TypeCacheEntry *tcache;
+
+                    tcache = lookup_type_cache(var->vartype,
+                                               TYPECACHE_EQ_OPR);
+                    eqop = tcache ? tcache->eq_opr : InvalidOid;
+                }
+                if (!OidIsValid(eqop))
+                    continue;
+                if (var_on_left)
+                {
+                    if (opexpr->opno != eqop)
+                        continue;
+                }
+                else
+                {
+                    /* commuted: 检查 commutator op */
+                    Oid commut = get_commutator(opexpr->opno);
+                    if (commut != eqop)
+                        continue;
+                }
+
+                /* 命中：构造 pk_where_sql 片段 + 序列化 key。
+                 * V2 策略（见 doc/p0_pk_oidx_deparse_strategy.md §3）：
+                 *   直接把整个 OpExpr(Var(PK)=Const) 节点交给
+                 *   ruleutils 的 deparse_expression()，而不是手动按 PK
+                 *   列的 type 调 output function。这样：
+                 *   1) 字面量的 consttype 和实际输出函数严格对应（避免
+                 *      int4 Datum 当 int8 解读 → garbage SQL）；
+                 *   2) format_type_be static buffer 覆写问题不存在
+                 *      （deparse_expression 内部用 palloc 生成 cast）；
+                 *   3) 自定义类型的 output function ERROR 用 PG_TRY
+                 *      捕获后安全回退（has_pk_pred=false）。 */
+                {
+                    List       *dpctx;
+                    char       *deparsed;
+
+                    dpctx = deparse_context_for(
+                                RelationGetRelationName(reln),
+                                rte->relid);
+                    deparsed = NULL;
+                    PG_TRY();
+                    {
+                        deparsed = deparse_expression(
+                                       (Node *) opexpr,
+                                       dpctx,
+                                       false,
+                                       false);
+                    }
+                    PG_CATCH();
+                    {
+                        FlushErrorState();
+                        deparsed = NULL;
+                    }
+                    PG_END_TRY();
+
+                    if (deparsed != NULL && *deparsed != '\0' &&
+                        strlen(deparsed) < 65536)
+                    {
+                        pk_where_sql = pstrdup(deparsed);
+                    }
+                    else
+                    {
+                        /* deparse 失败 → P0 回退，不消费这条谓词，
+                         * P2 会把它当作普通 qual 纳入 general_where。 */
+                        has_pk_pred = false;
+                        pk_where_sql = NULL;
+                        pk_serialized_key = NULL;
+                        continue;
+                    }
+
+                    pk_serialized_key = overlay_serialize_pk_from_single_datum(
+                        reln, pk_attno, con->constvalue,
+                        con->constisnull, con->consttype);
+                }
+                has_pk_pred = true;
+                break; /* 第一个命中的 PK 等值条件即可 */
+            }
+        }
+
+        /* P2 general (non-PK) qual pushdown: 收集 baserestrictinfo 中
+         * 不是 PK=Const 自身的剩余 clauses，用 AND 组合后 deparse 成
+         * SQL 文本透传到 Executor，MAIN 的 SPI SELECT 直接用它
+         * 过滤（减少 MAIN 侧从磁盘拉回的行数）。
+         * 回退策略：deparse 报错、包含不可反编译节点（Param 等）或
+         * 结果为空串 → has_general_where=false，Main 保持原查询。 */
+        if (rel->baserestrictinfo != NIL)
+        {
+            List       *remain = NIL;
+            ListCell   *rc;
+
+            foreach(rc, rel->baserestrictinfo)
+            {
+                RestrictInfo *rinfo = (RestrictInfo *) lfirst(rc);
+                Node        *clause;
+                bool        is_pk_clause = false;
+
+                if (!IsA(rinfo, RestrictInfo)) continue;
+                clause = (Node *) rinfo->clause;
+
+                if (has_pk_pred && IsA(clause, OpExpr))
+                {
+                    OpExpr *ope = (OpExpr *) clause;
+                    if (list_length(ope->args) == 2 &&
+                        pk_attno != 0 && pk_colname != NULL)
+                    {
+                        Node       *ln = (Node *) linitial(ope->args);
+                        Node       *rn = (Node *) lsecond(ope->args);
+                        Var        *v = NULL;
+
+                        if (IsA(ln, Var) && IsA(rn, Const))
+                            v = (Var *) ln;
+                        else if (IsA(ln, Const) && IsA(rn, Var))
+                            v = (Var *) rn;
+                        if (v != NULL &&
+                            v->varno == rti &&
+                            v->varattno == pk_attno &&
+                            v->varlevelsup == 0)
+                        {
+                            TypeCacheEntry *tc;
+                            Oid            eqop;
+                            tc = lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR);
+                            eqop = tc ? tc->eq_opr : InvalidOid;
+                            if (OidIsValid(eqop) &&
+                                (ope->opno == eqop ||
+                                 get_commutator(ope->opno) == eqop))
+                            {
+                                is_pk_clause = true;
+                            }
+                        }
+                    }
+                }
+                if (!is_pk_clause)
+                    remain = lappend(remain, clause);
+            }
+            if (remain != NIL)
+            {
+                Node       *top;
+                List       *dpctx;
+                char       *deparsed;
+
+                top = (Node *) ((list_length(remain) == 1)
+                                    ? (Node *) linitial(remain)
+                                    : (Node *) makeBoolExpr(AND_EXPR,
+                                                            remain,
+                                                            -1));
+                dpctx = deparse_context_for(RelationGetRelationName(reln), rte->relid);
+                PG_TRY();
+                {
+                    deparsed = deparse_expression(top, dpctx, false, false);
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                    deparsed = NULL;
+                }
+                PG_END_TRY();
+                if (deparsed != NULL && *deparsed != '\0' &&
+                    strlen(deparsed) < 65536)
+                {
+                    has_general_where = true;
+                    general_where_sql = pstrdup(deparsed);
+                }
+            }
+        }
+
+        cpath = makeNode(CustomPath);
         foreach(lc, rel->pathlist)
         {
             Path *p = (Path *) lfirst(lc);
@@ -365,14 +689,80 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         cpath->path.parallel_aware = false;
         cpath->path.parallel_safe  = false;
         cpath->path.parallel_workers = 0;
-        cpath->path.rows       = rel->rows;
+        /* PK-predicate 快速路径：进一步压低 cost 显式鼓励 Planner（即使
+         * 我们后面强删 pathlist，成本标记也能保留给 EXPLAIN 看）。 */
+        if (has_pk_pred)
+            cpath->path.rows = 1.0;
+        else
+            cpath->path.rows       = rel->rows;
         cpath->path.startup_cost = 0.0;
         cpath->path.total_cost = min_cost * 1.0e-5;
         cpath->path.pathkeys   = NIL;
         cpath->flags           = 0;
         cpath->custom_paths    = NIL;
         cpath->custom_restrictinfo = NIL;
-        cpath->custom_private  = list_make1_oid(rte->relid);
+
+        /* 打包 custom_private（统一 Integer/String 包装）。
+         * OID 用十进制字符串传递（PG List 的 Integer cell 是 int32，
+         * 大 OID >INT32_MAX 会截断成负数，Executor 端 open rel 失败）。
+         * custom_private 扩展到 6 元素保持向后兼容：任何元素缺失
+         * Executor 端都安全回退到相应的全量路径。 */
+        {
+            List       *cpriv = NIL;
+            int         pkflag;
+            int         gwflag;
+            char       *oid_cstr;
+            pkflag = has_pk_pred ? 1 : 0;
+            gwflag = has_general_where ? 1 : 0;
+            oid_cstr = psprintf("%u", (unsigned) rte->relid);
+            /* CRITICAL: makeString() stores the passed char* pointer
+             * BY REFERENCE — it does NOT copy.  We MUST NOT pfree()
+             * the strings we hand to makeString(), otherwise the
+             * String* nodes inside custom_private end up pointing to
+             * freed/reused memory (→ Executor reads garbage bytes
+             * like 0x0111 or random pointers).
+             * Strategy: always pstrdup() on the way in, then free our
+             * locals as usual.  copyObject() (which happens when
+             * CustomScan plan is deep-copied) then takes its own
+             * deep copies of String nodes via pstrdup in
+             * _copyString. */
+            cpriv = lappend(cpriv, makeString(pstrdup(oid_cstr)));
+            pfree(oid_cstr);
+            cpriv = lappend(cpriv, makeInteger(pkflag));
+            if (pkflag && (pk_where_sql == NULL || *pk_where_sql == '\0'))
+            {
+                pkflag = 0;
+                has_pk_pred = false;
+                if (pk_serialized_key) { pfree(pk_serialized_key); pk_serialized_key = NULL; }
+                /* Replace the Integer cell we just appended. */
+                list_nth_cell(cpriv, 1)->ptr_value = (void *)(intptr_t) makeInteger(0);
+            }
+            cpriv = lappend(cpriv,
+                            makeString(pstrdup(
+                                (has_pk_pred && pk_where_sql) ? pk_where_sql : "")));
+            cpriv = lappend(cpriv,
+                            makeString(pstrdup(
+                                (has_pk_pred && pk_serialized_key) ? pk_serialized_key : "")));
+            elog(DEBUG2, "P0 DEBUG: pkflag=%d where=%s key_prefix=%.*s; gwflag=%d general=%s",
+                 pkflag,
+                 (has_pk_pred && pk_where_sql) ? pk_where_sql : "(empty)",
+                 (has_pk_pred && pk_serialized_key) ? 16 : 0,
+                 (has_pk_pred && pk_serialized_key) ? pk_serialized_key : "(null)",
+                 gwflag,
+                 (has_general_where && general_where_sql) ? general_where_sql : "(empty)");
+            cpriv = lappend(cpriv, makeInteger(gwflag));
+            cpriv = lappend(cpriv,
+                            makeString(pstrdup(
+                                (has_general_where && general_where_sql) ? general_where_sql : "")));
+            cpath->custom_private = cpriv;
+        }
+        if (pk_where_sql)
+            pfree(pk_where_sql);
+        if (pk_serialized_key)
+            pfree(pk_serialized_key);
+        if (general_where_sql)
+            pfree(general_where_sql);
+
         cpath->methods         = &ob_branchscan_path_methods;
         add_path(rel, (Path *) cpath);
 
@@ -400,8 +790,20 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
                 if (IsA(p, CustomPath))
                     newlist = lappend(newlist, p);
             }
-            rel->pathlist = newlist;
+            /* If our CustomPath is the only candidate (normal active-branch
+             * case, at least one SeqScan/IndexScan existed to seed pathlist),
+             * strip everything else.  If newlist is EMPTY (e.g. PG Planner
+             * already reduced baserel to a single dummy Result path with
+             * rows=0, as happens for `WHERE id = NULL` or
+             * `WHERE id IS NULL` on a NOT-NULL PK), KEEP the original
+             * pathlist.  A zero-row dummy plan is correct (no rows can
+             * possibly match, so no need for BranchScan injection), and
+             * otherwise `pathlist = NIL` leads to a fatal
+             * "could not devise a query plan for the given query" error. */
+            if (newlist != NIL)
+                rel->pathlist = newlist;
         }
+        table_close(reln, NoLock);
     }
 }
 
@@ -411,18 +813,28 @@ ob_branchscan_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
                                List *clauses, List *custom_plans)
 {
     CustomScan *cscan = makeNode(CustomScan);
-    Oid         relid = linitial_oid(cpath->custom_private);
+    /* P0: custom_private 4 元素协议：
+     *   [0] String  → OID 十进制字符串（strtoul 解析，避免大 OID int32 截断）
+     *   [1] Integer → has_pk_pred_flag (0/1)
+     *   [2] String  → pk_where_sql_cstr（可能空串）
+     *   [3] String  → serialized_pk_key（可能空串）
+     * 直接透传到 cscan，不做结构转换。 */
+    const char *relid_cstr = strVal(linitial(cpath->custom_private));
+    Oid         relid = (Oid) strtoul(relid_cstr, NULL, 10);
     List       *custom_exprs_list;
 
+    (void) root;
+    (void) relid;    /* relid OID 已经在 custom_private[0] 中透传，此处仅解包检查 */
     (void) clauses;  /* qual is NOT pushed down in MVP: we materialize the
                       * full overlay result set in ExecCustomScan and let PG
                       * wrap our CustomScan node in an upper Filter node to
-                      * evaluate WHERE quals.  Otherwise storing raw
-                      * RestrictInfo (T_RestrictInfo=315) into
-                      * scan.plan.qual would cause "unrecognized node type"
-                      * errors when the planner tries to treat them as Exprs
-                      * (CustomScan qual expects already-planned expression
-                      * nodes, not RestrictInfo wrappers). */
+                      * evaluate WHERE quals.  For PK-predicate fast-path:
+                      * Planner 已经识别 PK=Const 并传递了 pk_where_sql；
+                      * 非 PK 条件仍在 scan.plan.qual 中运行。
+                      * 注意：clauses 中可能包含已被 PK 条件吸收的
+                      * RestrictInfo，仍需解包挂载到 scan.plan.qual ——
+                      * ExecQual 对 AND-条件评估是幂等的，重复评估
+                      * 一次 PK=Const 不影响正确性（只是多一次比较）。*/
 
     cscan->scan.scanrelid  = rel->relid;
     cscan->flags           = cpath->flags;
@@ -430,13 +842,7 @@ ob_branchscan_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 
     /* Strip RestrictInfo wrappers: scan.plan.qual expects plain Exprs,
      * not RestrictInfo nodes (T_RestrictInfo=315 would be reported as
-     * "unrecognized node type" by ExecQual).  Baserestrictinfo comes
-     * in as clauses parameter; we assign the unwrapped Expr list to
-     * scan.plan.qual so ExecQual in ob_branchscan_exec() evaluates
-     * WHERE predicates against each materialized merged row.  MVP
-     * does not push quals into the 2-pass helper SPI (they run in the
-     * Filter-node-like scan-level qual); this is correct but may be
-     * optimized later. */
+     * "unrecognized node type" by ExecQual). */
     custom_exprs_list = NIL;
     {
         ListCell *lc;
@@ -448,7 +854,7 @@ ob_branchscan_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
         }
     }
     cscan->custom_exprs    = NIL;
-    cscan->custom_private  = list_make1_oid(relid);
+    cscan->custom_private  = copyObject(cpath->custom_private);
     cscan->custom_scan_tlist = NIL;
     cscan->custom_relids   = bms_make_singleton(rel->relid);
     cscan->methods         = &ob_branchscan_scan_methods;
@@ -492,7 +898,9 @@ ob_branchscan_create_custom_scan_state(CustomScan *cscan)
 List *
 ob_compute_overlay_slots(Oid relid, int32 branch_id)
 {
-    return ob_compute_overlay_slots_internal(relid, branch_id, NULL);
+    return ob_compute_overlay_slots_internal(relid, branch_id, NULL,
+                                             false, NULL, NULL,
+                                             false, NULL);
 }
 
 static void
@@ -503,11 +911,98 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
     Oid              relid;
     int32            branch_id;
     Relation         rel;
+    List            *cpriv;
+    int              flag;
 
     (void) eflags;
     (void) estate;
 
-    relid     = linitial_oid(cscan->custom_private);
+    /* P0: custom_private 4 元素协议解包。
+     * OID 不再从 custom_private[0] 解析（字符串易出错），
+     * 直接从 estate 继承 PG 结构拿：RT index → RTE → relid。*/
+    cpriv = cscan->custom_private;
+    {
+        Index           rti = cscan->scan.scanrelid;
+        RangeTblEntry  *rte;
+        /* scanrelid 是 baserel 的 RT index（从 1 开始编号）。
+         * 对 CustomScan 来说 Plan 阶段我们已设置 cscan->scan.scanrelid
+         * = rel->relid (RT index)，所以这里一定能拿到。*/
+        rte = rt_fetch(rti, estate->es_range_table);
+        relid = rte->relid;
+    }
+    /* P0 PK=Const 快路径解包（见 doc/p0_pk_oidx_deparse_strategy.md §5）。
+     * 协议：cpriv[1]=Integer pkflag；cpriv[2]=String pk_where_sql；
+     *       cpriv[3]=String pk_serialized_key。
+     * 任何 malformed / 空串 → has_pk_pred=false 安全回退到 seqscan
+     * （此时 P2 general_where 仍可独立启用，两条路径不耦合）。
+     * 注意：**必须用 intVal() 从 Integer 节点取 ival，不能用
+     * lsecond_int / list_nth_int** —— 后者直接把 ListCell 存的
+     * Integer* 指针截断成 int（64-bit下高位丢失），会导致整个
+     * 进程 exit code 2 崩溃。 */
+    flag = 0;
+    if (list_length(cpriv) >= 2)
+    {
+        Node *nde = lsecond(cpriv);
+        if (nde != NULL && IsA(nde, Integer))
+            flag = intVal(nde);
+    }
+    ebs->has_pk_pred = (flag != 0);
+    ebs->pk_where_sql = NULL;
+    ebs->pk_serialized_key = NULL;
+    if (ebs->has_pk_pred && list_length(cpriv) >= 4)
+    {
+        Node       *n_w = lthird(cpriv);
+        Node       *n_k = lfourth(cpriv);
+        const char *wstr = (n_w != NULL && IsA(n_w, String))
+                               ? strVal(n_w) : NULL;
+        const char *kstr = (n_k != NULL && IsA(n_k, String))
+                               ? strVal(n_k) : NULL;
+
+        if (wstr != NULL && *wstr != '\0' && kstr != NULL && *kstr != '\0')
+        {
+            ebs->pk_where_sql = pstrdup(wstr);
+            ebs->pk_serialized_key = pstrdup(kstr);
+        }
+        else
+        {
+            /* 任一缺失 → 任一已分配都要 pfree 后回退（不过这里上面
+             * 还没分配，直接清零 flag 就行） */
+            ebs->pk_where_sql = NULL;
+            ebs->pk_serialized_key = NULL;
+            ebs->has_pk_pred = false;
+        }
+    }
+
+    /* P2 general (non-PK) qual pushdown.  Any malformed element = fallback.
+     * custom_private[5] is a String node; "" or NULL → skip pushdown. */
+    ebs->has_general_where = false;
+    ebs->general_where_sql = NULL;
+    if (list_length(cpriv) >= 6)
+    {
+        int             gwflag;
+        Node           *nde;
+        const char     *gwstr;
+
+        nde = list_nth(cpriv, 4);
+        if (nde != NULL && IsA(nde, Integer))
+            gwflag = intVal(nde);
+        else
+            gwflag = 0;
+        ebs->has_general_where = (gwflag != 0);
+        nde = list_nth(cpriv, 5);
+        gwstr = (nde != NULL && IsA(nde, String)) ? strVal(nde) : NULL;
+        if (ebs->has_general_where && gwstr != NULL && *gwstr != '\0')
+            ebs->general_where_sql = pstrdup(gwstr);
+        else
+        {
+            ebs->general_where_sql = NULL;
+            ebs->has_general_where = false;
+        }
+        elog(DEBUG2, "P2 EXEC UNPACK: gwflag=%d general_where=%s",
+             gwflag,
+             ebs->general_where_sql ? ebs->general_where_sql : "(null)");
+    }
+
     branch_id = overlay_branch_get_current_id();
 
     /* ----- LAZY MATERIALIZATION -----
@@ -570,7 +1065,12 @@ ob_branchscan_exec(CustomScanState *node)
 
         slots = ob_compute_overlay_slots_internal(ebs->relid,
                                                    ebs->branch_id,
-                                                   &helper_tdesc);
+                                                   &helper_tdesc,
+                                                   ebs->has_pk_pred,
+                                                   ebs->pk_where_sql,
+                                                   ebs->pk_serialized_key,
+                                                   ebs->has_general_where,
+                                                   ebs->general_where_sql);
         ebs->result_slots = slots;
         ebs->cursor       = list_head(slots);
         if (helper_tdesc != NULL)
@@ -666,6 +1166,24 @@ ob_branchscan_end(CustomScanState *node)
             ExecDropSingleTupleTableSlot(s);
         }
         list_free(ebs->result_slots);
+    }
+
+    /* P0 PK-IndexScan MVP: 释放 Begin 阶段 pstrdup 的字符串 */
+    if (ebs->pk_where_sql != NULL)
+    {
+        pfree(ebs->pk_where_sql);
+        ebs->pk_where_sql = NULL;
+    }
+    if (ebs->pk_serialized_key != NULL)
+    {
+        pfree(ebs->pk_serialized_key);
+        ebs->pk_serialized_key = NULL;
+    }
+    /* P2 general (non-PK) qual pushdown cleanup */
+    if (ebs->general_where_sql != NULL)
+    {
+        pfree(ebs->general_where_sql);
+        ebs->general_where_sql = NULL;
     }
 
     /* IMPORTANT: ebs->rel_desc was obtained via RelationGetDescr()

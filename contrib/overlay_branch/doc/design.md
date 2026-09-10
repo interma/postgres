@@ -167,6 +167,36 @@ Delta Store
 
 > 第一版如果允许改 core，建议直接增加 `BranchModifyTable`，不要为了坚持 extension-only 把自己逼进各种 hook。
 
+#### Write Redirect 核心实现细节（V2 最终版固化）
+
+**主循环 + Pure-delta 独立 pass 双架构：**
+```
+ ExecutorRun hook 进入 ModifyTable
+    ├─ WR MAIN PASS（不变）：
+    │   for each 子计划物理 MAIN 行 (outerPlan):
+    │      ctid SPI 取 old_version → 写 delta op=U/D
+    │    pk 加入 EMITTED set ✔
+    │
+    └─ WR PURE-DELTA PASS (8-phase，V2-P3 关键扩展)：
+         Phase C: 仅 CMD_DELETE 进入 (MVP UPDATE=安全 NOP)
+         Phase D: delta_list WHERE op=I AND NOT EMITTED
+                    deep copy 在 es_query_cxt 分配
+         Phase E: while (outerPlanState scan_ps):
+                    qual_scan = scan_ps.qual
+                    qual_extra = switch T_IndexScanState      → indexqualorig
+                                       T_BitmapHeapScanState → bitmapqualorig
+                                       T_IndexOnlyScanState  → recheckqual
+         Phase F: ExecQual (qual_scan AND qual_extra)
+         Phase G: SAFETY GUARD 👉 qual 全 NULL 立即 continue (防全表 DML nuke)
+                    pass=true → delta(op=D, old_version=NULL, key=pk)  ✔ pure delta origin
+         Phase H: cleanup (es_query_cxt 自动回收)
+```
+
+**入口硬拦截（V2 强约束，绝不 silent）：**
+- `PlannedStmt.hasModifyingCTE = true` → ereport ERROR（Data-Modifying CTE 是唯一能把 DML 结果流入外层 SELECT 的合法方式；不严拦直接导致 MAIN heap pollution）
+- `if (commandType != CMD_SELECT) return;` 在 Planner hook 最顶（UPDATE/DELETE baserel scan 不应被 BranchScan 注入，ModifyTable 的 ctid 读不走这个）
+- Plsner hook + WR hook 双份 guard（冗余 Belt-and-braces）
+
 ### 第三层：BranchScan
 
 最适合做 **CustomScan**。PostgreSQL 允许扩展提供 Custom Scan Path/Plan/Executor，用自己的扫描实现替换普通 relation scan。
@@ -285,6 +315,41 @@ branch value = ...
 
 交给业务层（Agent / Application）自行 resolve，产生新的 transaction。数据库只告诉业务"你的假设已经不成立"，而不是替业务决定 `ours / theirs`。
 
+### Apply 3-pass 执行顺序 & Pure-delta 特殊规则（V2 最终版）
+
+**3-Pass 原子顺序（独立 SPI 事务，任一条冲突整体回滚）：**
+```
+Pass 1 — DELETE deltas 先执行（外键 child → parent 删除安全）
+Pass 2 — UPDATE deltas 再执行（含冲突检测）
+Pass 3 — INSERT deltas 最后执行（外键 parent → child 插入安全）
+```
+
+**Pure-delta 特殊规则 — 绝不能 false-positive CONFLICT：**
+
+```
+delta = {op=D, old_version=NULL, key=k}     ← old_version NULL = pure delta 起源
+意思：分支里 INSERT k → 分支里 DELETE k，MAIN 从始至终都没有这行
+
+apply 常规逻辑 (old_version != NULL):
+   SELECT * FROM main WHERE pk=k            → 0 row → 抛 CONFLICT
+                                      ❌ bug11: 纯 delta 不应报冲突
+
+V2 修法 — apply Pass1 顶部加专属 NOP：
+   if (dt->old_version == NULL)
+       return;    (NOP skip, 不写 MAIN，不冲突)
+```
+
+**Pure-delta INSERT/UPDATE 规则：**
+- `op=I, old_version=NULL`：分支自插入，MAIN 不存在 → Pass3 直接 `INSERT INTO main`
+- `op=U, old_version=NULL`：pure-delta UPDATE（V2 MVP 不应产生；若出现则按 I 语义插入新版本或升级到 V3 再处理）
+
+### Apply 冲突检测 & 主键类型强约束
+
+`old_version = format("<blocknum>:<offset>-x<xmin>")` 的正确性依赖 MAIN 上该行物理版本没有被 rewrite（HOT 更新除外，HOT 保留 ctid 不变）。
+
+- typmod PK：PK 列为 `BPCHAR(N)` / `NUMERIC(p,s)` 时，全链路必须用 `format_type_with_typmod(atttypid, atttypmod)`（format_type_be 只返回基名，长度信息丢失 → BPCHAR `CAST(... AS char)` 变成 `text` → rtrim 后 key mismatch 100%）
+- BPCHAR JSON 字符串数组元素 = 两端均 rtrim：`overlay_serialize_pk` 对 BPCHAR 调 `pq_rtrim(…)`；P0 / apply WHERE 子句 cast 用 `CAST (… AS bpchar(N))::text` 外层 `::text` 保留文本语义 — 否则 WR 写 `["PD001  "]`（带空格），apply 查写 `["PD001"]` → 0 row → 误冲突。
+
 ---
 
 ## Snapshot 的工程陷阱
@@ -378,7 +443,13 @@ WITH (isolation = 'snapshot');
 - logical replication
 - DDL
 - ON CONFLICT
-- RETURNING 复杂情况
+- pure-delta UPDATE（V2 保持安全 NOP；需要改 = DELETE + INSERT 等效语义）
+
+**已在 V2 扩展覆盖（第一版限制已部分解除）：**
+
+- RETURNING 子句（INSERT/UPDATE/DELETE 全路径 + pure-delta DELETE）
+- Data-Modifying CTE：入口 `PlannedStmt.hasModifyingCTE` 检测，明确 ereport ERROR（绝不静默 MAIN pollution）
+- BPCHAR(6)/NUMERIC(10,2) 等带 typmod 的 PK 列：全链路 `format_type_with_typmod()` 替代 format_type_be；BPCHAR PK JSON 序列化两端均 rtrim
 
 先证明模型。
 
