@@ -367,9 +367,9 @@ T2 Branch:
 
 如果定义 Branch 是严格 fork，T2 应该看到 `x=1`。但千万不要真的 `RegisterSnapshot()` hold 3 小时，否则 MVCC/VACUUM 会非常难看。
 
-### V1 建议的语义
+### V1/V2 的默认语义：Live Workspace
 
-**Branch = Read Committed Main + Branch Overlay**
+**Branch = Read Committed Main + Branch Overlay**（等价于 `use_branch(name, mode => 'live')`）
 
 ```
 当前 Main
@@ -378,14 +378,17 @@ Branch Delta
 ```
 
 这样：
-
 - T0 branch sees `x=1`
 - T1 main `x=2`
 - T2 branch sees `x=2`
 
 除非 Branch 自己修改过（如 `branch x=10`），那么始终看到 `10`。
 
-这其实更接近 **Workspace**，而不是严格意义上的数据库 fork。而且这可能反而更符合 Business-first Agent 场景。
+这其实更接近 **Workspace**，而不是严格意义上的数据库 fork。更符合 Business-first Agent 场景。
+
+### V3 引入的 Snapshot Mode（严格 fork 语义）
+
+V3 支持 `use_branch(name, mode => 'snapshot')`，在进入分支时通过 `RegisterSnapshot(GetTransactionSnapshot())` 冻结 MAIN 读视图，MAIN 表后续写入不再可见；但 delta 仍为最新已提交（支持多 session 协作写同一分支）。详细协议与风险控制见 [multi_session_mvcc.md](./multi_session_mvcc.md) 的 SNAPSHOT Mode 章节。
 
 ---
 
@@ -406,14 +409,15 @@ AI Agent 通常不是要永久生活在过去，而是：
 
 这比 Neon 那种 Storage Snapshot Branch 更有意思。
 
-### 2. Snapshot Branch（未来）
+### 2. Snapshot Branch（V3 T5 实装，MAIN freeze + Delta always-latest）
 
 ```sql
-CREATE BRANCH b2
-WITH (isolation = 'snapshot');
+SELECT use_branch('b2', 'snapshot');
 ```
 
 语义：**Frozen Main Snapshot + Branch Delta**
+
+V3 已实装：MAIN 表元组按 snapshot taken 时 xmin horizon 冻结；同一 branch 的 live session 写入 WR delta 仍对 snapshot reader 可见（协作友好）。详细契约见 multi_session_mvcc.md §I8.5。
 
 预计 AI Agent **80% 场景**可能更适合 live branch。
 
@@ -450,6 +454,14 @@ WITH (isolation = 'snapshot');
 - RETURNING 子句（INSERT/UPDATE/DELETE 全路径 + pure-delta DELETE）
 - Data-Modifying CTE：入口 `PlannedStmt.hasModifyingCTE` 检测，明确 ereport ERROR（绝不静默 MAIN pollution）
 - BPCHAR(6)/NUMERIC(10,2) 等带 typmod 的 PK 列：全链路 `format_type_with_typmod()` 替代 format_type_be；BPCHAR PK JSON 序列化两端均 rtrim
+
+**已在 V3 扩展覆盖（跨会话并发 T1→T8）：**
+
+- 2-param `use_branch(name, mode => 'snapshot' | 'live')` + SNAPSHOT MAIN freeze 语义（FR5）
+- state machine `active → applying → applied/discarded` CAS gate（FR3）
+- FR2 V1 零锁协议（use=zero lock，SHARED→EXCLUSIVE 升级死锁根除；仅 CAS-winner 取 Exclusive advisory）
+- FR4 NOTIFY + SPI counter fallback 双层失效机制（post-apply ERROR 55000 kickout）
+- L1 精确调度 5 spec × 9 permutation 全绿 + L2 pgbench fixture（见 `test/` 三层）
 
 先证明模型。
 

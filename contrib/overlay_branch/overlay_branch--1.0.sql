@@ -72,6 +72,27 @@ AS 'MODULE_PATHNAME', 'overlay_branch_use'
 LANGUAGE C STRICT VOLATILE
 SET search_path = @extschema@, pg_catalog;
 
+-- ============================================================
+-- 2-parameter use_branch(name, mode) with MVCC mode override.
+--   mode = 'live'    : reads on MAIN use current snapshot (V2 behaviour)
+--   mode = 'snapshot': reads on MAIN freeze at the snapshot taken when
+--                      this function is called; see V3 docs.
+-- OVERLOAD RESOLUTION NOTE: mode has NO SQL DEFAULT so use_branch('foo')
+--   UNIQUELY resolves to the 1-parameter form above; without this PG 17
+--   raises "ERROR: function use_branch(unknown) is not unique".
+-- ============================================================
+CREATE FUNCTION @extschema@.use_branch(branch_name name, mode text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'overlay_branch_use_with_mode'
+LANGUAGE C VOLATILE
+SET search_path = @extschema@, pg_catalog;
+
+COMMENT ON FUNCTION @extschema@.use_branch(name, text) IS
+'Enter a branch with an explicit MVCC mode.
+mode = ''live''    : reads on MAIN use current snapshot (V2 behaviour).
+mode = ''snapshot'': reads on MAIN freeze at the MVCC snapshot taken
+                     when this function is called; see V3 docs.';
+
 CREATE FUNCTION @extschema@.current_branch()
 RETURNS name
 AS 'MODULE_PATHNAME', 'overlay_branch_current'
@@ -127,6 +148,40 @@ AS $$
     ORDER BY b.branch_id;
 $$;
 
+CREATE FUNCTION @extschema@.overlay_branch_cached_mode(bid integer)
+RETURNS text
+AS 'MODULE_PATHNAME', 'overlay_branch_cached_mode'
+LANGUAGE C STABLE STRICT
+SET search_path = @extschema@, pg_catalog;
+
+CREATE OR REPLACE FUNCTION @extschema@.list_branches()
+RETURNS TABLE(
+    branch_id integer,
+    branch_name name,
+    owner oid,
+    created_at timestamp with time zone,
+    mode text,
+    state text,
+    delta_count bigint
+)
+LANGUAGE sql STABLE STRICT
+SET search_path = @extschema@, pg_catalog
+AS $$
+    SELECT b.branch_id,
+           b.branch_name,
+           b.owner,
+           b.created_at,
+           COALESCE(@extschema@.overlay_branch_cached_mode(b.branch_id), b.mode) AS mode,
+           b.state,
+           COALESCE(d.cnt, 0)::bigint AS delta_count
+    FROM pg_branch b
+    LEFT JOIN (SELECT branch_id, count(*) AS cnt
+               FROM pg_branch_delta
+               GROUP BY branch_id) d
+      ON d.branch_id = b.branch_id
+    ORDER BY b.branch_id;
+$$;
+
 CREATE FUNCTION @extschema@.overlay_main_plus_delta(regclass)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'overlay_main_plus_delta'
@@ -170,6 +225,36 @@ CREATE FUNCTION @extschema@.overlay_debug_delta_delete_all(
 AS 'MODULE_PATHNAME', 'overlay_debug_delta_delete_all'
 LANGUAGE C STRICT VOLATILE
 SET search_path = @extschema@, pg_catalog;
+
+-- ============================================================
+-- V3 Task 2 Layer 1 (FR1 + FR4): throttled catalog recheck
+--   * overlay_branch_is_active(name) RETURNS bool
+--       - returns ground truth from pg_branch catalog, performing
+--         throttled heavy SPI recheck if enough calls have elapsed
+--         (see GUCs overlay_branch.invalidation_check_threshold and
+--         overlay_branch.invalidation_check_interval_ms).
+--       - NOT STRICT / VOLATILE per project conventions: we need to
+--         handle NULL inputs manually and recheck state each call.
+--   * overlay_branch_force_invalidation_check() RETURNS bool
+--       - user-visible "check NOW" bypass: forces a heavy SPI recheck
+--         regardless of throttle counter / elapsed time.
+--       - returns true if the branch context remained active AFTER the
+--         recheck; false and NOTICE when rechecked and found inactive.
+--   * NOTIFY channel "ob_branch_state" payload format "<bid>:<new_state>"
+--     is broadcast from apply_branch / discard_branch C entry points
+--     after catalog mutations commit; no SQL entry needed (registered by
+--     _PG_init / called from branch_lifecycle.c).
+-- ============================================================
+
+CREATE FUNCTION @extschema@.overlay_branch_is_active(name name)
+RETURNS bool
+LANGUAGE C VOLATILE SET search_path = ''
+AS 'MODULE_PATHNAME', 'overlay_branch_is_active_by_name';
+
+CREATE FUNCTION @extschema@.overlay_branch_force_invalidation_check()
+RETURNS bool
+LANGUAGE C VOLATILE SET search_path = ''
+AS 'MODULE_PATHNAME', 'overlay_branch_force_invalidation_check';
 
 -- ============================================================
 -- Public aliases (views for tables, plain functions exposed)
@@ -222,6 +307,26 @@ CREATE OR REPLACE FUNCTION public.discard_branch(branch_name name)
 RETURNS void LANGUAGE sql VOLATILE SET search_path = @extschema@, pg_catalog
 AS $$SELECT @extschema@.discard_branch(branch_name)$$;
 
+CREATE OR REPLACE FUNCTION public.use_branch(branch_name name, mode text)
+RETURNS void LANGUAGE sql VOLATILE SET search_path = @extschema@, pg_catalog
+AS $$SELECT @extschema@.use_branch(branch_name, mode)$$;
+
+CREATE OR REPLACE FUNCTION public.is_active(name name)
+RETURNS bool
+SET search_path = @extschema@, pg_catalog, pg_temp
+LANGUAGE sql
+AS $$
+    SELECT @extschema@.overlay_branch_is_active(name);
+$$;
+
+CREATE OR REPLACE FUNCTION public.force_invalidation_check()
+RETURNS bool
+SET search_path = @extschema@, pg_catalog, pg_temp
+LANGUAGE sql
+AS $$
+    SELECT @extschema@.overlay_branch_force_invalidation_check();
+$$;
+
 CREATE OR REPLACE FUNCTION public.list_branches()
 RETURNS TABLE(branch_id integer, branch_name name, owner oid,
               created_at timestamp with time zone, mode text,
@@ -241,6 +346,12 @@ GRANT EXECUTE ON FUNCTION public.use_branch(name) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.current_branch() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.apply_branch(name) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.discard_branch(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.use_branch(name, text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.list_branches() TO PUBLIC;
+
+GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_is_active(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_force_invalidation_check() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_active(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.force_invalidation_check() TO PUBLIC;
 
 COMMENT ON EXTENSION overlay_branch IS 'Overlay Branch - speculative database state using table overlay and delta store';

@@ -9,10 +9,14 @@
 #define OVERLAY_BRANCH_H
 
 #include "postgres.h"
+#include "miscadmin.h"
 #include "datatype/timestamp.h"
 #include "executor/tuptable.h"
 #include "nodes/pg_list.h"
 #include "utils/relcache.h"
+#include "storage/lmgr.h"
+#include "storage/lockdefs.h"
+#include "storage/lock.h"
 
 /* ----------
  * Branch modes
@@ -20,6 +24,74 @@
  */
 #define BRANCH_MODE_LIVE		"live"
 #define BRANCH_MODE_SNAPSHOT	"snapshot"
+
+/* ----------
+ * V3 FR2: Branch-level Advisory Lock magic key.
+ *
+ * int64 key layout (exactly matches PG's native SET_LOCKTAG_ADVISORY form
+ * used by pg_advisory_xact_lock(int8)):
+ *   bits 63..48  = 0x4F42 = magic prefix 'O' 'B'  ("overlay branch")
+ *   bits 47..32  = reserved, set 0
+ *   bits 31..0   = uint32 view of int32 branch_id (from pg_branch.branch_id)
+ *
+ * Collision probability with user-generated advisory keys is ~1/2^16 since
+ * ordinary keys almost never carry high bits 0x4F42.
+ *
+ * We locally re-define SET_LOCKTAG_INT64 here (mirroring lockfuncs.c L613)
+ * because that macro is a file-local helper in the backend, not exported
+ * through headers.
+ * ----------
+ */
+#define OB_ADVISORY_MAGIC_HI16  ((uint64) 0x4F42ULL << 48)
+#define OB_MAKE_ADVISORY_KEY(bid)  \
+	(OB_ADVISORY_MAGIC_HI16 | ((uint64) ((uint32) (bid))))
+
+#ifndef SET_LOCKTAG_INT64
+#define SET_LOCKTAG_INT64(tag, key64) \
+	SET_LOCKTAG_ADVISORY(tag, \
+						 MyDatabaseId, \
+						 (uint32) ((key64) >> 32), \
+						 (uint32) (key64), \
+						 1)
+#endif
+
+/* ----------
+ * FR2 helpers: take/release xact-scoped advisory lock on a branch_id.
+ *
+ * Use sessionLock = false so the lock is tied to the current transaction
+ * (auto-released on COMMIT / ABORT, never leaks).
+ * dontWait       = false so callers block until granted (or the deadlock
+ * detector picks a victim with ERRCODE 40P01, which is the safe behaviour).
+ *
+ * Same-backend same-xact ShareLock → ExclusiveLock upgrade works correctly in PG
+ * (promoted without wait, but we document Section L tests to cover this path).
+ * ----------
+ */
+static inline void
+ob_take_branch_advisory_lock(int32 bid, LOCKMODE lockmode)
+{
+	int64		key = (int64) OB_MAKE_ADVISORY_KEY(bid);
+	LOCKTAG		tag;
+
+	if (bid <= 0)
+		elog(ERROR,
+			 "overlay_branch: invalid branch_id=%d for advisory lock",
+			 bid);
+	SET_LOCKTAG_INT64(tag, key);
+	(void) LockAcquire(&tag, lockmode, false, false);
+}
+
+static inline void
+ob_release_branch_advisory_lock(int32 bid, LOCKMODE lockmode)
+{
+	int64		key = (int64) OB_MAKE_ADVISORY_KEY(bid);
+	LOCKTAG		tag;
+
+	if (bid <= 0)
+		return;
+	SET_LOCKTAG_INT64(tag, key);
+	(void) LockRelease(&tag, lockmode, false);
+}
 
 /* ----------
  * Fully qualified schema (control file pins schema='overlay_branch',
@@ -35,8 +107,16 @@
  * ----------
  */
 #define BRANCH_STATE_ACTIVE	"active"
+#define BRANCH_STATE_APPLYING	"applying"	/* FR3 transient CAS state while apply runs */
 #define BRANCH_STATE_APPLIED	"applied"
 #define BRANCH_STATE_DISCARDED	"discarded"
+
+/* ----------
+ * Layer1 NOTIFY channel name (FR1: broadcast branch state changes).
+ * Payload format: "<branch_id>:<new_state>"
+ * ----------
+ */
+#define OB_NOTIFY_CHANNEL		"ob_branch_state"
 
 /* ----------
  * Delta operation types
@@ -58,6 +138,11 @@ typedef struct BranchContext
 	char		mode[16];		/* "live" or "snapshot" */
 	TimestampTz	created_at;		/* branch creation time */
 	Oid			owner;			/* branch owner (from pg_branch.owner) */
+	/* ===== V3 multi-session fields (append-only, keep ABI compat) ===== */
+	struct SnapshotData *branch_main_snapshot;	/* NULL=live; non-NULL=snapshot frozen MAIN reads */
+	bool		snapshot_registered;			/* true iff UnregisterSnapshot is pending */
+	uint32		invalidation_counter;			/* FR4: throttle SPI re-checks */
+	TimestampTz	invalidation_last_check;		/* FR4: throttle SPI re-checks */
 } BranchContext;
 
 /* ----------
@@ -83,6 +168,16 @@ extern char *overlay_branch_current_name;
 extern bool overlay_branch_enabled;
 
 /* ----------
+ * V3 multi-session tuning GUCs
+ * ----------
+ */
+extern int	ob_invalidation_check_threshold;	/* every N is_active() calls → SPI check */
+extern int	ob_invalidation_check_interval_ms;	/* every M ms → SPI check */
+extern bool	ob_apply_strict_pins;				/* apply fails if other sessions hold pins */
+extern bool	ob_use_shared_mem_pin_table;		/* optional: shmem pin tracking */
+extern bool	ob_in_snapshot_mode_helper;		/* internal: PushActiveSnapshot guard */
+
+/* ----------
  * Recursion-guard globals (owned by overlay_branch.c; written
  * directly by use_internal/apply_internal in branch_lifecycle.c
  * to avoid layering extra trivial setters/getters).
@@ -90,6 +185,9 @@ extern bool overlay_branch_enabled;
  */
 extern bool ob_in_apply_operation;
 extern bool ob_in_guc_setconfig;
+extern bool ob_in_invalidation_check;
+extern bool ob_in_planner_hook;  /* set = throttled SPI running, depth-1 guard. */
+extern bool ob_throttled_allow_kickout;  /* only ExecutorRun WR dml_split entry sets true = do cleanup. */
 
 /* ----------
  * Global branch context (for the current session)
@@ -104,11 +202,45 @@ extern BranchContext *CurrentBranchContext;
 extern void		overlay_branch_init(void);
 extern int32	overlay_branch_create_internal(const char *branch_name);
 extern void		overlay_branch_use_internal(const char *branch_name);
+extern void		overlay_branch_use_with_mode_internal(const char *branch_name,
+													   const char *mode);
 extern const char *overlay_branch_get_current_name(void);
 extern int32	overlay_branch_get_current_id(void);
 extern bool		overlay_branch_is_active(void);
 extern void		overlay_branch_apply_internal(const char *branch_name);
 extern void		overlay_branch_discard_internal(const char *branch_name);
+extern void		ob_ensure_unregister_snapshot(BranchContext *ctx);
+extern void		ob_exit_branch_cleanup(BranchContext *ctx);
+	/* Layer1: NOTIFY broadcast + throttled invalidation SPI recheck */
+	extern void		ob_broadcast_state_change(int32 bid, const char *new_state);
+	extern bool		ob_invalidate_check_throttled(bool for_dml);
+
+/* I8.2 (2026-09-17 L1 ob_apply_mutex deadlock-timeout fix):
+ * session-local per-bid mode cache, replaces use_branch catalog UPDATE.
+ *
+ * Old pre-I8.2 code persisted every use_branch(name, mode) via SPI
+ * UPDATE pg_branch.mode → each UPDATE took RowExclusiveLock on the
+ * matching catalog row. Two sessions calling use_branch('same_bid')
+ * therefore serialized at the heavyweight lock → under
+ * pg_isolation_regress this manifest as s2_p1_use `<waiting ...>`
+ * 360s timeout → false deadlock cancel on permutation P2.
+ *
+ * Cache semantics (identical to catalog behavior within one session):
+ *   • bid→last-used-mode HTAB, session lifetime.
+ *   • Set on every with_mode_internal success (incl. 1-arg default live).
+ *   • Overlaid in list_branches SRF over catalog mode.
+ *   • Removed by apply_internal / discard_internal when bid no longer
+ *     ACTIVE (no re-enter possible until future recreate; catalog row
+ *     then inserts mode='live' default).
+ * No heavyweight locks, no cross-session serialization.
+ */
+extern const char *ob_mode_cache_lookup(int32 bid);
+extern void     ob_mode_cache_set(int32 bid, const char *mode);
+extern void     ob_mode_cache_remove(int32 bid);
+
+/* T8 § B.11 debug GUCs (NOT ABI-stable, _debug_ prefix) */
+extern int		ob_debug_apply_sleep_sec;
+extern int		ob_debug_invalidation_counter_throttle_override;
 
 /* ----------
  * Function declarations for Delta Store operations

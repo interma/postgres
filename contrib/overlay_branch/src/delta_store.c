@@ -39,6 +39,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 /* ---------------------------------------------------------------
@@ -83,6 +84,101 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 	char	   *q_key;
 	char	   *q_oldver;
 	int			ret;
+	StringInfoData gsql;
+	int			gret;
+
+	if (branch_id <= 0)
+		elog(ERROR, "overlay_delta_insert: invalid branch_id=%d", branch_id);
+
+	initStringInfo(&gsql);
+	appendStringInfo(&gsql,
+					 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
+					 "WHERE branch_id = %d LIMIT 1",
+					 (int) branch_id);
+	gret = ob_spi_one_shot(gsql.data, true, 1);
+	if (gret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		pfree(gsql.data);
+		elog(ERROR, "overlay_delta_insert: bid=%d state lookup SPI ret=%d",
+			 branch_id, gret);
+	}
+	if (SPI_processed == 0)
+	{
+		const char *bn;
+		SPI_finish();
+		bn = overlay_branch_get_current_name();
+		pfree(gsql.data);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("overlay_delta_insert: branch_id=%d does not exist",
+						branch_id),
+				 errhint("Current session branch: \"%s\". "
+						 "Call create_branch() first.",
+						 bn ? bn : "<none>")));
+	}
+	else
+	{
+		bool		isnull;
+		Datum		v;
+		char	   *st;
+		MemoryContext oldmc;
+
+		/* mirror apply_branch Step0 pattern: SELECT branch_id, state → state is col 2 */
+		v = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+		if (isnull)
+		{
+			SPI_finish();
+			pfree(gsql.data);
+			{
+				const char *bn2 = overlay_branch_get_current_name();
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("overlay_delta_insert: bid=%d has NULL state "
+								"(corrupt pg_branch row)",
+								branch_id),
+						 errhint("Current session branch: \"%s\".",
+								 bn2 ? bn2 : "<none>")));
+			}
+		}
+		/* copy detoasted text C string into a context that outlives SPI_finish
+		 * (SPI proc context is torn down by finish; TopMemoryContext is safe,
+		 * mirroring apply_branch Step0).  Otherwise the returned string
+		 * pointer becomes dangling after SPI_finish, producing empty string /
+		 * garbage compare. */
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		st = TextDatumGetCString(v);
+		MemoryContextSwitchTo(oldmc);
+		SPI_finish();
+		if (st == NULL || strcmp(st, BRANCH_STATE_ACTIVE) != 0)
+		{
+			const char *bn;
+			char	   *saved_st = st ? pstrdup(st) : pstrdup("<NULL>");
+
+			pfree(gsql.data);
+			bn = overlay_branch_get_current_name();
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("overlay_branch: cannot write delta rows to branch "
+							"\"%s\" (bid=%d state=%s). "
+							"Writes are only allowed while branch is ACTIVE.",
+							bn ? bn : "<unresolved name>",
+							branch_id, saved_st),
+					 (st && strcmp(st, BRANCH_STATE_APPLYING) == 0
+					  ? errhint("Branch is currently applying. "
+								"Retry apply once the current apply_branch() "
+								"caller has finished.")
+					  : 0),
+					 (st && (strcmp(st, BRANCH_STATE_APPLIED) == 0
+							 || strcmp(st, BRANCH_STATE_DISCARDED) == 0)
+					  ? errhint("Branch is in a terminal state (%s); "
+								"no further writes allowed. Create a new branch.",
+								saved_st)
+					  : 0)));
+		}
+		if (st) pfree(st);
+	}
+	pfree(gsql.data);
 
 	if (key == NULL)
 		elog(ERROR, "overlay_delta_insert: key must not be NULL");
@@ -170,7 +266,15 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 					 "LIMIT 1",
 					 branch_id, relid, q_key);
 
+	/* The outer caller may be a cursor whose DECLARE-time snapshot freezes
+	 * snapshot->curcid before this same-txn WR INSERT ran.  Push the latest
+	 * secondary snapshot (GetSnapshotData refreshes curcid to the current
+	 * command id) so delta rows inserted by later commands remain visible.
+	 * Push/Pop uses FirstSnapshotSet; PopActiveSnapshot auto-frees snapshots
+	 * with zero active_count+regd_count (see snapmgr.c L743-763). */
+	PushActiveSnapshot(GetLatestSnapshot());
 	ret = ob_spi_one_shot(sql.data, true, 1);
+	PopActiveSnapshot();
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();
@@ -286,7 +390,14 @@ overlay_delta_list_for_rel(int32 branch_id, Oid relid)
 					 "ORDER BY key",
 					 branch_id, relid);
 
+	/* Match the Push/Pop discipline used in overlay_delta_lookup: force the
+	 * secondary latest snapshot so delta rows appended by a later command id
+	 * inside the same transaction (e.g. same-txn WR INSERT after a DECLARE
+	 * CURSOR) become visible even when the outer statement's active snapshot
+	 * still has the older, frozen curcid. */
+	PushActiveSnapshot(GetLatestSnapshot());
 	ret = ob_spi_one_shot(sql.data, true, 0);
+	PopActiveSnapshot();
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();

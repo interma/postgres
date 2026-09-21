@@ -398,7 +398,7 @@ RESET overlay_branch.current;
 SELECT current_branch() AS cur_before_c3a;
  cur_before_c3a 
 ----------------
- b_live
+ 
 (1 row)
 
 -- === C3a. ZERO-POLLUTION LAW: Main MUST remain baseline 3, id=1 STILL 'v-base-1' ===
@@ -763,7 +763,6 @@ FROM overlay_branch.overlay_main_plus_delta('public.guard_ok')
 -- Cleanup D part: discard b_guard, drop the guard test tables.
 RESET overlay_branch.current;
 SELECT discard_branch('b_guard');
-NOTICE:  discarding current branch "b_guard", reverting to Main
  discard_branch 
 ----------------
  
@@ -809,7 +808,6 @@ SELECT CASE WHEN overlay_branch.overlay_debug_delta_count(
 -- E1: discard now cascades deletion of all 3 delta rows.
 RESET overlay_branch.current;
 SELECT discard_branch('b_discard_cascade');
-NOTICE:  discarding current branch "b_discard_cascade", reverting to Main
  discard_branch 
 ----------------
  

@@ -76,15 +76,40 @@ char	   *overlay_branch_current_name = NULL;
 bool		overlay_branch_enabled = true;
 
 /* ================================================================
+ * V3 multi-session tuning GUCs
+ * ================================================================ */
+int			ob_invalidation_check_threshold = 32;
+int			ob_invalidation_check_interval_ms = 100;
+bool		ob_apply_strict_pins = true;
+bool		ob_use_shared_mem_pin_table = false;
+bool		ob_in_snapshot_mode_helper = false;
+
+/* ================================================================
  * Global session state
  * ================================================================ */
 BranchContext *CurrentBranchContext = NULL;
 
-/* ---------- Recursion guard flags (4-layer Bypass stack) ---------- */
+/* ---------- Recursion guard flags (5-layer Bypass stack) ---------- */
 bool		ob_in_apply_operation = false;		/* extern: branch_lifecycle.c writes */
 bool		ob_in_guc_setconfig = false;		/* extern: branch_lifecycle.c writes */
+bool		ob_in_invalidation_check = false;	/* extern: branch_lifecycle.c throttled() */
+bool		ob_in_planner_hook = false;		/* extern: branch_scan planner_hook wrap */
+bool		ob_throttled_allow_kickout = false;	/* extern: only WR ExecutorRun allows cleanup */
 static bool ob_in_overlay_helper = false;
 static bool ob_in_write_redirect = false;
+
+/* T8 § B.9.1 Debug GUCs — § B.11 documented.  Default values match L3
+ * expected baseline.  Underlying storage: these two are extern-accessible
+ * from branch_lifecycle.c for actual enforcement. */
+int			ob_debug_apply_sleep_sec = 0;			/* PGC_SUSET: pg_sleep(N)
+													 * between CAS-winner
+													 * state='applying' and
+													 * MAIN merge; 0 = OFF */
+int			ob_debug_invalidation_counter_throttle_override = -1;
+											/* PGC_USERSET: >= 0 overrides
+											 * DEFAULT_SPI_INVALIDATION_THROTTLE
+											 * constant for L1 state_inval
+											 * permutation; -1 = use default */
 
 /* --- Layer 1: apply_operation bypass --- */
 bool
@@ -148,6 +173,8 @@ void		_PG_init(void);
 static bool overlay_guc_check_assign_current_branch(char **newval,
 												   void **extra,
 												   GucSource source);
+static void overlay_guc_assign_current_branch(const char *newval,
+											  void *extra);
 static void overlay_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void overlay_ExecutorRun(QueryDesc *queryDesc,
 					ScanDirection direction,
@@ -168,6 +195,11 @@ static const char *ob_utility_opname(NodeTag tag);
  * ================================================================ */
 PG_FUNCTION_INFO_V1(overlay_branch_create);
 PG_FUNCTION_INFO_V1(overlay_branch_use);
+PG_FUNCTION_INFO_V1(overlay_branch_use_with_mode);
+PG_FUNCTION_INFO_V1(overlay_branch_is_active_by_name);
+PG_FUNCTION_INFO_V1(overlay_branch_force_invalidation_check);
+PG_FUNCTION_INFO_V1(overlay_branch_cached_mode);
+
 PG_FUNCTION_INFO_V1(overlay_branch_current);
 PG_FUNCTION_INFO_V1(overlay_branch_apply);
 PG_FUNCTION_INFO_V1(overlay_branch_discard);
@@ -194,11 +226,26 @@ _PG_init(void)
 		CurrentBranchContext->is_active = false;
 		strcpy(CurrentBranchContext->mode, BRANCH_MODE_LIVE);
 		CurrentBranchContext->created_at = 0;
+		CurrentBranchContext->branch_main_snapshot = NULL;
+		CurrentBranchContext->snapshot_registered = false;
+		CurrentBranchContext->invalidation_counter = 0;
+		CurrentBranchContext->invalidation_last_check = 0;
 
 		MemoryContextSwitchTo(oldctx);
 	}
 
-	/* GUC: overlay_branch.current (triggers USE via check_hook) */
+	/* GUC: overlay_branch.current (triggers USE via assign_hook —
+	 *
+	 * IMPORTANT PG PATTERN: check hooks MUST be side-effect free.  PG can
+	 * and will re-invoke check hooks for pre-flight validation,
+	 * multi-pass SET LOCAL savepoint restoration, subxact abort GUC
+	 * rollback, etc.  All side-effects (use/exit branch) MUST live in
+	 * the assign hook, which is called exactly once per real GUC
+	 * assignment (once savepoint rollbacks have been negotiated).  If
+	 * we put side-effects in the check hook, savepoint rollback after
+	 * an ERROR inside a PL/pgSQL EXCEPTION block double-invokes
+	 * ob_exit_branch_cleanup → TopMemoryContext double-pfree → PANIC.
+	 * (Recorded as T5 踩坑 #3 in doc/progress_tracker.md.) */
 	DefineCustomStringVariable("overlay_branch.current",
 							   "Set the current active branch for this session.",
 							   "Set to the branch name, or empty/NULL to leave the branch.",
@@ -207,7 +254,7 @@ _PG_init(void)
 							   PGC_USERSET,
 							   0,
 							   overlay_guc_check_assign_current_branch,
-							   NULL,
+							   overlay_guc_assign_current_branch,
 							   NULL);
 
 	DefineCustomBoolVariable("overlay_branch.enabled",
@@ -220,6 +267,83 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+
+	/* -------- V3 multi-session GUCs (FR2/FR4/FR7 tunables) -------- */
+	DefineCustomIntVariable("overlay_branch.invalidation_check_threshold",
+							"Run a SPI state-recheck after N calls to overlay_branch_is_active (FR4 fast-path override of NOTIFY push).",
+							"Set to 0 to disable call-count throttling and require time-based or NOTIFY-based invalidation only.",
+							&ob_invalidation_check_threshold,
+							32,
+							0,
+							INT_MAX / 2,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("overlay_branch.invalidation_check_interval_ms",
+							"Minimum wall-clock interval between SPI state re-checks, in milliseconds (FR4 fallback).",
+							"Set to 0 to disable time-based throttling and rely on NOTIFY + call-count triggers.",
+							&ob_invalidation_check_interval_ms,
+							100,
+							0,
+							INT_MAX / 2,
+							PGC_USERSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("overlay_branch.apply_strict_pins",
+							 "apply_branch() fails with ERROR if other sessions still hold use_branch() pins on the branch.",
+							 "Strict mode (on) guarantees zero post-apply data drift at the cost of requiring all users to exit the branch first; relaxed mode warns and proceeds.",
+							 &ob_apply_strict_pins,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("overlay_branch.use_shared_mem_pin_table",
+							 "Enable optional shared-memory pin-count table to speed up apply_branch pinning decisions (FR7).",
+							 "Requires loading overlay_branch via shared_preload_libraries. When off, falls back to pure SPI-based state checks.",
+							 &ob_use_shared_mem_pin_table,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/* T8 § B.11: Debug GUCs — NOT ABI stable, prefixed with _debug_.
+	 * Default values match L3 expected baseline. */
+	DefineCustomIntVariable("overlay_branch._debug_apply_sleep_sec",
+							"(DEBUG) Number of seconds to pg_sleep between apply_branch CAS-winner state='applying' and MAIN row merge.",
+							"Set >0 to widen the applying-state window for L1 ob_applying_freeze.spec.  Production default 0 (off).",
+							&ob_debug_apply_sleep_sec,
+							0,
+							0,
+							3600,
+							PGC_SUSET,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("overlay_branch._debug_invalidation_counter_throttle_override",
+							"(DEBUG) Override FR4 DEFAULT_SPI_INVALIDATION_THROTTLE call-count constant.",
+							"Set >= 0 to force a custom throttle value; -1 (default) means use the compiled-in constant (32).  Used by L1 ob_state_inval.spec to shorten permutations.",
+							&ob_debug_invalidation_counter_throttle_override,
+							-1,
+							-1,
+							INT_MAX / 2,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 
 	MarkGUCPrefixReserved("overlay_branch");
 
@@ -245,44 +369,263 @@ _PG_init(void)
 }
 
 /* ================================================================
- * GUC check hook for overlay_branch.current
+ * GUC hooks for overlay_branch.current
+ *
+ *   check hook  = SIDE-EFFECT FREE validation only.  PG can (and will)
+ *                 re-invoke this for savepoint-rollback GUC restore,
+ *                 multi-pass SET LOCAL pre-flight, etc.  Any side-effect
+ *                 here → double cleanup → TopMemoryContext double-pfree
+ *                 → PANIC (T5 踩坑 #3).
+ *
+ *                 MUST NOT touch ob_in_guc_setconfig here: the flag is
+ *                 OWNED by the assign hook.  SetConfigOption calls the
+ *                 hooks in order: (1) check — possibly repeated — then
+ *                 (2) assign — exactly once per real assignment.  If we
+ *                 reset the recursion flag in check, the assign hook
+ *                 sees it as FALSE and re-runs the side-effect — a
+ *                 second cleanup or a second use_branch — leading to
+ *                 the exact double-pfree we saw in T5 Section N entry
+ *                 after a PL/pgSQL EXCEPTION block.
+ *
+ *   assign hook = REAL side-effects: enter/leave branch.  Called exactly
+ *                 once per true GUC assignment (post-negotiation).
+ *                 THIS is where we inspect/flip ob_in_guc_setconfig to
+ *                 break the SetConfigOption recursion that use_branch()
+ *                 creates when it wants to persist the GUC.
  * ================================================================ */
 static bool
 overlay_guc_check_assign_current_branch(char **newval, void **extra,
 										GucSource source)
 {
-	const char *val;
+	const char *name;
 
+	/* ---- PG GUC CONTRACT -------------------------------------------------
+	 * Check hook = SIDE-EFFECT-FREE VALIDATION ONLY (PG may call this
+	 * MULTIPLE times for a single SET: preflight, savepoint rollback,
+	 * post-check pre-assign revalidation).  We may use READ-ONLY SPI to
+	 * query ground-truth catalog state, but we MUST NOT flip any flags,
+	 * write any catalogs, take any locks, or touch CurrentBranchContext.
+	 * Return false → PG aborts the SET (no GUC write, PG emits the
+	 * standard "invalid value for parameter" error).  Return true →
+	 * proceed to assign hook (which performs real side-effects and is
+	 * GUARANTEED to succeed because validation is already complete).
+	 * ------------------------------------------------------------------ */
+
+	/* NULL / empty = "leave branch" → always valid (no SPI needed) */
+	if (newval == NULL || *newval == NULL || **newval == '\0')
+		return true;
+
+	name = *newval;
+
+	/* Hard length bound (must fit BranchContext.name[NAMEDATALEN]) */
+	if (strlen(name) >= NAMEDATALEN)
+		return false;
+
+	/* ------------------------------------------------------------------
+	 * EARLY-INIT GUARD: During _PG_init / post-startup GUC sweep, no
+	 * database has been connected yet (MyDatabaseId is InvalidOid) and
+	 * SPI_connect will fail (no active snapshot / transaction).  In
+	 * that phase we simply accept any syntactically-valid name; the
+	 * assign hook will still validate via use_internal() if the name
+	 * is actually written, and first user SET during normal backend
+	 * operation will re-run this full SPI check. */
+	if (MyDatabaseId == InvalidOid)
+		return true;
+
+	/* ------------------------------------------------------------------
+	 * READ-ONLY SPI VALIDATION — branch EXISTS + state = ACTIVE.
+	 * Uses the current LatestSnapshot (same visibility as user SELECTs
+	 * on the catalog).  Errors from SPI (e.g. table missing because
+	 * CREATE EXTENSION not yet run in this database → fail-closed
+	 * reject the value.  Extension not loaded? user can still call
+	 * use_branch() SQL-callable directly; SET-based path is a luxury.
+	 *
+	 * Before returning false (PG will raise the generic "invalid value
+	 * for parameter" error), we first emit a CUSTOM ereport(ERROR) with
+	 * human-readable text matching the public use_branch() API.  PG's
+	 * check-hook contract allows ereport + return false as a pair: the
+	 * ERROR is delivered to the user exactly as-is, and the GUC value
+	 * remains unchanged. */
+	{
+		bool		is_valid = false;
+		bool		found = false;
+		bool		state_active = false;
+		int			spi_rc;
+		StringInfoData sql;
+		char	   *esc_name;
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			return false;
+
+		initStringInfo(&sql);
+		esc_name = quote_literal_cstr(name);
+		appendStringInfo(&sql,
+						 "SELECT state FROM " OBTABLE_BRANCH
+						 " WHERE branch_name = %s LIMIT 1",
+						 esc_name);
+
+		spi_rc = SPI_execute(sql.data, true, 1);
+		pfree(sql.data);
+
+		if (spi_rc == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			Datum		state_datum;
+			bool		isnull;
+			char	   *state_text;
+
+			found = true;
+			state_datum = SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc,
+										1, &isnull);
+			if (!isnull)
+			{
+				state_text = TextDatumGetCString(state_datum);
+				if (state_text != NULL &&
+					strcmp(state_text, BRANCH_STATE_ACTIVE) == 0)
+				{
+					is_valid = true;
+					state_active = true;
+				}
+				else
+				{
+					state_active = false;
+				}
+				pfree(state_text);
+			}
+		}
+
+		SPI_finish();
+
+		if (!is_valid)
+		{
+			if (!found)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("branch \"%s\" does not exist", name)));
+			else if (!state_active)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("branch \"%s\" is not active", name)));
+			/* (fall-through) return false below in case ereport path
+			 * was compiled out; normally ereport(ERROR) above does not
+			 * return. */
+		}
+		return is_valid;
+	}
+}
+
+static void
+overlay_guc_assign_current_branch(const char *newval, void *extra)
+{
+	/* ---- Recursion guard (caller-owned flag) ---------------------------
+	 *
+	 * External callers of SetConfigOption (use_with_mode_internal /
+	 * throttle cleanup helper / etc.) lift ob_in_guc_setconfig to TRUE
+	 * *before* calling SetConfigOption and restore the saved pre-call
+	 * value (typically FALSE) immediately after SetConfigOption returns.
+	 *
+	 * WE NEVER TOUCH THIS FLAG HERE.  If we cleared it inside the hook,
+	 * a single SetConfigOption that internally invokes the assign hook
+	 * TWO or more times (PG GUC machinery does internal two-pass updates
+	 * for some value classes; savepoint rollback also re-checks) would
+	 * see flag=FALSE on the SECOND pass and enter the real side-effect
+	 * code — double-cleanup / double-pfree / state corruption. */
 	if (ob_in_guc_setconfig)
+		return;
+
+	/* ---- PG GUC CONTRACT ------------------------------------------------
+	 * Assign hook = REAL SIDE-EFFECTS ONLY, MUST NOT FAIL.
+	 *
+	 * The check hook overlay_guc_check_assign_current_branch() has
+	 * already performed FULL validation:
+	 *   • Name length < NAMEDATALEN
+	 *   • (if non-empty) branch EXISTS in pg_branch AND state='active'
+	 *
+	 * If check returned true, this assign hook runs and the below
+	 * operations are GUARANTEED error-free.  The only non-standard
+	 * case is the PL/pgSQL abort-restore path (T5 PANIC fix), handled
+	 * by LAYER-1 below.  No PG_TRY needed — error paths simply cannot
+	 * happen given check-hook prevalidation. */
+
+	/* Empty/NULL → leave any active branch.  Check hook has already
+	 * validated empty strings (always valid). */
+	if (newval == NULL || *newval == '\0')
 	{
-		ob_in_guc_setconfig = false;
-		return true;
+		if (CurrentBranchContext != NULL && CurrentBranchContext->is_active)
+		{
+			/* I8.2: persist cached mode BEFORE cleanup so GUC RESTORE +
+			 * re-entry on the same bid re-enters the same mode the user
+			 * had selected (snapshot survives leave→re-enter cycles). */
+			ob_mode_cache_set(CurrentBranchContext->branch_id,
+							  CurrentBranchContext->mode);
+			ob_exit_branch_cleanup(CurrentBranchContext);
+		}
+		return;
 	}
 
-	if (newval == NULL || *newval == NULL)
+	/* Non-empty → use branch. */
+
+	/* LAYER-1 (PL/pgSQL abort-restore guard):
+	 *   If CurrentBranchContext EXISTS but is_active == FALSE, we are
+	 *   on a PL/pgSQL subxact-abort GUC RESTORE PATH.  Throttle /
+	 *   discard / apply have already kicked us off the branch and run
+	 *   exit_cleanup.  Check hook ran BEFORE the abort started and
+	 *   said the name is valid (exists+active at that time), but the
+	 *   catalog state has moved on since — we MUST NOT call use_internal
+	 *   (would call SPI inside an abort unwind → PANIC).  The GUC value
+	 *   has already been written by PG; we simply skip the enter side-
+	 *   effect.  Any subsequent user action will re-SET and re-check. */
+	if (CurrentBranchContext != NULL && !CurrentBranchContext->is_active)
+		return;
+
+	/* I8.2 mode-preserve: GUC 1-arg SET (no mode param) — reuse cached mode.
+	 * Without this, assign hook always calls use_internal() → mode='live'
+	 * unconditionally → PART D/E snapshot modes always regress to 'live' in
+	 * list_branches.  With cache hit, re-enter prior mode exactly (matches
+	 * prior catalog-WRITE semantics but w/o RowExclusiveLock per use). */
 	{
-		if (CurrentBranchContext != NULL)
+		int32 bid_from_name = 0;
+		char   *esc;
+		StringInfoData sq;
+		const char *mode_for_hook = NULL;
+
+		/* Allocate in outer Caller context BEFORE SPI_connect to avoid
+		 * double-free: SPI_finish() frees SPI_proc context, so any
+		 * allocations made while SPI_proc is CurrentMemoryContext would
+		 * already be released before we pfree them below. */
+		esc = quote_literal_cstr(newval);
+		initStringInfo(&sq);
+		appendStringInfo(&sq,
+			"SELECT branch_id FROM overlay_branch.pg_branch "
+			"WHERE branch_name = %s LIMIT 1", esc);
+
+		if (SPI_connect() == SPI_OK_CONNECT)
 		{
-			CurrentBranchContext->is_active = false;
-			CurrentBranchContext->branch_id = 0;
-			CurrentBranchContext->branch_name[0] = '\0';
+			if (SPI_execute(sq.data, true, 1) == SPI_OK_SELECT &&
+				SPI_processed == 1)
+			{
+				bool isnull = false;
+				Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+				if (!isnull)
+					bid_from_name = DatumGetInt32(d);
+			}
+			SPI_finish();
 		}
-		return true;
-	}
-	val = *newval;
-	if (*val == '\0')
-	{
-		if (CurrentBranchContext != NULL)
+		pfree(esc);
+		pfree(sq.data);
+		if (bid_from_name > 0)
+			mode_for_hook = ob_mode_cache_lookup(bid_from_name);
+		if (mode_for_hook != NULL)
 		{
-			CurrentBranchContext->is_active = false;
-			CurrentBranchContext->branch_id = 0;
-			CurrentBranchContext->branch_name[0] = '\0';
+			overlay_branch_use_with_mode_internal(newval, mode_for_hook);
+			return;
 		}
-		return true;
 	}
 
-	overlay_branch_use_internal(val);
-	return true;
+	/* Check hook says branch EXISTS + state='active' at the latest
+	 * snapshot.  This call will not raise any ERROR. */
+	overlay_branch_use_internal(newval);
 }
 
 /* ================================================================
@@ -702,15 +1045,79 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	char	   *op_name = NULL;
 	char	   *obj_name = NULL;
 	char	   *fail_reason = NULL;
+	NodeTag		tag;
 
-	if (overlay_branch_is_active() && pstmt != NULL &&
-		pstmt->utilityStmt != NULL &&
-		!overlay_guard_ddl_ok_for_branch(pstmt->utilityStmt,
-										  &op_name, &obj_name,
-										  &fail_reason))
+	/* --- FR4 kickout guard: do NOT run the generic
+	 * overlay_branch_is_active() → throttled(DQL) check for pure
+	 * session/utility commands that never touch user-table rows.
+	 * Running it on, say, a SET command (T_VariableSetStmt) would cause
+	 * the following pathological race:
+	 *
+	 *   1. Session S is on branch B (state ACTIVE in catalog).
+	 *   2. S manually flips overlay_branch.pg_branch.state = 'applied'
+	 *      (catalog-only write; WR protected-schema guard correctly
+	 *      skips the DML kickout so the manual flip persists).
+	 *   3. S runs SET overlay_branch.invalidation_check_threshold = 1
+	 *      so the *next* user-table DML deterministically runs SPI.
+	 *   4. Without the whitelist below: SET triggers ProcessUtility
+	 *      → overlay_branch_is_active() → throttled(false) with
+	 *      counter already >= new threshold=1 → DQL NOTICE kickout
+	 *      → ctx->is_active = false (and ctx->counter reset, GUC
+	 *      overlay_branch.current cleared).
+	 *   5. The *actual* user-table UPDATE (the drift-write the test
+	 *      deliberately wanted to ERROR-block) then sees
+	 *      ctx->is_active=false → throttled fast-path return false
+	 *      (no ERROR because no "on branch"), falls through to MAIN
+	 *      heap, silent drift.
+	 *
+	 * Solution: only overlay_branch_is_active() + DDL-guard the
+	 * statement categories that *might* mutate user state.  Every
+	 * Tag below is provably session-only / catalog-maintenance only
+	 * and is allowed to skip the check.
+	 *
+	 * The list is intentionally conservative: add to it only when
+	 * you can prove the command type never writes MAIN user heap
+	 * rows (no silent pollution possible). */
+	if (pstmt != NULL && pstmt->utilityStmt != NULL)
 	{
-		overlay_guard_ereport_fail(op_name ? op_name : "execute utility/DDL",
-								   obj_name, fail_reason);
+		tag = nodeTag(pstmt->utilityStmt);
+		switch (tag)
+		{
+			case T_VariableSetStmt:
+			case T_VariableShowStmt:
+			case T_ListenStmt:
+			case T_NotifyStmt:
+			case T_UnlistenStmt:
+			case T_TransactionStmt:
+			case T_ConstraintsSetStmt:
+			case T_DiscardStmt:
+			case T_LockStmt:
+			case T_CheckPointStmt:
+			case T_ExecuteStmt:
+			case T_PrepareStmt:
+			case T_DeallocateStmt:
+			case T_CreateSubscriptionStmt:
+			case T_DropSubscriptionStmt:
+			case T_AlterSubscriptionStmt:
+			case T_CreatePublicationStmt:
+			case T_AlterPublicationStmt:
+			case T_SecLabelStmt:
+				/* Pure session / maintenance utility — no user-data
+				 * mutation possible, so skip the is_active() call and
+				 * its throttled(DQL) side-effect.  Still run normal
+				 * command below. */
+				break;
+			default:
+				if (overlay_branch_is_active() &&
+					!overlay_guard_ddl_ok_for_branch(pstmt->utilityStmt,
+													  &op_name, &obj_name,
+													  &fail_reason))
+				{
+					overlay_guard_ereport_fail(op_name ? op_name : "execute utility/DDL",
+											   obj_name, fail_reason);
+				}
+				break;
+		}
 	}
 
 	if (prev_ProcessUtility)
@@ -743,6 +1150,180 @@ overlay_branch_use(PG_FUNCTION_ARGS)
 	overlay_branch_use_internal(NameStr(*branch_name));
 	PG_RETURN_VOID();
 }
+
+Datum
+overlay_branch_use_with_mode(PG_FUNCTION_ARGS)
+{
+	Name		branch_name = PG_GETARG_NAME(0);
+	const char *mode;
+
+	if (PG_ARGISNULL(1))
+		mode = BRANCH_MODE_LIVE;
+	else
+		mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	overlay_branch_use_with_mode_internal(NameStr(*branch_name), mode);
+	PG_RETURN_VOID();
+}
+
+/* --------------------------------------------------------------------
+ * overlay_branch_cached_mode — SQL-callable helper: return per-bid
+ * session-local cached mode, or NULL if not cached (so caller can
+ * COALESCE with catalog mode).  Used by list_branches() SQL body to
+ * overlay the I8.2 per-bid HTAB onto the pure-catalog SELECT. */
+Datum
+overlay_branch_cached_mode(PG_FUNCTION_ARGS)
+{
+	int32 bid = PG_GETARG_INT32(0);
+	const char *cached;
+
+	cached = ob_mode_cache_lookup(bid);
+	if (cached == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(cached));
+}
+
+/* --------------------------------------------------------------------
+ * overlay_branch_is_active_by_name — SQL-callable: check catalog state
+ * of a named branch, PLUS if the named branch is exactly the current
+ * session's in-use branch also run Layer1/FR4 invalidation + kickout.
+ *
+ * SQL signature: overlay_branch_is_active(branch_name name) RETURNS bool
+ * Synonym: public.is_active(name name) RETURNS bool
+ * -------------------------------------------------------------------- */
+Datum
+overlay_branch_is_active_by_name(PG_FUNCTION_ARGS)
+{
+	Name        branch_name = PG_GETARG_NAME(0);
+	const char *bn;
+	BranchContext *ctx = CurrentBranchContext;
+	bool        result = false;
+
+	if (PG_ARGISNULL(0) || branch_name == NULL)
+		PG_RETURN_BOOL(false);
+	bn = NameStr(*branch_name);
+	if (*bn == '\0')
+		PG_RETURN_BOOL(false);
+
+	/* If this is OUR current branch, FIRST run our own inv check so the
+	 * call side-effect kicks us out.  is_active → throttled DQL path. */
+	if (ctx != NULL && ctx->is_active &&
+		ctx->branch_id != 0 &&
+		strncmp(ctx->branch_name, bn, NAMEDATALEN) == 0)
+	{
+		/* is_current = true; (formerly kept for logging — removed to suppress -Wunused-but-set) */
+		(void) ob_invalidate_check_throttled(false);
+		/* Re-read ctx after possible kick-out */
+		if (!CurrentBranchContext || !CurrentBranchContext->is_active)
+			PG_RETURN_BOOL(false);
+	}
+
+	/* Always hit catalog so user gets ground-truth, not just in-memory.
+	 * SPI lifecycle probe (same pattern as ob_invalidate_check_throttled):
+	 * we may be reached from inside a nested SPI (e.g. via SQL-language
+	 * synonym `public.is_active` whose body is a SELECT that invokes us
+	 * through the function executor — outer SQL func may already hold an
+	 * SPI connection).  PG does not expose SPI_connected() public API, so
+	 * we probe via SPI_connect() return value. */
+	{
+		int         spi_cr2;
+		bool        did_con2 = false;
+		StringInfoData sql2;
+		int         ret2;
+		char       *esc2;
+
+		spi_cr2 = SPI_connect();
+		if (spi_cr2 == SPI_OK_CONNECT)
+			did_con2 = true;
+		else if (spi_cr2 != SPI_ERROR_CONNECT)
+			elog(ERROR, "overlay_branch_is_active: SPI_connect ret=%d", spi_cr2);
+
+		esc2 = quote_literal_cstr(bn);
+		initStringInfo(&sql2);
+		appendStringInfo(&sql2,
+					 "SELECT state FROM " OBTABLE_BRANCH " "
+					 "WHERE branch_name = %s LIMIT 1",
+					 esc2);
+		pfree(esc2);
+
+		ret2 = SPI_execute(sql2.data, true, 1);
+		pfree(sql2.data);
+		if (ret2 != SPI_OK_SELECT)
+		{
+			if (did_con2)
+				SPI_finish();
+			elog(ERROR, "overlay_branch_is_active: SPI_execute ret=%d", ret2);
+		}
+		if (SPI_processed == 1 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
+		{
+			Datum   v2;
+			bool    isnull2;
+			char   *st2;
+
+			v2 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+							 1, &isnull2);
+			if (!isnull2)
+			{
+				st2 = TextDatumGetCString(v2);
+				if (st2 != NULL && strcmp(st2, BRANCH_STATE_ACTIVE) == 0)
+					result = true;
+				pfree(st2);
+			}
+		}
+		if (did_con2)
+			SPI_finish();
+	}
+
+	PG_RETURN_BOOL(result);
+}
+
+/* --------------------------------------------------------------------
+ * overlay_branch_force_invalidation_check — SQL-callable debug helper
+ * (no params): forces the Layer1/FR4 invalidation SPI recheck to run
+ * NOW regardless of count/time throttles.  Returns true iff the session
+ * is still on an ACTIVE branch after the check.  Mainly useful for
+ * regression tests to exercise the kickout path without waiting N ms.
+ *
+ * SQL signature: overlay_branch_force_invalidation_check() RETURNS bool
+ * Synonym: public.force_invalidation_check() RETURNS bool
+ * -------------------------------------------------------------------- */
+Datum
+overlay_branch_force_invalidation_check(PG_FUNCTION_ARGS)
+{
+	BranchContext *ctx = CurrentBranchContext;
+
+	if (ctx == NULL || !ctx->is_active)
+		PG_RETURN_BOOL(false);
+
+	/* Force both throttles to fire: counter += THRESHOLD, last_check = 0 */
+	if (ob_invalidation_check_threshold > 0)
+		ctx->invalidation_counter = (uint32) ob_invalidation_check_threshold + 1u;
+	else
+		ctx->invalidation_counter = 1u << 30;
+	ctx->invalidation_last_check = 0;
+
+	/* Run DQL-path check, but force_invalidation_check() is a deliberate
+	 * user-visible "run the check NOW" request — unlike the "observer"
+	 * callers (planner hook, rel_ok), force_check needs to actually raise
+	 * the DQL NOTICE + clear ctx + reset GUC so the user can see it (J3,
+	 * E4).  Opt-in to destructive kickout side-effects.  See branch_life
+	 * cycle.c ob_throttled_allow_kickout comment. */
+	{
+		extern bool ob_throttled_allow_kickout;
+		bool		saved_allow = ob_throttled_allow_kickout;
+		bool		thr_ok;
+
+		ob_throttled_allow_kickout = true;
+		thr_ok = ob_invalidate_check_throttled(false);
+		ob_throttled_allow_kickout = saved_allow;
+		if (!thr_ok)
+			PG_RETURN_BOOL(false);
+	}
+
+	PG_RETURN_BOOL(CurrentBranchContext != NULL &&
+				   CurrentBranchContext->is_active);
+}
+
 
 Datum
 overlay_branch_current(PG_FUNCTION_ARGS)
@@ -871,6 +1452,8 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 			{
 				HeapTuple	tup = SPI_tuptable->vals[i];
 				int			col;
+				int32		this_bid = 0;
+				bool		bid_isnull = true;
 
 				if (tup == NULL)
 				{
@@ -882,6 +1465,17 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 					continue;
 				}
 
+				/* Peek bid (col 0) first for possible mode-cache overlay
+				 * (FR2 V1 I8.2: mode no longer written to catalog per-use;
+				 * it lives in a session-local bid HTAB to avoid cross-
+				 * session RowExclusiveLock contention). */
+				{
+					Datum bid_datum = SPI_getbinval(tup, spi_td, 1,
+													&bid_isnull);
+					if (!bid_isnull)
+						this_bid = DatumGetInt32(bid_datum);
+				}
+
 				for (col = 0; col < 7; col++)
 				{
 					Datum		val;
@@ -889,6 +1483,23 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 					Form_pg_attribute att;
 
 					val = SPI_getbinval(tup, spi_td, col + 1, &isnull);
+
+					/* mode column (5th output = col index 4): overlay the
+					 * session-local cached mode for this bid, if any.
+					 * Fallback = catalog mode (pure read, no lock). */
+					if (col == 4 && !bid_isnull)
+					{
+						const char *cached_mode =
+							ob_mode_cache_lookup(this_bid);
+						if (cached_mode != NULL)
+						{
+							st->nulls[i * 7 + col] = false;
+							st->values[i * 7 + col] =
+								CStringGetTextDatum(cached_mode);
+							continue;
+						}
+					}
+
 					st->nulls[i * 7 + col] = isnull;
 					if (isnull)
 					{

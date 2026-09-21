@@ -44,6 +44,7 @@
 #include "utils/ruleutils.h"
 #include "utils/typcache.h"
 #include "utils/syscache.h"
+#include "utils/snapmgr.h"
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
@@ -58,6 +59,8 @@ static void  ob_branchscan_begin(CustomScanState *node, EState *estate, int efla
 static TupleTableSlot *ob_branchscan_exec(CustomScanState *node);
 static void  ob_branchscan_end(CustomScanState *node);
 static void  ob_branchscan_rescan(CustomScanState *node);
+static void  ob_branchscan_mark_pos(CustomScanState *node);
+static void  ob_branchscan_rest_pos(CustomScanState *node);
 
 static const CustomPathMethods  ob_branchscan_path_methods = {
     "overlay_branch_branchscan",
@@ -71,11 +74,13 @@ static const CustomScanMethods  ob_branchscan_scan_methods = {
 };
 
 static const CustomExecMethods ob_branchscan_exec_methods = {
-    .CustomName       = "overlay_branch_branchscan",
-    .BeginCustomScan  = ob_branchscan_begin,
-    .ExecCustomScan   = ob_branchscan_exec,
-    .EndCustomScan    = ob_branchscan_end,
-    .ReScanCustomScan = ob_branchscan_rescan,
+    .CustomName         = "overlay_branch_branchscan",
+    .BeginCustomScan    = ob_branchscan_begin,
+    .ExecCustomScan     = ob_branchscan_exec,
+    .EndCustomScan      = ob_branchscan_end,
+    .ReScanCustomScan   = ob_branchscan_rescan,
+    .MarkPosCustomScan  = ob_branchscan_mark_pos,
+    .RestrPosCustomScan = ob_branchscan_rest_pos,
 };
 
 /* ----- ExtendedCustomScanState: embed CustomScanState as 1st field per PG
@@ -91,6 +96,7 @@ typedef struct ExtendedCustomScanState
     /* our private state follows */
     List         *result_slots;
     ListCell     *cursor;
+    ListCell     *mark_cursor;    /* saved position for Mark/Restore */
     Relation      rel;
     TupleDesc     rel_desc;
     Oid           relid;
@@ -197,33 +203,70 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
     }
 
     /* ----- Guard: run the internal MAIN seqscan *outside* the Planner
-     * hook overlay (otherwise infinite recursion: helper → SPI SELECT
-     * → Planner hook → CustomScan → helper …).  Use PG_TRY to restore
-     * the flag on ANY error path — otherwise a single failed helper
-     * call leaves the flag stuck true for the rest of the session and
-     * *disables* transparent overlay reads permanently. */
-    overlay_overlay_helper_enter();
-    PG_TRY();
+     * hook overlay (otherwise infinite recursion: helper → SPI SELECT →
+     * Planner hook → CustomScan → helper …).  Use PG_TRY to restore the flag
+     * on ANY error path — otherwise a single failed helper call leaves the
+     * flag stuck true for the rest of the session and *disables*
+     * transparent overlay reads permanently.
+     *
+     * V3 FR5 (T5): Push/Pop Snapshot Balance Rules
+     * --------------------------------------------
+     * When the branch uses SNAPSHOT mode, the MAIN baseline read must use
+     * the frozen TransactionSnapshot captured at use_branch() entry time and
+     * stored in ctx->branch_main_snapshot.  We wrap ONLY push it AROUND the
+     * single ob_spi_one_shot() call (not longer — no helper-wide push without pop
+     * early-return ereport(ERROR) double-pops or imbalance).
+     *
+     * BALANCE INVARIANT (strict):
+     *   • pushed_snap_ = (ctx != NULL && ctx->snap != NULL)
+     *   • TRY body: push → SPI → pfree sql → check ret; ONLY ONE pop BEFORE any
+     *     control-flow leaves the TRY block.
+     *   • CATCH body: pop ONLY if the push was STILL ACTIVE (not yet popped)
+     *     by the normal path).  We track this with a separate
+     *     `pop_done` flag that both TRY and CATCH can see (declared at
+     *     outer block scope so CATCH can read write it).
+     *   • helper enter/exit are balanced independently (already handled outermost.  Live mode: zero
+     *     overhead (no push pop skipped entirely).                          */
     {
-        ret = ob_spi_one_shot(sql.data, true, 0);
-        pfree(sql.data);
+        bool        pushed_snap_;
+        bool        pop_done_;
 
-        if (ret != SPI_OK_SELECT)
+        pushed_snap_ = (CurrentBranchContext != NULL &&
+                      CurrentBranchContext->branch_main_snapshot != NULL);
+        pop_done_ = false;
+
+        overlay_overlay_helper_enter();
+        PG_TRY();
         {
-            SPI_finish();
-            table_close(rel, AccessShareLock);
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("ob_compute_overlay_slots: SPI main seqscan failed ret=%d", ret)));
+            if (pushed_snap_)
+                PushActiveSnapshot(CurrentBranchContext->branch_main_snapshot);
+            ret = ob_spi_one_shot(sql.data, true, 0);
+            if (pushed_snap_)
+            {
+                PopActiveSnapshot();
+                pop_done_ = true;
+            }
+            pfree(sql.data);
+
+            if (ret != SPI_OK_SELECT)
+            {
+                SPI_finish();
+                table_close(rel, AccessShareLock);
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("ob_compute_overlay_slots: SPI main seqscan failed ret=%d", ret)));
+            }
         }
-    }
-    PG_CATCH();
-    {
+        PG_CATCH();
+        {
+            if (pushed_snap_ && !pop_done_)
+                PopActiveSnapshot();
+            overlay_overlay_helper_exit();
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
         overlay_overlay_helper_exit();
-        PG_RE_THROW();
     }
-    PG_END_TRY();
-    overlay_overlay_helper_exit();
 
     {
         HeapTuple  *htups = NULL;
@@ -364,58 +407,37 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
 {
     if (prev_set_rel_pathlist_hook)
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
-    if (overlay_in_apply_operation())
-        return;
-    /* B1.24 REDUNDANT SAFETY GUARD: always skip BranchScan injection
-     * for WRITE-side scan subplans.  The *primary* guard that keeps
-     * UPDATE / DELETE / INSERT subplans on raw SeqScan (not CustomScan)
-     * is B-1 further down: `if (ct != CMD_SELECT) return;`.  However we
-     * additionally check overlay_in_write_redirect() here, so that even if
-     * a future refactor accidentally changes B-1, WR subplans are still
-     * driven by physical ctid.  Pure-delta DML (UPDATE/DELETE of rows
-     * that only exist in the delta table, i.e. INSERTed in-branch) is
-     * documented as MVP-out-of-scope until WRITE subplans can run with
-     * ExecQual evaluation against reconstructed delta slots — see
-     * write_redirect.c "NOTE: pure-delta INSERT rows" comment. */
-    if (overlay_in_write_redirect())
-        return;
-    /* B1.5: Skip if we are *inside* the shared 2-pass helper itself.
-     * CRITICAL for EXPLAIN / EXPLAIN ANALYZE as well as actual SELECT:
-     * PG 17's ExecInitCustomScan calls `BeginCustomScan` unconditionally
-     * (even for plain EXPLAIN, which needs to initialize every plan node
-     * to build the ExplainState tree).  Inside BeginCustomScan we call
-     * ob_compute_overlay_slots_internal which does SPI_execute("SELECT *
-     * FROM <MAIN>") for Pass1 — if we did not bypass here, that *inner*
-     * Planner invocation on the same MAIN relation would ALSO inject a
-     * CustomPath, PG would pick it, re-enter ExecInitCustomScan, call
-     * BeginCustomScan again → stack overflow in < 1 sec. */
-    if (overlay_in_overlay_helper())
-        return;
 
-    /* B-1: MVP ONLY inject CustomScan for pure SELECT queries.
-     * UPDATE / DELETE / INSERT have their own scan subplans, but
-     * Step 4a's write-redirection Executor hook (overlay_ExecutorRun)
-     * hard-casts scan state to standard nodes (SeqScanState etc.) to
-     * extract PK / tuple locator information.  If we injected a
-     * CustomScan here for the WHERE-match scan of an UPDATE, the
-     * Executor hook would dereference wrong field offsets and
-     * SIGSEGV (signal 11).  Step 4a writes go through the delta
-     * table via the ExecutorRun hook regardless of scan plan type,
-     * so we lose nothing by skipping CustomScan injection for
-     * non-SELECT commands in V1. */
-    if (root->parse != NULL && root->parse->type == T_Query)
-    {
-        CmdType ct = ((Query *) root->parse)->commandType;
-        if (ct != CMD_SELECT)
-            return;
-    }
-    if (!overlay_branch_is_active())
-        return;
-    if (rte->rtekind != RTE_RELATION)
-        return;
-    if (rte->relkind != RELKIND_RELATION)
-        return;
-    /* B0: Skip system / overlay_branch catalog schemas */
+    /* ================================================================
+     * PRE-CHECK LAYER (fast-path exits BEFORE any C function call
+     * into branch_lifecycle.c that may itself invoke SPI / planner,
+     * which would re-enter this hook → stack overflow.
+     *
+     * ORDERING RULE (CRITICAL, violation ⇒ infinite recursion SIGABRT):
+     *   B0 (schema skip, O(1) relcache)
+     *   → B1 (recursion guards: apply / write_redirect / helper)
+     *   → B2 (command-type bypass: non-SELECT CMD)
+     *   → ONLY THEN call C wrappers is_active/CurrentBranchContext etc.
+     *
+     * Rationale:
+     *   overlay_branch_is_active() (L?) ≝
+     *       ob_invalidate_check_throttled(false)  [SPI-execute: SELECT state
+     *                                                FROM overlay_branch.pg_branch]
+     *       + return ctx->is_active;
+     *   If we call is_active() BEFORE filtering RTE's whose namespace ==
+     *   OBSCHEMA ("overlay_branch"), the inner SPI query against
+     *   pg_branch (which IS in OBSCHEMA but wasn't yet skipped because
+     *   B0 was AFTER is_active()) will re-plan → re-enter this hook →
+     *   is_active() again → infinite recursion →
+     *   "stack depth limit exceeded" in 50-100 calls (2MB stack).
+     *   See Section J3 of test/sql/overlay_branch_invalidation.sql
+     *   (J3 Bug) for the regression guard that exercises this exact path.
+     * ================================================================ */
+
+    /* B0 PRE-CHECK: Skip system / overlay_branch catalog schemas.
+     * MUST be the very FIRST per-RTE filter (before ANY C function into
+     * the overlay module that could SPI-plan anything). */
+    if (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_RELATION)
     {
         Oid            nspoid;
         const char    *nspname;
@@ -429,6 +451,99 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
              strcmp(nspname, OBSCHEMA) == 0))
             return;
     }
+
+    /* B1 PRE-CHECK: recursion guards for bypass layers */
+    if (overlay_in_apply_operation())
+        return;
+    if (overlay_in_write_redirect())
+        return;
+    if (overlay_in_overlay_helper())
+        return;
+
+    /* B2 PRE-CHECK: MVP only inject CustomScan for pure SELECT.
+     * (Same logic as before, but now it's here, above the is_active() call
+     * to avoid unnecessary helper C entry for non-SELECT statements.) */
+    if (root->parse != NULL && root->parse->type == T_Query)
+    {
+        CmdType ct = ((Query *) root->parse)->commandType;
+        if (ct != CMD_SELECT)
+            return;
+    }
+
+    /* ---- End of pre-check layer; it is now SAFE to call into the
+     * overlay module's C helpers because:
+     *   (1) any SPI inside the helper would target *another* user table,
+     *       not OBSCHEMA — we've already filtered those out,
+     *   (2) helper recursion guards are set on their respective internal
+     *       helper-enter/exit functions.
+     * ---- */
+
+    /* OLD BLOCK L367-431's order (now PROHIBITED, see J3 bug):
+     *   if (in_apply) return;            // B1 → ok
+     *   if (in_write_redirect) return;   // B1 → ok
+     *   if (in_overlay_helper) return;   // B1 → ok
+     *   if (ct != SELECT) return;        // B2 → ok
+     *   if (!overlay_branch_is_active()) // ← ⚠ CALLED BEFORE B0!
+     *       return;                          stack overflow ⇐ B0 was at ~L418
+     *   ... B0 ...                        ← too late, recursion already on
+     * DO NOT revert to that order without re-running J3 + J threshold=1. */
+
+    /* --- Planner-hook throttle-suppression wrap ---
+     * We call the C wrapper overlay_branch_is_active() here, which in turn
+     * calls ob_invalidate_check_throttled(for_dml=false).  The throttled()
+     * helper, when its heavy SPI check fires, has SIDE-EFFECTS: it runs
+     * ob_exit_branch_cleanup() → ctx->is_active=false +
+     * SetConfigOption("overlay_branch.current","") + ereport DQL NOTICE.
+     *
+     * That is the CORRECT behaviour during *executor* processing (a plain
+     * SELECT that discovers its branch is stale MUST revert and announce
+     * it).  It is the WRONG behaviour during planner processing, for a
+     * non-SELECT CmdType whose plan we will not even generate a
+     * CustomScan for anyway (B2 returns immediately after).  The ordering
+     * race that kills D7 if we don't wrap this:
+     *
+     *   D6: manual catalog flip state=applied
+     *   D6b: SET threshold=1 (protected by ProcessUtility whitelist; safe)
+     *   D7: UPDATE t_inv SET v = ... WHERE pk=11
+     *     → planner hook runs for t_inv RTE (UPDATE target)
+     *       B0 (schema public: NOT protected) → B1 ok → B2 non-SELECT →
+     *       (B2 already returns; fine.  BUT: if the CmdType were SELECT,
+     *        or if B2 were somehow after the is_active() call, the wrap
+     *        below is still safe: a stale-branch SELECT plan should NOT
+     *        mutate user state in the *planner*, only during *executor*.)
+     *     → executor_run_intercept runs with dml_split=true, is_active()
+     *       was NOT prematurely cleared by the planner, throttled(true)
+     *       runs heavy SPI → DML split ERROR → D7 PASS.
+     *
+     * Concretely: set ob_in_planner_hook around the C call.  Inside
+     * throttled(), when this flag is set and the heavy SPI check would
+     * kick out, we jump straight to returning `false` / `true` with NO
+     * side-effects (no ctx cleanup, no GUC reset, no NOTICE) and let the
+     * subsequent executor-stage call do the real enforcement.
+     *
+     * Scope of the flag: it wraps ONLY the is_active() call, because:
+     *   - everything before (B0/B1/B2) is pure O(1) relcache + guard bools
+     *     and cannot SPI-plan anything;
+     *   - everything AFTER the is_active() call (CustomPath construction)
+     *     does NOT call back into throttled/is_active helpers, so keeping
+     *     the flag live there would be pointless and add unnecessary
+     *     recursion-guard depth.
+     */
+    {
+        bool active_snapshot;
+
+        ob_in_planner_hook = true;
+        active_snapshot = overlay_branch_is_active();
+        ob_in_planner_hook = false;
+        if (!active_snapshot)
+            return;
+    }
+    if (rte->rtekind != RTE_RELATION)
+        return;
+    if (rte->relkind != RELKIND_RELATION)
+        return;
+    /* OLD B0 block WAS HERE (L418-431, after is_active).
+     * Removed to avoid double-schema-check; B0 has been moved above. */
     {
         /* 把 reln 的生命周期扩大到整个 CustomPath 构建块：先前置的
          * has_pk 检查 + 新增的 PK 等值条件识别都要访问 relcache。 */
@@ -1072,11 +1187,12 @@ ob_branchscan_exec(CustomScanState *node)
                                                    ebs->has_general_where,
                                                    ebs->general_where_sql);
         ebs->result_slots = slots;
-        ebs->cursor       = list_head(slots);
-        if (helper_tdesc != NULL)
-            FreeTupleDesc(helper_tdesc);
-        ebs->materialized = true;
-    }
+    ebs->cursor       = list_head(slots);
+    ebs->mark_cursor  = NULL;
+    if (helper_tdesc != NULL)
+        FreeTupleDesc(helper_tdesc);
+    ebs->materialized = true;
+}
 
 next_tuple:
     if (ebs->cursor == NULL)
@@ -1201,14 +1317,54 @@ ob_branchscan_end(CustomScanState *node)
 }
 
 static void
+ob_branchscan_mark_pos(CustomScanState *node)
+{
+    ExtendedCustomScanState *ebs = CSS2BS(node);
+
+    ebs->mark_cursor = ebs->cursor;
+}
+
+static void
+ob_branchscan_rest_pos(CustomScanState *node)
+{
+    ExtendedCustomScanState *ebs = CSS2BS(node);
+
+    if (ebs->mark_cursor != NULL)
+        ebs->cursor = ebs->mark_cursor;
+    else
+        ebs->cursor = list_head(ebs->result_slots);
+}
+
+static void
 ob_branchscan_rescan(CustomScanState *node)
 {
     ExtendedCustomScanState *ebs = CSS2BS(node);
 
-    /* If materialized, reset cursor.  If not yet materialized,
-     * first ExecCustomScan call will do it anyway. */
-    if (ebs->materialized)
-        ebs->cursor = list_head(ebs->result_slots);
+    (void) ob_invalidate_check_throttled(/*for_dml=*/ false);
+
+    if (!ebs->materialized)
+    {
+        Assert(ebs->result_slots == NIL);
+        ebs->cursor = NULL;
+        ebs->mark_cursor = NULL;
+        return;
+    }
+
+    {
+        ListCell *lc;
+
+        foreach(lc, ebs->result_slots)
+        {
+            TupleTableSlot *slot = (TupleTableSlot *) lfirst(lc);
+            ExecDropSingleTupleTableSlot(slot);
+        }
+        list_free(ebs->result_slots);
+        ebs->result_slots = NIL;
+    }
+
+    ebs->materialized  = false;
+    ebs->cursor        = NULL;
+    ebs->mark_cursor   = NULL;
 }
 
 /* ================================================================

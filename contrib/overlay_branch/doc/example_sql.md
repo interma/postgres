@@ -3,8 +3,10 @@
 > 本文档从**用户视角**描述 Overlay Branch 扩展**当前已实现**的 SQL 接口和典型输出。
 > 文中所有示例均可直接在 psql 里复现，内容就是回归测试用例所验证的真实行为。
 >
-> **范围（MVP）**：仅支持**有主键的普通 heap 表**；Live Branch（Latest Main + Branch Delta）语义；
-> 没有 snapshot 隔离；没有自定义 SQL 语法（用函数调用代替）。
+> **范围**：仅支持**有主键的普通 heap 表**；默认为 Live Branch（Latest Main + Branch Delta）语义；
+> 用函数调用代替自定义 SQL 语法。
+>
+> **V3 新增**：SNAPSHOT mode 已实装 `use_branch(name, mode => 'snapshot')`，MAIN 冻结 / Delta 始终最新，详细契约见 [multi_session_mvcc.md](./multi_session_mvcc.md) §I8.5。
 >
 > **读路径双入口**：
 > - **V1 手动 SRF**：必须显式 `FROM overlay_branch.overlay_main_plus_delta('t') AS x(...)`；
@@ -41,6 +43,15 @@
 - [7. RETURNING 子句](#7-returning-子句)
 - [8. Data-Modifying CTE：明确 ERROR](#8-data-modifying-cte明确-error)
 - [9. MVP 暂不支持的场景（明确报错）](#9-mvp-暂不支持的场景明确报错)
+- [10. V3 FR5：Snapshot vs Live 两种分支语义对比](#10-v3-fr5snapshot-vs-live-两种分支语义对比)
+  - [10.1 典型场景对比](#101-典型场景对比)
+  - [10.2 同一 MAIN 变化下的感知差异](#102-同一-main-变化下的感知差异)
+  - [10.3 分支内自写 delta 均可见（两种语义一致）](#103-分支内自写-delta-均可见两种语义一致)
+- [11. V3 FR3 / FR4：Applying 防护 + Kickout 失效 & 新 helper](#11-v3-fr3--fr4applying-防护--kickout-失效--新-helper)
+  - [11.1 两个失效检查 SQL helper](#111-两个失效检查-sql-helper)
+  - [11.2 跨会话 Apply/Discard 后 DML Kickout (ERRCODE 55000)](#112-跨会话-applydiscard-后-dml-kickout-errcode-55000)
+  - [11.3 FR3 Applying 状态期间 DML 阻塞](#113-fr3-applying-状态期间-dml-阻塞)
+  - [11.4 DO block 包裹重试模板](#114-do-block-包裹重试模板)
 
 ---
 
@@ -96,6 +107,8 @@ SELECT create_branch('agent_workspace');
 
 > 说明：`create_branch()` 返回内部递增的 `branch_id`。
 > 只会在 `pg_branch` 里插入一行元数据，**不会拷贝任何数据**，成本 ≈ 一次单行 INSERT。
+> `create_branch()` 时不区分 mode（catalog 中 pg_branch.mode 恒为 `'live'`）；
+> **分支隔离语义在 `use_branch(name, mode => …)` 进入时按 session 决定**（见 §1.2）。
 
 失败示例：
 
@@ -104,9 +117,6 @@ SELECT create_branch('agent_workspace');
 SELECT create_branch('agent_workspace');
 ERROR:  branch "agent_workspace" already exists
 ```
-
-> MVP **不支持 snapshot 模式**（`WITH (isolation='snapshot')`）。
-> 所有 branch mode 恒为 `'live'`，即「未改的行跟随 Main 最新版本」。
 
 ### 1.2 use_branch() — 切换当前分支 / 离开分支
 
@@ -121,6 +131,22 @@ SELECT use_branch('agent_workspace');
 -- 等价的 GUC 写法（效果完全相同；两者二选一，推荐用函数）
 SET overlay_branch.current = 'agent_workspace';
 SET
+```
+
+```sql
+-- === V3 新增 FR5：2-param use_branch(name, mode) ===
+--   mode 可选值：'live' （默认，等价于不传）
+--               'snapshot' （V3 实装；MAIN 表读按进入时快照冻结）
+-- 两个入口均挂了 public synonym，可不带 schema。
+SELECT use_branch('agent_workspace', mode => 'snapshot');
+ use_branch
+------------
+
+(1 row)
+
+-- 退出 snapshot 模式：重新 use live 或直接离开 branch
+SELECT use_branch('agent_workspace', mode => 'live');   -- 切换回 live
+SELECT use_branch(NULL);                                 -- 彻底回 Main
 ```
 
 ```sql
@@ -192,7 +218,7 @@ Expanded display is off.
 | `branch_name` | name | 分支名（唯一）|
 | `owner` | oid | 创建者 |
 | `created_at` | timestamptz | 创建时间 |
-| `mode` | text | **MVP 恒为 `'live'`**；snapshot 模式未实现 |
+| `mode` | text | catalog 默认 `'live'`；若本 backend 正在以 `use_branch(name, mode=>'snapshot')` 使用该 branch，则显示 `'snapshot'`（走 `COALESCE(cached_mode, db_mode)` 读取本 session-local mode cache）|
 | `state` | text | `active` / `applied` / `discarded` |
 | `delta_count` | bigint | 当前 `pg_branch_delta` 中该分支的增量行数 |
 
@@ -409,6 +435,14 @@ NOTICE:  overlay_branch: APPLY BRANCH 'agent_workspace' completed
 
 (1 row)
 ```
+
+> **V3 FR4 行为变更（自 apply / 跨会话 apply kickout）**：
+> - **自 apply**：如果当前 session 正在 use_branch(X)，然后自己执行 `apply_branch(X)` → apply 完成后本 session 会自动回到 Main（`current_branch()` 返回空），无需再 `use_branch(NULL)`。
+> - **跨会话 apply**：如果 session A use_branch(X) 进行中，session B 执行了 `apply_branch(X)` 或 `discard_branch(X)` → 下一次 session A 在 X 里运行 DML / 或 DQL 达到 throttling 阈值时，会**立即报 `ERRCODE 55000` 并踢出 branch**，防止在 state=applied/discarded 下继续产生漂移写入。跨会话会首先通过 NOTIFY 通道；短连接（如 L1 isolation harness）下走纯 SPI counter fallback 兜底。详见 `doc/multi_session_mvcc.md` §I8.3 / I8.6。
+>
+> - **自 discard**：类似自 apply；在 use_branch(X) 中 discard 后立即回 Main，已有 NOTICE。
+>
+> 建议在业务长循环中（如 Agent 多次 WR）每条语句外 `DO block BEGIN ... EXCEPTION WHEN 55000 THEN ... END` 包裹以检测分支失效并 retry（见 §11.2 示例）。
 
 Apply 后，Main 被真实改写，**branch 的 delta 被清空**（不保留审计副本，因为 MVP），
 `pg_branch.state` 变为 `applied`：
@@ -694,9 +728,214 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 | **分区表**（根/叶）| 6 层 guard 的 G3 级提前拒绝（relkind / partitioned） | `overlay_branch does not support partitioned tables`（guard 通用提示）|
 | **FK 级联写**（trigger 触发的子表级联 UPDATE/DELETE）| G4 级非 internal trigger 拦截或 G5 `pg_constraint` FK 检测 | `cannot modify via FK-triggered write`（guard 通用提示）|
 | 直接对 `pg_branch` / `pg_branch_delta` 用户写 | `security_barrier` view 无 INSERT/UPDATE/DELETE rule → 普通报错 | `cannot insert into view "pg_branch"`（PG 原生视图错误）|
-| snapshot 模式 / `isolation = 'snapshot'` | mode 列目前只接受 `'live'`（create_branch() 内部写死默认值） | MVP 直接用 live 不需要传参；传入 snapshot 不生效（保留字段为未来兼容）|
+| **在 `create_branch()` 时指定 `isolation = 'snapshot'`** | `create_branch()` 不接受 isolation 参数（catalog 中 pg_branch.mode 恒为 live）；要开启 snapshot 语义，请在进入分支时显式 `use_branch(name, mode => 'snapshot')`（见 §1.2）| 若硬传 snapshot 到 mode 字段不生效（建议走 use_branch 的 FR5 入口）|
 | 对 VIEW / MATVIEW / FOREIGN TABLE 写 DML | 在 guard 的 G2/G3 级就拦截，不支持透明叠加读 | V2 BranchScan planner hook 直接 skip，走原路径；DML 则在 WR guard 报错 |
 
 这些限制在后续版本逐步解除。MVP 能跑通「有 PK 的普通 heap 表 + I/U/D + V2 透明 BranchScan
 （含 P0 PK O(1) 快路径 + P2 WHERE 非 PK 下推 + P1 RETURNING）+ apply/discard + 冲突检测」
 就已证明 Overlay Branch 模型的正确性。
+
+---
+
+## 10. V3 FR5：Snapshot vs Live 两种分支语义对比
+
+> 从 V3 T5 开始，`use_branch()` 支持两种 session-local 隔离模式；
+> 同一 branch 可以在不同 session 里分别以 snapshot 或 live 方式进入（互不干扰）。
+
+### 10.1 典型场景对比
+
+| 维度 | mode='live' （进入默认） | mode='snapshot' （V3 实装 FR5） |
+|------|---|---|
+| **MAIN 表的旧行**（没被自己写过） | 始终跟随 Main 的最新提交 → 看到别人 commit 的修改 | **冻结**在 `use_branch(..., 'snapshot')` 那一刻的事务快照 → 别人后续 commit 看不到 |
+| **分支自己写的 WR delta 行** | 始终可见（与 MAIN 叠加） | 始终可见（与 MAIN 叠加） |
+| **同一 branch 的其他 live session 新写的 WR delta** | 始终可见（LatestSnapshot 读 delta） | **始终可见**（delta 表 append-only；因为 delta 表是 overlay_branch 内部 MVCC，不因 snapshot 冻结） |
+| **典型场景** | AI Agent 协作工作区；保留自己改的同时看库存/别人的新提交；写冲突留在 apply 时一次性解决 | 报表 / 离线分析 / 长查询；MAIN 数据在查询期间不漂移；同一批分析结果可重复读 |
+| **怎么进入** | `use_branch('b')` 或 `use_branch('b','live')` | `use_branch('b','snapshot')` |
+| **怎么退出** | `use_branch(NULL)` / `RESET overlay_branch.current` / 切回 live：`use_branch('b','live')` | 相同；也可以切换成 live 再继续工作 |
+
+### 10.2 同一 MAIN 变化下的感知差异
+
+```sql
+-- ========== 准备 ==========
+SELECT use_branch(NULL);
+TRUNCATE products;
+INSERT INTO products VALUES (1,'A',10),(2,'B',5),(3,'C',20);
+SELECT create_branch('b_snap');
+
+-- ========== s1: snapshot 会话 ==========   (相当于 psql session 1)
+SELECT use_branch('b_snap', 'snapshot');
+SELECT * FROM products ORDER BY id;
+-- 看到 MAIN baseline: A(10), B(5), C(20)   （id=4 还未插入）
+
+-- ========== s2: live 会话在 MAIN 写入 ==========   (psql session 2)
+SELECT use_branch(NULL);
+INSERT INTO products VALUES (4,'D',30);     -- MAIN 新增 id=4
+UPDATE products SET price=9999 WHERE id=3;  -- MAIN id=3 涨价
+COMMIT;
+
+-- ========== 回到 s1: snapshot 会话 ==========
+SELECT * FROM products ORDER BY id;
+-- id | name | price      （MAIN 冻结！）
+--  1 |  A   | 10
+--  2 |  B   |  5         看不到 MAIN id=4/D；id=3 仍为 20
+--  3 |  C   | 20         （snapshot xmin 取在 use_branch 时刻）
+--  (3 rows)
+
+-- ========== s3: 同一 branch live 方式进入 ==========
+SELECT use_branch(NULL);      -- 先回 Main 换个"视角"
+SELECT use_branch('b_snap', 'live');
+SELECT * FROM products ORDER BY id;
+-- id | name | price
+--  1 |  A   |   10
+--  2 |  B   |    5         LIVE 模式：id=4 看到了！id=3 涨价到 9999 了！
+--  3 |  C   | 9999
+--  4 |  D   |   30
+--  (4 rows)
+```
+
+### 10.3 分支内自写 delta 均可见（两种语义一致）
+
+不管 snapshot 还是 live，自己在分支里写的 delta 永远会叠加显示：
+
+```sql
+SELECT use_branch('b_snap', 'snapshot');
+UPDATE products SET price=7 WHERE id=2;     -- delta U(id=2)
+INSERT INTO products VALUES (99, 'Mine', 1);-- delta I(id=99)
+SELECT * FROM products ORDER BY id;
+-- 1|A|10       (MAIN frozen)
+-- 2|B|7        (自己的 delta U)
+-- 3|C|20       (MAIN frozen)
+-- 99|Mine|1    (自己的 delta I)
+```
+
+---
+
+## 11. V3 FR3 / FR4：Applying 防护 + Kickout 失效 & 新 helper
+
+V3 引入两组跨会话正确性保护，对用户行为**可见**（会产生新的 NOTICE / ERROR），
+但不改变正常路径语义。
+
+### 11.1 两个失效检查 SQL helper
+
+V3 Task 2 新挂了 2 个 `public.*` synonym，可在应用代码里主动检查分支状态：
+
+| 函数 | 返回值 | 典型用途 |
+|---|---|---|
+| `is_active(name)` | `bool` | true = ground truth：该 branch 仍为 `active`（且当前 session 未被踢出）；false = applied/discarded/nonexistent |
+| `force_invalidation_check()` | `bool` | 立刻忽略 throttling、跑一次重量级 SPI select 从 pg_branch 拿 ground truth；发现 state 变了则踢出 branch，返回 false 并附带 NOTICE |
+
+典型用法：
+
+```sql
+-- 进入分支后，长事务 loop 的心跳检查：每次迭代先确认 branch 还活着
+SELECT use_branch('agent_workspace');
+
+-- ... 中间若干 DML ...
+SELECT is_active('agent_workspace');
+ is_active
+-----------
+ t
+
+-- 如果这时另一会话 apply 了 agent_workspace...
+SELECT apply_branch('agent_workspace') FROM (SELECT 1) x WHERE (SELECT current_setting('overlay_branch.current', true)) <> 'agent_workspace';
+-- (上面的 WHERE 用来模拟"另一 session 执行 apply"，真实场景是另一个 psql 连接)
+
+SELECT force_invalidation_check();
+NOTICE:  overlay_branch: force_invalidation_check: branch "agent_workspace" state is applied,
+             kicking out (was active)
+ force_invalidation_check
+--------------------------
+ f
+
+SELECT current_branch();
+ current_branch
+----------------
+                (empty — 已回 Main)
+```
+
+### 11.2 跨会话 Apply/Discard 后 DML Kickout (ERRCODE 55000)
+
+> 这是 FR4 与 FAIL#1 CmdType split 修复的用户可见后果：
+> 分支一旦被别人 apply/discard，下一条 **DML** 会被 **ERROR 55000 拦截**（不是静默 NOTICE 继续），
+> 从根本上防止漂移写入 MAIN。DQL（纯 SELECT）则只给 NOTICE + fallback，
+> 通过后踢出（但 DQL 不会污染 MAIN）。
+
+```sql
+-- ========== 场景：两个 psql 连接，sA 仍在分支 b_kick 里工作，sB 将其 apply ==========
+
+-- (sA)
+SELECT create_branch('b_kick');
+SELECT use_branch('b_kick');
+INSERT INTO products VALUES (5, 'SA_work', 777);
+INSERT 0 1
+
+-- (sB)
+SELECT apply_branch('b_kick');
+NOTICE:  overlay_branch: APPLY BRANCH 'b_kick' completed ...
+ apply_branch
+--------------
+
+-- (sA 继续写，以为 b_kick 仍 active)
+INSERT INTO products VALUES (6, 'SA_late', 0);
+ERROR:  overlay_branch: state of branch "b_kick" is not active (state=applied);
+             drift writes to MAIN are blocked. DML cannot proceed inside a non-active
+             branch context. Re-enter a fresh branch or return to MAIN.
+HINT:  ERRCODE 55000 (object_not_in_prerequisite_state).
+DETAIL:  Apply/Discard on this branch was committed by another session; a NOTIFY was
+         broadcast. This backend's next DML statement detected the state change via
+         throttled SPI counter fallback + force recheck.
+
+-- 此时 sA 自动踢出 branch，current_branch() 为空：
+SELECT current_branch() = '';
+ ?column?
+----------
+ t
+```
+
+### 11.3 FR3 Applying 状态期间 DML 阻塞
+
+apply_branch() 开始执行时，状态会先原子切换到 `applying`（CAS gate），
+直到 MAIN 合并全部成功 commit 后才变成 `applied`。在这短暂窗口内：
+
+```sql
+-- 假设 sA 正在 apply b_large（用 _debug_apply_sleep_sec 模拟长窗口）
+--   sB 在同一 b_large 里发一条 INSERT：
+INSERT INTO products VALUES (7, 'rush', 1);
+ERROR:  overlay_branch: state of branch "b_large" is 'applying'; write to delta
+             is forbidden while an apply is in progress. Please retry.
+HINT:  ERRCODE 55000.
+DETAIL:  FR3 transient state guard: apply winner CAS set state='applying' while
+         performing MAIN merge; after commit state transitions to 'applied' via
+         pg_branch catalog row update; delta writes are blocked so there is no
+         "torn write" where a new WR delta was written during apply and silently
+         lost.
+```
+
+### 11.4 DO block 包裹重试模板
+
+推荐在 Agent 应用代码里用此模板包住每条 WR 语句：
+
+```sql
+DO $$
+DECLARE
+    retries int := 0;
+BEGIN
+    <<retry_loop>>
+    LOOP
+        BEGIN
+            INSERT INTO products VALUES (9, 'retryable', 99);
+            EXIT retry_loop;                          -- 成功就退出
+        EXCEPTION
+            WHEN SQLSTATE '55000' THEN                -- 分支失效 / applying 期间
+                retries := retries + 1;
+                IF retries > 3 THEN RAISE; END IF;     -- 最多 3 次
+                PERFORM pg_sleep(0.1 * retries);
+                -- 开新分支重试（实际逻辑按业务写）
+                PERFORM use_branch('fresh_' || retries::text, 'live');
+        END;
+    END LOOP retry_loop;
+END $$;
+```
+
+生产级封装：对 55000 显式分支失效场景（apply/discard kickout、applying 窗口）做有限重试；
+超过阈值则上抛让调用方人工介入，不做静默 ours/theirs merge。

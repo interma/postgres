@@ -22,6 +22,7 @@
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "executor/executor.h"
+#include "parser/parsetree.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
@@ -154,9 +155,149 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 	extern char *slot_get_ctid_cstr(TupleTableSlot *slot);
 	extern TupleTableSlot *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr);
 
-	if (!overlay_branch_is_active() ||
-		queryDesc->planstate == NULL)
-		return false;
+	/* V3 Layer1 + FR4: DML path MUST raise ERROR if the branch has been
+	 * applied/discarded in another session — DQL path gets NOTICE + MAIN
+	 * fallback only, but drift-writes to MAIN are 100% disallowed, so we
+	 * call with for_dml=true BEFORE the plain is_active() check so the
+	 * ERROR split fires.
+	 *
+	 * CRITICAL CmdType guard: throttled(true) (DML ERROR split) is ONLY
+	 * for INSERT/UPDATE/DELETE/MERGE.  For plain SELECTs (including
+	 * SELECT force_invalidation_check(), SELECT is_active('name'), SELECT
+	 * * FROM user_table), CmdType is CMD_SELECT and we just need the
+	 * soft DQL kickout (NOTICE + fall back to MAIN reads).  Accidentally
+	 * passing for_dml=true to a SELECT caused the regression in Section
+	 * J3 where `SELECT force_check()` raised a DML ERROR.
+	 *
+	 * CRITICAL protected-schema guard (Bug #5): before invoking
+	 * throttled() on a DML CmdType, inspect the PlannedStmt's
+	 * resultRelations.  If EVERY target relation lives in a protected
+	 * schema (pg_catalog / information_schema / pg_toast* / OBSCHEMA
+	 * i.e. the extension's own catalog tables) then this statement is a
+	 * purely internal / catalog DML (e.g.  UPDATE overlay_branch.pg_branch
+	 * SET state='applied' simulating another session, or a SPI insert
+	 * inside the extension helper), NOT a user-table drift-write.
+	 * Running throttled() on such DMLs is wrong: it might SPI-query
+	 * pg_branch, notice the just-written applied state, and KICK OUT
+	 * CurrentBranchContext *before* the following user-table DML (D7)
+	 * has a chance to run with for_dml=true.  Effect: D7 would see
+	 * ctx->is_active already false, hit the throttled L565 fast-path,
+	 * return false, and the drift-write silently falls through to MAIN.
+	 * Guarding target-schema here (BEFORE the throttled() call) keeps
+	 * the user-table branch context alive long enough for the next
+	 * real user-table DML to correctly raise the DML split ERROR. */
+	{
+		bool		dml_split;
+
+		dml_split = (cmd == CMD_INSERT ||
+					 cmd == CMD_UPDATE ||
+					 cmd == CMD_DELETE ||
+					 cmd == CMD_MERGE);
+
+		if (dml_split && queryDesc->plannedstmt != NULL &&
+			queryDesc->plannedstmt->resultRelations != NIL)
+		{
+			ListCell   *lc;
+			bool		all_protected = true;
+
+			foreach(lc, queryDesc->plannedstmt->resultRelations)
+			{
+				Index		rti = lfirst_int(lc);
+				RangeTblEntry *rte;
+				Oid			nspoid;
+				char	   *nsp;
+
+				if (rti <= 0 ||
+					rti > list_length(queryDesc->plannedstmt->rtable))
+				{
+					all_protected = false;
+					break;
+				}
+				rte = rt_fetch(rti, queryDesc->plannedstmt->rtable);
+				if (rte == NULL || rte->rtekind != RTE_RELATION ||
+					!OidIsValid(rte->relid))
+				{
+					all_protected = false;
+					break;
+				}
+				nspoid = get_rel_namespace(rte->relid);
+				if (!OidIsValid(nspoid))
+				{
+					all_protected = false;
+					break;
+				}
+				nsp = get_namespace_name(nspoid);
+				if (nsp == NULL)
+				{
+					all_protected = false;
+					break;
+				}
+				if (strcmp(nsp, "pg_catalog") != 0 &&
+					strcmp(nsp, "information_schema") != 0 &&
+					strncmp(nsp, "pg_toast", 8) != 0 &&
+					strcmp(nsp, OBSCHEMA) != 0)
+				{
+					all_protected = false;
+					break;
+				}
+			}
+
+			/* Pure catalog DML: skip throttled kickout entirely so an
+			 * in-flight user-table branch context is not prematurely
+			 * invalidated by our own catalog writes. */
+			if (all_protected)
+				return false;
+		}
+
+		/* --- Throttled invalidation check + CmdType-split dispatch ---
+		 *
+		 * CRITICAL CmdType-split: DESTRUCTIVE kickout side-effects
+		 * (exit_branch + clear GUC + raise NOTICE/ERROR) are ONLY
+		 * opted-in for REAL DML (dml_split=true: INSERT/UPDATE/
+		 * DELETE/MERGE about to touch user-table rows).  For plain
+		 * SELECT/DECLARE CURSOR etc. (dml_split=false), throttled()
+		 * runs in OBSERVER-ONLY mode — returns boolean ground-truth
+		 * WITHOUT mutating ctx.is_active or clearing the GUC, so a
+		 * post-apply SELECT (which sees "branch dead" via SPI) does
+		 * NOT silently consume the kickout via suppressed NOTICE
+		 * when client_min_messages >= WARNING, which would cause the
+		 * NEXT real DML to fall through to MAIN unprotected and
+		 * silently drift-write (T8 L1 ob_state_inval P1 bug).
+		 *
+		 * Every other caller of throttled() — planner hook,
+		 * is_active_by_name, rel_ok/ddl_ok guards, ProcessUtility
+		 * branch-DDL whitelist, internal SPI heavy-check re-read —
+		 * MUST also see the boolean ground-truth WITHOUT mutating
+		 * global state.  Otherwise D7 (UPDATE t_inv after SET
+		 * threshold=1) dies: an observer call clears ctx.is_active
+		 * before the real ModifyTable ExecutorRun runs, the DML
+		 * ERROR split never fires, and the drift write silently
+		 * lands on MAIN.
+		 *
+		 * Note: protected-schema skip above (all catalog DML →
+		 * return false) means the DML-only opt-in below never fires
+		 * for catalog-only statements — exactly what we want because
+		 * internal catalog writes must never cause a WRONG DML
+		 * ERROR against the in-flight user branch. */
+		{
+			extern bool ob_throttled_allow_kickout;
+			bool		saved_allow = ob_throttled_allow_kickout;
+			bool		thr_ok;
+
+			if (dml_split)
+				ob_throttled_allow_kickout = true;
+			thr_ok = ob_invalidate_check_throttled(dml_split);
+			ob_throttled_allow_kickout = saved_allow;
+			if (!thr_ok || queryDesc->planstate == NULL)
+				return false;
+		}
+
+		/* Non-DML CmdType: after throttled(false) DQL check we have nothing
+		 * to redirect — fall through to standard executor so SELECTs,
+		 * DECLARE CURSORs, etc. run normally on MAIN. */
+		if (!dml_split)
+			return false;
+	}
 
 	/* MVP guard: if plannedstmt has ModifyingCTE (INSERT/UPDATE/DELETE in
 	 * WITH list wrapped in outer SELECT), then queryDesc->operation is
@@ -641,6 +782,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						ExprState *qual_scan;
 						ExprState *qual_extra;
 						ExprContext *econtext;
+						ListCell   *lc;
 						/* Walk down outerPlanState to the leaf scan node,
 						 * stopping early if we hit any level with a non-NULL
 						 * qual.  Nodes such as Result or ProjectSet wrap the
@@ -670,7 +812,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						else if (nodeTag(scan_ps) == T_IndexOnlyScanState)
 							qual_extra = ((IndexOnlyScanState *) scan_ps)->recheckqual;
 						econtext = scan_ps->ps_ExprContext;
-						ListCell *lc;
 						foreach(lc, cand_inserts)
 						{
 							TupleTableSlot *slot = (TupleTableSlot*) lfirst(lc);

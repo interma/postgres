@@ -51,9 +51,9 @@ V1 MVP 不做 Parallel、MarkPos/RestorePos、EXPLAIN 详细输出（ExplainCust
 |---|---|
 | `contrib/overlay_branch/include/overlay_branch.h` | 在函数签名区（~L129-L155）追加 3 个 public 前向声明：`ob_compute_overlay_slots`（公共 helper，给 SRF 和 CustomScan 共用）、`ob_branchscan_planner_hook`（planner hook entry，_PG_init 里取地址注册） |
 | `contrib/overlay_branch/src/overlay_branch.c` | 唯一 C 源：(a) 全局 saved-hook chain + 4 张 static 方法表；(b) Planner hook + PlanCustomPath；(c) 2-pass 公共 helper 抽出；(d) Begin/Exec/End/ReScan 4 个 executor 实现；(e) _PG_init 链入 saved hook chain + RegisterCustomScanMethods |
-| `contrib/overlay_branch/test/sql/overlay_branch_user.sql` | 新增 Part G（Transparent SELECT 等价性）+ Part H（DML ModifyTable 读子计划触发 BranchScan + apply 主表精确变化） |
-| `contrib/overlay_branch/test/sql/overlay_branch_basic.sql` | 末尾新增 Part G（EXPLAIN 验证、MAIN baseline 无回归、where pk=1 不下推仍正确） |
-| `contrib/overlay_branch/test/expected/*.out` | 两条 pg_regress baseline 重生成 0 diff |
+| `contrib/overlay_branch/test/regress/sql/overlay_branch_user.sql` | 新增 Part G（Transparent SELECT 等价性）+ Part H（DML ModifyTable 读子计划触发 BranchScan + apply 主表精确变化） |
+| `contrib/overlay_branch/test/regress/sql/overlay_branch_basic.sql` | 末尾新增 Part G（EXPLAIN 验证、MAIN baseline 无回归、where pk=1 不下推仍正确） |
+| `contrib/overlay_branch/test/regress/expected/*.out` | 两条 pg_regress baseline 重生成 0 diff |
 
 ## A.3 Implementation Steps（3 切片 MVP，严格顺序依赖）
 

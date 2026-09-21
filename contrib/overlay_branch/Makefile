@@ -16,12 +16,25 @@ PGFILEDESC = "overlay_branch - speculative database state using table overlay an
 # Header files live in include/
 override CPPFLAGS += -I$(srcdir)/include
 
-# Regression tests live in test/{sql,expected}
-REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced
+# Directory layout for test/ (clean separation of 3 test tiers):
+#   test/regress/{sql,expected}   L3 pg_regress (make check gate)
+#   test/isolation/specs          L1 pg_isolation_regress (T8 concurrency)
+#   test/isolation/expected       L1 baseline .out files
+#   test/isolation/isolation_schedule
+#   test/bench/                   L2 pgbench manual race-detection fixture
+# Temp instance shared-libs conf lives at root level (shared by both harnesses).
+REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced overlay_branch_mvcc
 REGRESS_OPTS = \
-	--inputdir=$(srcdir)/test \
+	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \
-	--temp-config=$(srcdir)/test/temp_instance_shared_libs.conf
+	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
+ISOLATION_OPTS = \
+	--inputdir=$(srcdir)/test/isolation \
+	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
+
+# L1 pg_isolation_regress concurrency tests (T8 total acceptance).
+ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan
+EXTRA_CLEAN += test_output output_iso tmp_check_iso
 
 # Handy helper: sync the just-built extension bits (so/sql/control) out of the
 # writable /tmp/pg17-writable install tree into the user's "home" PG install at
