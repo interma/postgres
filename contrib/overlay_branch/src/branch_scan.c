@@ -366,25 +366,107 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
          * that have no MAIN baseline counterpart).  MUST run even when
          * n == 0: otherwise queries like "WHERE pk = <newkey>" fail
          * because MAIN has 0 rows but Pass2 used to be nested inside
-         * the (n>0) block. */
+         * the (n>0) block.
+         *
+         * Pure-delta multi-op fold: a single PK may have multiple
+         * pending delta entries (e.g. INSERT→UPDATE, or INSERT→UPDATE
+         * →DELETE, or UPDATE→UPDATE).  Without folding, Pass2 would
+         * emit duplicate rows because each op's DeltaTuple satisfies
+         * the `!emitted && (I||U)` guard independently.
+         *
+         * Collapse rules (same PK, preserve relative order):
+         *   - Any chain that ends in DELETE   → skip (row dies).
+         *   - Otherwise                        → use the LAST delta that
+         *     is not DELETE (either INSERT or UPDATE — reconstruct its
+         *     tuple_data as the final post-image).
+         * Algorithm: two-phase walk.
+         *   Phase 2a (scan backwards): for each un-emitted key, locate
+         *     the latest non-DELETE delta and record its index.  If the
+         *     latest delta is DELETE, mark the key as dead (final_idx=-1).
+         *   Phase 2b (walk forwards): reconstruct only entries whose
+         *     index equals final_idx for their key (emits 1 row per
+         *     surviving key in original delta order). */
         {
-            ListCell *lc;
+            struct p2map_ent_ { const char *key; int final_idx; };
+            HASHCTL      hctl;
+            HTAB        *final_map;
+            HASH_SEQ_STATUS hseq;
+            struct p2map_ent_ *ent;
+            bool        *emit_flags;
+            int          i, ndelta;
+            ListCell    *lc;
+
+            ndelta = list_length(delta_list);
+            if (ndelta == 0) goto pass2_done;
+            emit_flags = (bool*) palloc0(sizeof(bool) * ndelta);
+
+            memset(&hctl, 0, sizeof(hctl));
+            hctl.keysize = sizeof(const char *);
+            hctl.entrysize = sizeof(struct p2map_ent_);
+            hctl.hcxt = CurrentMemoryContext;
+            final_map = hash_create("Pass2 fold map", ndelta, &hctl,
+                                    HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+            /* Phase 2a backwards: locate final effective delta per un-emitted key. */
+            for (i = ndelta - 1; i >= 0; i--)
+            {
+                DeltaTuple *dt = (DeltaTuple *) list_nth(delta_list, i);
+                struct p2map_ent_ *m_ent;
+                bool found;
+                if (dt->emitted) continue;
+                if (dt->key == NULL) continue;
+                m_ent = (struct p2map_ent_ *)
+                    hash_search(final_map, &dt->key, HASH_ENTER, &found);
+                if (!found)
+                {
+                    m_ent->key = dt->key;
+                    if (dt->op == DELTA_OP_DELETE)
+                        m_ent->final_idx = -1;
+                    else
+                        m_ent->final_idx = i;
+                }
+                else
+                {
+                    /* final entry dominates; earlier same-PK I/U are
+                     * redundant for emission (but must be kept in the
+                     * delta table for apply/discard). */
+                    if (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE)
+                        dt->emitted = true;
+                }
+            }
+
+            /* Phase 2b set emit_flags = (index == final_idx for that key). */
+            hash_seq_init(&hseq, final_map);
+            while ((ent = (struct p2map_ent_ *) hash_seq_search(&hseq)) != NULL)
+            {
+                if (ent->final_idx >= 0)
+                    emit_flags[ent->final_idx] = true;
+            }
+            hash_destroy(final_map);
+
+            /* Walk forwards and reconstruct flagged entries. */
+            i = 0;
             foreach(lc, delta_list)
             {
                 DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-                if (!dt->emitted && dt->op == DELTA_OP_INSERT)
+                if (!dt->emitted && emit_flags[i] &&
+                    (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE))
                 {
                     TupleTableSlot *new_slot;
                     if (dt->tuple_data == NULL)
                         ereport(ERROR,
                                 (errcode(ERRCODE_DATA_CORRUPTED),
-                                 errmsg("ob_compute_overlay_slots: delta INSERT key=%s has NULL tuple_data",
+                                 errmsg("ob_compute_overlay_slots: delta I/U key=%s has NULL tuple_data",
                                         dt->key)));
                     new_slot = reconstruct_slot_from_delta(rel, dt->tuple_data);
                     result_slots = lappend(result_slots, new_slot);
                     dt->emitted = true;
                 }
+                i++;
             }
+            pfree(emit_flags);
+pass2_done:
+            ;
         }
 
         MemoryContextSwitchTo(oldcxt);

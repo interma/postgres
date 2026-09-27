@@ -23,7 +23,7 @@ override CPPFLAGS += -I$(srcdir)/include
 #   test/isolation/isolation_schedule
 #   test/bench/                   L2 pgbench manual race-detection fixture
 # Temp instance shared-libs conf lives at root level (shared by both harnesses).
-REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced overlay_branch_mvcc
+REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced overlay_branch_mvcc overlay_branch_puredelta
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \
@@ -33,7 +33,7 @@ ISOLATION_OPTS = \
 	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
 
 # L1 pg_isolation_regress concurrency tests (T8 total acceptance).
-ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan
+ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete
 EXTRA_CLEAN += test_output output_iso tmp_check_iso
 
 # Handy helper: sync the just-built extension bits (so/sql/control) out of the

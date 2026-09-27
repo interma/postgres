@@ -2195,8 +2195,21 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 	main_slot = ob_fetch_main_current_slot(rel, where_clause);
 	if (main_slot == NULL)
 	{
-		char *reason = psprintf("UPDATE pk=%s MAIN row missing at apply time (concurrent DELETE)",
-							 dt->key);
+		char	   *reason;
+
+		/* Pure-delta origin UPDATE: row never existed in MAIN,
+		 * old_version is NULL because there was never any MAIN
+		 * baseline.  Fall back to INSERT pass to materialize the
+		 * final post-image.  Engineering spec: "Apply logic:
+		 * handle pure UPDATE when old_version empty by insert_pass". */
+		if (dt->old_version == NULL)
+		{
+			pfree(where_clause);
+			apply_relation_insert_pass(rel, dt);
+			return;
+		}
+		reason = psprintf("UPDATE pk=%s MAIN row missing at apply time (concurrent DELETE)",
+						  dt->key);
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),

@@ -650,7 +650,11 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 		MemoryContext oldmc;
 
 		oldmc = MemoryContextSwitchTo(TopMemoryContext);
-		out_slot = MakeSingleTupleTableSlot(reldesc, &TTSOpsVirtual);
+		{
+			TupleDesc	slot_desc = CreateTupleDescCopy(reldesc);
+
+			out_slot = MakeSingleTupleTableSlot(slot_desc, &TTSOpsVirtual);
+		}
 		ExecClearTuple(out_slot);
 		for (int a = 0; a < reldesc->natts; a++)
 		{
@@ -955,6 +959,12 @@ overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
 
 	Assert(rel != NULL && slot != NULL);
 	ExecMaterializeSlot(slot);
+	if (TTS_IS_VIRTUAL(slot))
+	{
+		TupleDesc	std = slot->tts_tupleDescriptor;
+		if (std && slot->tts_nvalid < std->natts)
+			slot->tts_nvalid = std->natts;
+	}
 
 	reldesc = RelationGetDescr(rel);
 	natts = reldesc->natts;

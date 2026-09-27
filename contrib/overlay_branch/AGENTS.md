@@ -308,6 +308,49 @@ its `multi_session_mvcc.md` design appendix for future reference / bug fixes.
 
 ---
 
+## 6.1 B-series Extension Milestones (V3 增量功能扩展)
+
+Post-Baseline incremental features built **on top of** T1–T8 green baseline.  Each
+milestone uses the same strict quality gate as T (2× clean 0-warn rebuild + L3 0 diff +
+L1 0 diff + doc sync).
+
+### ✅ B1 Pure Delta UPDATE (Phase 12/12 Green, 2026-09-22)
+
+* **Scope**: CMD_UPDATE fallback through WR delta path for pure-origin rows (MAIN miss first, then pure delta fallback via reconstruct Slot → `heap_form_tuple`-backed SET-merge.
+* **Acceptance**: LIVE view correct after main+pure mixed UPDATE rows;
+  `apply_branch()` correctly materializes pure-origin UPDATEs (insert-pass fallback on MAIN miss).
+* **Artifacts**:
+  L3 Section L (pure_delta UPDATE) in overlay_branch_advanced.sql/expected;
+  L1 pure_delta_update.spec + 6/6 green;
+  Code: `write_redirect.c` CMD_UPDATE fallback (ProjInfo walker + skip junk attnum≤0);
+  `branch_scan.c` Pass2 emit op=INSERT∪UPDATE;
+  `branch_lifecycle.c` apply UPDATE pure-origin MAIN-miss → insert_pass fallback.
+* **Doc**: multi_session_mvcc.md §D.11.
+
+### ✅ B2 Pure Delta UPSERT (ON CONFLICT DO UPDATE/NOTHING 12/12 Green (2026-09-23)
+
+* **Scope**: CMD_INSERT UPSERT syntactic sugar 100% delta path (ABSOLUTELY NO
+  forbidden: fall through to standard speculative insertion path which writes
+  MAIN directly → drift).
+* **Hard invariants**:
+  (a) MAIN-heap baseline FIRST → pure delta SECOND;
+  (b) conflict detection strictly 2-phase: Phase I pure delta SPI (bid/relid/pk → op/old_version/tuple_data; Phase II MAIN ctid SPI (primary key → ctid lookup → fetch_tuple_by_ctid);
+  (c) 4-way promo dispatch table (main_hit × pure_hit × oc_action × WHERE-cond).
+* **Verdicts / Evidence**: 7 canonical UPSERT cases A–G (promo 0/1/2/3) +
+  S8 LIVE 9 rows + S9 RAW MAIN 5 rows zero drift + T1 apply 9 rows materialized + U discard 9 rows preserved (24/24 assertions).
+* **Artifacts**:
+  - Code: `write_redirect.c` oc_action derivation (arbiterIndexes+onConflictSet as primary source),
+  Phase I/II SPI, promo 0/1/2/3, WR_enter, promo 2/3 ExecProject with `oc_proj->pi_exprContext` correct ExprContext,
+  BYTEA hex decode skip `\x` prefix, es_query_cxt alloc for cross-phase pointers,
+  WHERE false / DO NOTHING promo=0 no-op;
+  `branch_scan.c` Pass2 emit op=UPDATE (pure-origin);
+  `branch_lifecycle.c` apply pure-origin UPDATE old_version=NULL → insert_pass;
+  L3 Section S/T/U in overlay_branch_advanced.sql + expected (2×0 diff;
+  L1 pure_delta_upsert.spec + Makefile ISOLATION line registered + isolation_schedule line registered.
+* **Doc**: multi_session_mvcc.md §D.12.
+
+---
+
 ## 7. Commit / agent handoff hygiene
 
 When you finish a T (or a sub-T batch):

@@ -6,3 +6,6 @@ test: ob_state_inval
 test: ob_applying_freeze
 test: ob_snapshot_mode
 test: ob_branchscan_rescan
+test: pure_delta_upsert
+test: pure_delta_update
+test: pure_delta_delete

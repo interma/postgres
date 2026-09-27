@@ -88,9 +88,23 @@ ob_project_returning(ResultRelInfo *rri, TupleTableSlot *scanSlot,
 	ProjectionInfo *proj = rri->ri_projectReturning;
 	ExprContext *econtext;
 	TupleTableSlot *out;
+	TupleTableSlot *phys_out;
 
 	if (proj == NULL) return NULL;
 	econtext = proj->pi_exprContext;
+
+	if (scanSlot && TTS_IS_VIRTUAL(scanSlot))
+	{
+		TupleDesc	std = scanSlot->tts_tupleDescriptor;
+		if (std && scanSlot->tts_nvalid < std->natts)
+			scanSlot->tts_nvalid = std->natts;
+	}
+	if (planSlot && TTS_IS_VIRTUAL(planSlot))
+	{
+		TupleDesc	ptd = planSlot->tts_tupleDescriptor;
+		if (ptd && planSlot->tts_nvalid < ptd->natts)
+			planSlot->tts_nvalid = ptd->natts;
+	}
 
 	if (scanSlot)
 		econtext->ecxt_scantuple = scanSlot;
@@ -99,9 +113,23 @@ ob_project_returning(ResultRelInfo *rri, TupleTableSlot *scanSlot,
 		econtext->ecxt_scantuple->tts_tableOid = RelationGetRelid(rel);
 
 	out = ExecProject(proj);
-	if (!TupIsNull(out))
+	if (TupIsNull(out))
+		return out;
+
+	{
+		TupleDesc	otd = out->tts_tupleDescriptor;
+
 		ExecMaterializeSlot(out);
-	return out;
+		if (TTS_IS_VIRTUAL(out))
+		{
+			if (otd && out->tts_nvalid < otd->natts)
+				out->tts_nvalid = otd->natts;
+		}
+		phys_out = MakeSingleTupleTableSlot(otd, &TTSOpsHeapTuple);
+		ExecCopySlot(phys_out, out);
+		ExecMaterializeSlot(phys_out);
+	}
+	return phys_out;
 }
 
 /* ----------------------------------------------------------------
@@ -283,51 +311,140 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			extern bool ob_throttled_allow_kickout;
 			bool		saved_allow = ob_throttled_allow_kickout;
 			bool		thr_ok;
+			/* FIX-C: Dirty-only kickout gate.
+			 *
+			 * Destructive side-effects of throttled() (ERROR for DML,
+			 * NOTICE for DQL, exit_branch_cleanup + GUC reset) are ONLY
+			 * opted-in when BOTH:
+			 *   (a) dml_split == true (real user INSERT/UPDATE/DELETE
+			 *       about to write rows, not a catalog-only internal
+			 *       statement)
+			 *   (b) CurrentBranchContext is ACTUALLY DIRTY — i.e. it
+			 *       exists, is_active, and carries a real branch_id>0.
+			 *
+			 * Without (b), a dml_split=true write that happens to run
+			 * on a session with NO branch (or a zombie cleaned ctx with
+			 * bid=0 / name='') would invoke the kickout machinery on a
+			 * no-op ctx and produce a spurious ERROR / NOTICE.  In
+			 * that case we simply observe thr_ok (which is always true
+			 * for a NULL/clean ctx anyway) and skip the destructive
+			 * mutation path.  This is the DIRTY-ONLY complement to
+			 * FIX-A (ERROR vs NOTICE split). */
+			bool		dirty_ctx = false;
+			{
+				extern BranchContext *CurrentBranchContext;
+				if (CurrentBranchContext != NULL &&
+					CurrentBranchContext->is_active &&
+					CurrentBranchContext->branch_id > 0)
+					dirty_ctx = true;
+			}
 
-			if (dml_split)
+			if (dml_split && dirty_ctx)
 				ob_throttled_allow_kickout = true;
-			thr_ok = ob_invalidate_check_throttled(dml_split);
+			thr_ok = ob_invalidate_check_throttled(dml_split && dirty_ctx);
 			ob_throttled_allow_kickout = saved_allow;
 			if (!thr_ok || queryDesc->planstate == NULL)
 				return false;
 		}
 
-		/* Non-DML CmdType: after throttled(false) DQL check we have nothing
-		 * to redirect — fall through to standard executor so SELECTs,
-		 * DECLARE CURSORs, etc. run normally on MAIN. */
+		/* FIX-I: ModifyingCTE MVP guard (MUST run BEFORE Non-DML return!)
+		 *
+		 * If plannedstmt has ModifyingCTE (INSERT/UPDATE/DELETE in WITH
+		 * list wrapped in outer SELECT), then queryDesc->operation is
+		 * CMD_SELECT → dml_split=false.  If the Non-DML `if (!dml_split)
+		 * return false;` line below runs BEFORE this check, we silently
+		 * fall through to standard_ExecutorRun which writes DIRECTLY to
+		 * MAIN heap → silent MAIN pollution + data corruption!  E.g.:
+		 *
+		 *   WITH upd AS (UPDATE t SET v=v+1 WHERE pk=2 RETURNING *)
+		 *   SELECT * FROM upd;
+		 *
+		 * hasModifyingCTE flag is set by the planner exactly for this
+		 * case.  Proper fix requires intercepting *inner* ModifyTable
+		 * nodes inside CTE subplans (non-trivial refactor of WR loop).
+		 * MVP: explicit ERROR with helpful hint — silent corruption is
+		 * NEVER acceptable, regardless of CmdType. */
+		if (queryDesc->plannedstmt != NULL &&
+			queryDesc->plannedstmt->hasModifyingCTE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("overlay_branch MVP does not support data-modifying statements inside WITH (CTE) clauses"),
+					 errhint("Rewrite WITH (UPDATE/DELETE/INSERT ... RETURNING) SELECT ... "
+							 "using a TEMP TABLE to collect RETURNING rows:\n"
+							 "  CREATE TEMP TABLE _r AS UPDATE t SET ... RETURNING ...;\n"
+							 "  SELECT * FROM _r; DROP TABLE _r;")));
+		}
+
+		/* Non-DML CmdType: after throttled(false) DQL check + ModifyingCTE
+		 * MVP guard we have nothing to redirect — fall through to standard
+		 * executor so SELECTs, DECLARE CURSORs, etc. run normally on MAIN. */
 		if (!dml_split)
 			return false;
 	}
 
-	/* MVP guard: if plannedstmt has ModifyingCTE (INSERT/UPDATE/DELETE in
-	 * WITH list wrapped in outer SELECT), then queryDesc->operation is
-	 * CMD_SELECT and the top-level PlanState is NOT ModifyTableState — so
-	 * the original `!IsA(ModifyTableState)` guard above would silently
-	 * fall through to standard_ExecutorRun, which writes DIRECTLY to MAIN
-	 * heap → silent MAIN pollution + data corruption!  E.g.:
+	/* B2-2a DFS walker: locate the FIRST ModifyTableState descendant
+	 * of queryDesc->planstate.
 	 *
-	 *   WITH upd AS (UPDATE t SET v=v+1 WHERE pk=2 RETURNING *)
-	 *   SELECT * FROM upd;
-	 *
-	 * hasModifyingCTE flag is set by the planner exactly for this case.
-	 * Proper fix requires recursively intercepting *inner* ModifyTable
-	 * nodes inside CTE subplans (a non-trivial refactor of the WR loop
-	 * which currently assumes top-level ModifyTableState).  MVP: explicit
-	 * ERROR with helpful hint — silent corruption is never acceptable. */
-	if (queryDesc->plannedstmt != NULL &&
-		queryDesc->plannedstmt->hasModifyingCTE)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("overlay_branch MVP does not support data-modifying statements inside WITH (CTE) clauses"),
-				 errhint("Rewrite WITH (UPDATE/DELETE/INSERT ... RETURNING) SELECT ... "
-						 "using a TEMP TABLE to collect RETURNING rows:\n"
-						 "  CREATE TEMP TABLE _r AS UPDATE t SET ... RETURNING ...;\n"
-						 "  SELECT * FROM _r; DROP TABLE _r;")));
-	}
-
+	 * For UPSERT (INSERT ... ON CONFLICT), PG planner often wraps the
+	 * ModifyTableState under one or more projection / result nodes.
+	 * The original `!IsA(ModifyTableState)` guard above would wrongly
+	 * return false and fall through to standard ExecutorRun → MAIN
+	 * drift.  We DFS the PlanState tree (64-deep manual stack to avoid
+	 * recursion) and accept the FIRST ModifyTableState descendant we
+	 * find.  This is safe because WR redirects DML only when
+	 * mt_nrels==1 && resultRelations==1 anyway.  Scan descent stops
+	 * early at baserel-type nodes (Seq/Index/BitmapHeapScan) per
+	 * Scan_ps degradation invariant — prevents BitmapIndexScan trap. */
 	if (!IsA(queryDesc->planstate, ModifyTableState))
-		return false;
+	{
+		PlanState  *stack[64];
+		int			depth = 0;
+
+		stack[depth++] = queryDesc->planstate;
+		while (depth > 0)
+		{
+			PlanState  *ps = stack[--depth];
+			NodeTag		tag;
+
+			if (ps == NULL)
+				continue;
+			tag = nodeTag(ps);
+			if (tag == T_ModifyTableState)
+			{
+				/* Found: adopt as our working ModifyTableState */
+				queryDesc->planstate = ps;
+				break;
+			}
+			/* Stop descent at baserel-type scan nodes: they never wrap
+			 * ModifyTableState and continuing into BitmapIndexScan /
+			 * IndexScan internals causes false-positive trap trips. */
+			if (tag == T_SeqScanState ||
+				tag == T_IndexScanState ||
+				tag == T_IndexOnlyScanState ||
+				tag == T_BitmapHeapScanState ||
+				tag == T_TidScanState ||
+				tag == T_SubqueryScanState ||
+				tag == T_FunctionScanState ||
+				tag == T_ValuesScanState ||
+				tag == T_CteScanState ||
+				tag == T_WorkTableScanState ||
+				tag == T_ForeignScanState ||
+				tag == T_CustomScanState)
+				continue;
+			/* Push children right-first so left is popped first (DFS
+			 * order matches PG execution order; irrelevant for "first
+			 * ModifyTableState" match but keeps traversal
+			 * deterministic). */
+			if (ps->righttree != NULL && depth < 64)
+				stack[depth++] = ps->righttree;
+			if (ps->lefttree != NULL && depth < 64)
+				stack[depth++] = ps->lefttree;
+		}
+		/* If still not a ModifyTableState after DFS → no DML in tree */
+		if (!IsA(queryDesc->planstate, ModifyTableState))
+			return false;
+	}
 
 	overlay_write_redirect_enter();
 	PG_TRY();
@@ -577,8 +694,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							{
 								TupleTableSlot *cp;
 								TupleDesc	tdesc = rslot->tts_tupleDescriptor;
-								cp = MakeSingleTupleTableSlot(tdesc, &TTSOpsVirtual);
-								slot_getallattrs(rslot);
+								cp = MakeSingleTupleTableSlot(tdesc, &TTSOpsHeapTuple);
 								ExecCopySlot(cp, rslot);
 								ExecMaterializeSlot(cp);
 								retslots[nretslots] = cp;
@@ -657,7 +773,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				{
 #if PURE_DELTA_STEP >= 5
 					/* define early (cleanup block below uses it) */
-					struct WR_PDR1 { char *s; bytea *t; };
+					struct WR_PDR1 { char *s; bytea *t; char *ov; };
 #endif
 					int32 bid = overlay_branch_get_current_id();
 					Oid relid = RelationGetRelid(rel);
@@ -680,10 +796,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 #if PURE_DELTA_STEP >= 2
 					initStringInfo(&spiq);
 					appendStringInfo(&spiq,
-						"SELECT d.key, d.tuple_data FROM %s d "
-						"WHERE d.branch_id = %u AND d.relid = %u AND d.op = %s",
+						"SELECT d.key, d.tuple_data, d.old_version FROM %s d "
+						"WHERE d.branch_id = %u AND d.relid = %u AND d.op IN (%s, %s)",
 						OBTABLE_DELTA, (unsigned) bid, (unsigned) relid,
-						quote_literal_cstr("I"));
+						quote_literal_cstr("I"),
+						quote_literal_cstr("U"));
 #endif
 
 #if PURE_DELTA_STEP >= 3
@@ -717,17 +834,22 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							for (i = 0; i < SPI_processed; i++)
 							{
 								bool isn_td;
+								bool isn_ov;
 								char *pkstr = SPI_getvalue(SPI_tuptable->vals[i],
 								                           SPI_tuptable->tupdesc, 1);
 								bytea *td = (bytea*) SPI_getbinval(
 									SPI_tuptable->vals[i],
 									SPI_tuptable->tupdesc, 2, &isn_td);
+								char *ov = SPI_getvalue(SPI_tuptable->vals[i],
+								                        SPI_tuptable->tupdesc, 3);
+								isn_ov = (ov == NULL);
 								if (pkstr == NULL || isn_td || td == NULL)
 									continue;
 								{
 									struct WR_PDR1 *r;
 									r = (struct WR_PDR1*) palloc0(sizeof(struct WR_PDR1));
 									r->s = pstrdup(pkstr);
+									r->ov = isn_ov ? NULL : pstrdup(ov);
 									{
 										int sz = VARSIZE_ANY(td);
 										r->t = (bytea*) palloc(sz);
@@ -751,22 +873,40 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					if (raw_rows != NIL)
 					{
 						ListCell *lc;
+						List     *seen = NIL;
 						foreach(lc, raw_rows)
 						{
 							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
 							DeltaTuple dtu; bool rc;
+							ListCell *sl;
+							bool dup = false;
+							if (r->ov != NULL)
+								continue;
+							foreach(sl, seen)
+							{
+								if (strcmp((char*) lfirst(sl), r->s) == 0)
+								{ dup = true; break; }
+							}
+							if (dup)
+								continue;
+							seen = lappend(seen, r->s);
 							memset(&dtu, 0, sizeof(dtu));
 							rc = overlay_delta_lookup(bid, relid, r->s, &dtu);
-							if (rc && dtu.op == DELTA_OP_INSERT)
+							if (rc && (dtu.op == DELTA_OP_INSERT ||
+							           dtu.op == DELTA_OP_UPDATE) &&
+							    dtu.tuple_data != NULL)
 							{
-								TupleTableSlot *ps = reconstruct_slot_from_delta(rel, r->t);
+								TupleTableSlot *ps = reconstruct_slot_from_delta(rel,
+								                                                 dtu.tuple_data);
 								if (ps) cand_inserts = lappend(cand_inserts, ps);
 							}
 						}
+						list_free(seen);
 						foreach(lc, raw_rows)
 						{
 							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
 							if (r->s) pfree(r->s);
+							if (r->ov) pfree(r->ov);
 							if (r->t) pfree(r->t);
 							pfree(r);
 						}
@@ -825,6 +965,12 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									ExecClearTuple(econtext->ecxt_scantuple);
 								econtext->ecxt_scantuple = slot;
 								econtext->ecxt_outertuple = slot;
+								if (TTS_IS_VIRTUAL(slot))
+								{
+									TupleDesc	std = slot->tts_tupleDescriptor;
+									if (std && slot->tts_nvalid < std->natts)
+										slot->tts_nvalid = std->natts;
+								}
 								ResetExprContext(econtext);
 								if (qual_scan != NULL)
 								{
@@ -893,8 +1039,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											TupleDesc td =
 												rslot->tts_tupleDescriptor;
 											cp = MakeSingleTupleTableSlot(td,
-												&TTSOpsVirtual);
-											slot_getallattrs(rslot);
+												&TTSOpsHeapTuple);
 											ExecCopySlot(cp, rslot);
 											ExecMaterializeSlot(cp);
 											retslots[nretslots++] = cp;
@@ -903,6 +1048,257 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									}
 								}
 								pfree(pk);
+							}
+							else if (cmd == CMD_UPDATE)
+							{
+								TupleTableSlot *set_plan_slot;
+								TupleTableSlot *post_image;
+								TupleTableSlot *proj_slot;
+								ProjectionInfo *proj_info;
+								ExprContext *proj_ecxt;
+								char        *pk;
+								char        *tdata;
+								TupleDesc    reldesc;
+								TupleDesc    jdesc;
+								TupleTableSlot *save_scantuple;
+								TupleTableSlot *save_outertuple;
+								int			jnatts;
+								int			natts;
+								int			k;
+								int			r;
+								HeapTuple	post_htup;
+
+								reldesc = RelationGetDescr(rel);
+								natts = reldesc->natts;
+
+								jdesc = CreateTupleDescCopy(
+									subplan->ps_ResultTupleSlot->tts_tupleDescriptor);
+								jnatts = jdesc->natts;
+
+								set_plan_slot = MakeSingleTupleTableSlot(jdesc,
+									&TTSOpsHeapTuple);
+
+								proj_info = subplan->ps_ProjInfo;
+								if (proj_info == NULL)
+								{
+									ExecClearTuple(set_plan_slot);
+									if (jnatts != natts)
+									{
+										ereport(WARNING,
+											(errmsg("overlay_branch: pure-delta UPDATE: no projection info and natts mismatch")));
+										ExecDropSingleTupleTableSlot(set_plan_slot);
+										FreeTupleDesc(jdesc);
+										continue;
+									}
+									for (k = 0; k < jnatts; k++)
+									{
+										Datum		d;
+										bool		isnull;
+										Form_pg_attribute patt;
+										if (TTS_IS_VIRTUAL(slot) &&
+										    slot->tts_nvalid < (AttrNumber)(k+1))
+											slot->tts_nvalid = natts;
+										d = slot->tts_values[k];
+										isnull = slot->tts_isnull[k];
+										patt = TupleDescAttr(jdesc, k);
+										if (!isnull)
+										{
+											int16 typlen;
+											bool  typbyval;
+											get_typlenbyval(patt->atttypid,
+												&typlen, &typbyval);
+											d = datumCopy(d, typbyval, typlen);
+										}
+										set_plan_slot->tts_values[k] = d;
+										set_plan_slot->tts_isnull[k] = isnull;
+									}
+									set_plan_slot->tts_nvalid = jnatts;
+								}
+								else
+								{
+									proj_ecxt = proj_info->pi_exprContext;
+									save_scantuple = proj_ecxt->ecxt_scantuple;
+									save_outertuple = proj_ecxt->ecxt_outertuple;
+									{
+										MemoryContext oldcxt;
+										oldcxt = MemoryContextSwitchTo(
+											proj_ecxt->ecxt_per_tuple_memory);
+										if (TTS_IS_VIRTUAL(slot))
+										{
+											TupleDesc	std = slot->tts_tupleDescriptor;
+											if (std && slot->tts_nvalid < std->natts)
+												slot->tts_nvalid = std->natts;
+										}
+										proj_ecxt->ecxt_scantuple = slot;
+										proj_ecxt->ecxt_outertuple = slot;
+										proj_ecxt->ecxt_innertuple = NULL;
+										ResetExprContext(proj_ecxt);
+										proj_slot = ExecProject(proj_info);
+										ExecClearTuple(set_plan_slot);
+										if (TTS_IS_VIRTUAL(proj_slot) &&
+										    proj_slot->tts_nvalid < jnatts)
+											proj_slot->tts_nvalid = jnatts;
+										for (k = 0; k < jnatts; k++)
+										{
+											Datum		d;
+											bool		isnull;
+											Form_pg_attribute patt;
+											d = proj_slot->tts_values[k];
+											isnull = proj_slot->tts_isnull[k];
+											patt = TupleDescAttr(jdesc, k);
+											if (!isnull)
+											{
+												int16 typlen;
+												bool  typbyval;
+												get_typlenbyval(patt->atttypid,
+													&typlen, &typbyval);
+												d = datumCopy(d, typbyval, typlen);
+											}
+											set_plan_slot->tts_values[k] = d;
+											set_plan_slot->tts_isnull[k] = isnull;
+										}
+										set_plan_slot->tts_nvalid = jnatts;
+										MemoryContextSwitchTo(oldcxt);
+									}
+									proj_ecxt->ecxt_scantuple = save_scantuple;
+									proj_ecxt->ecxt_outertuple = save_outertuple;
+								}
+
+								post_image = MakeSingleTupleTableSlot(reldesc,
+									&TTSOpsHeapTuple);
+								{
+									MemoryContext oldmc;
+									oldmc = MemoryContextSwitchTo(TopMemoryContext);
+									for (k = 0; k < natts; k++)
+									{
+										Datum		d;
+										bool		isnull;
+										Form_pg_attribute patt;
+										if (TTS_IS_VIRTUAL(slot) &&
+										    slot->tts_nvalid < (AttrNumber)(k+1))
+											slot->tts_nvalid = natts;
+										d = slot->tts_values[k];
+										isnull = slot->tts_isnull[k];
+										patt = TupleDescAttr(reldesc, k);
+										if (!isnull)
+										{
+											int16 typlen;
+											bool  typbyval;
+											get_typlenbyval(patt->atttypid,
+												&typlen, &typbyval);
+											d = datumCopy(d, typbyval, typlen);
+										}
+										post_image->tts_values[k] = d;
+										post_image->tts_isnull[k] = isnull;
+									}
+									post_image->tts_nvalid = natts;
+
+									for (r = 0; r < natts; r++)
+									{
+										Form_pg_attribute ratt =
+											TupleDescAttr(reldesc, r);
+										const char *rname = NameStr(ratt->attname);
+										int j;
+										if (ratt->attisdropped) continue;
+										for (j = 0; j < jnatts; j++)
+										{
+											Form_pg_attribute jatt =
+												TupleDescAttr(jdesc, j);
+											if (jatt->attisdropped) continue;
+											if (strcmp(NameStr(jatt->attname),
+											           rname) == 0)
+											{
+												bool jisnull;
+												Datum jvalue;
+												if (set_plan_slot->tts_nvalid <
+												    (AttrNumber)(j+1))
+													set_plan_slot->tts_nvalid =
+														jnatts;
+												jvalue = slot_getattr(
+													set_plan_slot,
+													(AttrNumber)(j+1), &jisnull);
+												if (!jisnull)
+												{
+													int16 typlen;
+													bool  typbyval;
+													get_typlenbyval(ratt->atttypid,
+														&typlen, &typbyval);
+													jvalue = datumCopy(jvalue,
+														typbyval, typlen);
+													post_image->tts_values[r] =
+														jvalue;
+													post_image->tts_isnull[r] =
+														false;
+												}
+												break;
+											}
+										}
+									}
+									MemoryContextSwitchTo(oldmc);
+								}
+
+								post_htup = heap_form_tuple(reldesc,
+									post_image->tts_values,
+									post_image->tts_isnull);
+								ExecClearTuple(post_image);
+								ExecStoreHeapTuple(post_htup, post_image, true);
+
+								pk = overlay_serialize_pk(rel, post_image);
+								tdata = overlay_serialize_tuple(rel, post_image);
+
+								{
+									MemoryContext oldmcdi2;
+									oldmcdi2 = MemoryContextSwitchTo(
+										queryDesc->estate->es_query_cxt);
+									overlay_delta_insert(bid, relid, pk,
+									                     DELTA_OP_UPDATE, NULL, tdata);
+									MemoryContextSwitchTo(oldmcdi2);
+								}
+								ndone++;
+
+								if (has_returning)
+								{
+									TupleTableSlot *rslot;
+									rslot = ob_project_returning(rri,
+									                             post_image,
+									                             set_plan_slot,
+									                             rel);
+									if (rslot && !TupIsNull(rslot))
+									{
+										MemoryContext oldmcq;
+										oldmcq = MemoryContextSwitchTo(
+											queryDesc->estate->es_query_cxt);
+										if (nretslots >= nretslots_alloc)
+										{
+											int newsz = (nretslots_alloc == 0)
+												? 16 : nretslots_alloc * 2;
+											if (retslots == NULL)
+												retslots = palloc(
+													sizeof(TupleTableSlot*) * newsz);
+											else
+												retslots = repalloc(retslots,
+													sizeof(TupleTableSlot*) * newsz);
+											nretslots_alloc = newsz;
+										}
+										{
+											TupleTableSlot *cp;
+											TupleDesc td =
+												rslot->tts_tupleDescriptor;
+											cp = MakeSingleTupleTableSlot(td,
+												&TTSOpsHeapTuple);
+											ExecCopySlot(cp, rslot);
+											ExecMaterializeSlot(cp);
+											retslots[nretslots++] = cp;
+										}
+										MemoryContextSwitchTo(oldmcq);
+									}
+								}
+
+								pfree(pk);
+								if (tdata) pfree(tdata);
+								ExecDropSingleTupleTableSlot(post_image);
+								ExecDropSingleTupleTableSlot(set_plan_slot);
+								FreeTupleDesc(jdesc);
 							}
 #endif /* >=8 */
 						}
@@ -922,6 +1318,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						{
 							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
 							if (r->s) pfree(r->s);
+							if (r->ov) pfree(r->ov);
 							if (r->t) pfree(r->t);
 							pfree(r);
 						}
@@ -947,7 +1344,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				goto ob_write_redirect_done;
 			}
 
-			/* --- CMD_INSERT redirect --- */
+			/* --- CMD_INSERT redirect (including UPSERT ON CONFLICT) --- */
 			if (cmd == CMD_INSERT && overlay_should_redirect(rel))
 			{
 				PlanState  *subplan;
@@ -957,6 +1354,52 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				TupleTableSlot **retslots = NULL;
 				int			nretslots = 0;
 				int			nretslots_alloc = 0;
+				int32		bid = overlay_branch_get_current_id();
+				Oid			relid = RelationGetRelid(rel);
+				int			pk_attno = 0;
+				OnConflictAction oc_action = ONCONFLICT_NONE;
+				ProjectionInfo *oc_proj = NULL;
+				ExprState  *oc_where = NULL;
+
+				{
+					ResultRelInfo *rri0 = rri;
+					/* Primary derivation: use ModifyTable plan fields
+					 * because PG17 does NOT always populate
+					 * plan->onConflictAction for DO NOTHING (stays 0),
+					 * and rri->ri_onConflict can be NULL for DO NOTHING
+					 * when no SET targetlist is needed.
+					 * Rule:
+					 *   plan->arbiterIndexes == NIL → NONE (0, plain INSERT)
+					 *   arbiterIndexes set + (onConflictSet set OR
+					 *     rri ri_onConflict has ProjInfo) → UPDATE (2)
+					 *   arbiterIndexes set + no SET → NOTHING (1)
+					 */
+					if (plan->arbiterIndexes == NIL)
+					{
+						oc_action = ONCONFLICT_NONE;
+					}
+					else if (plan->onConflictSet != NIL ||
+							 (rri0->ri_onConflict != NULL &&
+							  rri0->ri_onConflict->oc_ProjInfo != NULL))
+					{
+						oc_action = ONCONFLICT_UPDATE;
+						if (rri0->ri_onConflict != NULL)
+						{
+							oc_proj = rri0->ri_onConflict->oc_ProjInfo;
+							oc_where = rri0->ri_onConflict->oc_WhereClause;
+						}
+					}
+					else
+					{
+						oc_action = ONCONFLICT_NOTHING;
+					}
+				}
+				{
+					const char *pk_colname_dummy = NULL;
+					if (!overlay_get_pk_single_attno(rel, (AttrNumber*) &pk_attno,
+												 &pk_colname_dummy))
+						pk_attno = 0;
+				}
 
 				subplan = outerPlanState(mt);
 
@@ -964,6 +1407,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			{
 				char	   *pk;
 				char	   *tdata;
+				char	   *old_version = NULL;
+				int			promotion = 0; /* 0=skip 1=INSERT 2=UPDATE(main) 3=UPDATE(pure) */
+				TupleTableSlot *pre_image_slot = NULL;
+				bytea	   *pure_tuple_bytes = NULL;
+				char	   *main_ctid = NULL;
 
 				CHECK_FOR_INTERRUPTS();
 
@@ -976,39 +1424,545 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				pk = overlay_serialize_pk(rel, slot);
 				tdata = overlay_serialize_tuple(rel, slot);
 
-				overlay_delta_insert(overlay_branch_get_current_id(),
-									RelationGetRelid(rel), pk,
-									DELTA_OP_INSERT, NULL, tdata);
-				ninserted++;
+				/* ================================================================
+				 * === B2 UPSERT: 2-Phase Conflict Detection (MAIN-first) ===
+				 * ================================================================
+				 * Per B1/B2 mandate, conflict detection is strictly 2-phase:
+				 *   Phase I  → pure delta SPI lookup (op=I OR op=U per
+				 *              BranchScan Pass2 invariant, so INSERT→UPDATE
+				 *              collapsed rows do not vanish)
+				 *   Phase II → MAIN heap ctid SPI lookup (MAIN-first per
+				 *              hard functional constraint)
+				 *
+				 * promo dispatch matrix after both phases:
+				 *   main_hit  pure_hit  oc_action  WHERE  promotion
+				 *   false     false     DO_UPD     -      1 (INSERT)
+				 *   false     false     DO_NOTHING -      1 (INSERT)
+				 *   true      false     DO_UPD     true   2 (UPDATE main)
+				 *   true      false     DO_UPD     false  0 (skip WHERE)
+				 *   true      false     DO_NOTHING -      0 (skip NOTHING)
+				 *   false     true      DO_UPD     true   3 (UPDATE pure)
+				 *   false     true      DO_UPD     false  0 (skip WHERE)
+				 *   false     true      DO_NOTHING -      0 (skip NOTHING)
+				 *   true      true      DO_UPD     true   2 (MAIN wins tie)
+				 * ================================================================ */
 
-				/* P1 RETURNING for INSERT: post-image is 'slot' itself. */
-				if (has_returning)
+				/* ---------- Phase I: Pure delta conflict lookup ---------- */
+				if (oc_action != ONCONFLICT_NONE)
 				{
-					TupleTableSlot *rslot;
-					rslot = ob_project_returning(rri, slot, slot, rel);
-					if (rslot != NULL && !TupIsNull(rslot))
+					StringInfoData spiq;
+					int			ret2;
+					bool		in_pure_delta = false;
+					char	   *pk_esc;
+					MemoryContext oldmc;
+
+					oldmc = NULL;
+					initStringInfo(&spiq);
+					pk_esc = quote_literal_cstr(pk);
+					appendStringInfo(&spiq,
+						"SELECT d.op, d.old_version, d.tuple_data FROM %s d "
+						"WHERE d.branch_id = %u AND d.relid = %u AND d.key = %s "
+						"AND (d.op = %s OR d.op = %s) LIMIT 1",
+						OBTABLE_DELTA, (unsigned) bid, (unsigned) relid, pk_esc,
+						quote_literal_cstr("I"), quote_literal_cstr("U"));
+					pfree(pk_esc);
+
+					overlay_overlay_helper_enter();
+					overlay_write_redirect_exit();
+					ret2 = ob_spi_one_shot(spiq.data, true, 0);
+					in_pure_delta = (ret2 == SPI_OK_SELECT);
+					overlay_write_redirect_enter();
+					overlay_overlay_helper_exit();
+					pfree(spiq.data);
+
+					if (in_pure_delta && SPI_tuptable != NULL && SPI_processed >= 1)
 					{
-						MemoryContext oldmcq;
-						oldmcq = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-						if (nretslots >= nretslots_alloc)
+						char	   *op_txt;
+						char	   *oldver_txt;
+						char	   *td_hex;
+						int			hexlen;
+						int			i;
+
+						/* FIX-H1: use SPI_getvalue (not SPI_getbinval) for
+						 * all columns.  For op/old_version (TEXT) this is
+						 * the only correct path; for tuple_data (BYTEA)
+						 * SPI returns it as hex-encoded TEXT string, we
+						 * run manual hex_decode below instead of
+						 * SPI_getbinval which would misinterpret the
+						 * server-side wire-format bytea header. */
+						op_txt = SPI_getvalue(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1);
+						oldver_txt = SPI_getvalue(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 2);
+						td_hex = SPI_getvalue(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 3);
+
+						if (op_txt != NULL && td_hex != NULL &&
+							(strcmp(op_txt, "I") == 0 || strcmp(op_txt, "U") == 0))
 						{
-							int			newsz = nretslots_alloc == 0 ? 16 : nretslots_alloc * 2;
-							/* CRITICAL: PG repalloc(NULL, size) calls
-							 * GetMemoryChunkContext(NULL) → SIGSEGV
-							 * (mcxt.c:1578).  First allocation MUST be
-							 * palloc; only subsequent resizes use repalloc. */
-							if (retslots == NULL)
-								retslots = palloc(sizeof(TupleTableSlot *) * newsz);
-							else
-								retslots = repalloc(retslots,
-													sizeof(TupleTableSlot *) * newsz);
-							nretslots_alloc = newsz;
+							/* FIX-H3 pure: allocate pure_tuple_bytes in
+							 * LONG-LIVED es_query_cxt (NOT per-tuple
+							 * ExprContext which is ResetExprContext'd at
+							 * loop tail — would poison pointer → 0x7f
+							 * garbage → SIGSEGV during promo=3
+							 * reconstruct). */
+							int			hstart = 0;
+							hexlen = (int) strlen(td_hex);
+							/* FIX-H1-2: PG SPI_getvalue bytea uses \x
+							 * prefix.  Skip leading 2 chars \x so hex
+							 * decode does not misinterpret '\' and 'x'
+							 * as nibbles (produces spurious 0x00 byte
+							 * prefix corrupting convert_from/UTF8). */
+							if (hexlen >= 2 && td_hex[0] == '\\' && td_hex[1] == 'x')
+							{
+								hstart = 2;
+								hexlen -= 2;
+							}
+							if (hexlen % 2 != 0)
+							{
+								elog(WARNING, "overlay_branch Phase I pure tuple_data odd hexlen=%d, truncating", hexlen);
+								hexlen--;
+							}
+							oldmc = MemoryContextSwitchTo(
+								queryDesc->estate->es_query_cxt);
+							pure_tuple_bytes = (bytea *)
+								palloc(VARHDRSZ + (hexlen / 2));
+							SET_VARSIZE(pure_tuple_bytes,
+										VARHDRSZ + (hexlen / 2));
+							MemoryContextSwitchTo(oldmc);
+							oldmc = NULL;
+
+							/* manual hex decode: td_hex[hstart + i*2]
+							 * td_hex[hstart + i*2+1] → one byte VARDATA. */
+							for (i = 0; i < hexlen / 2; i++)
+							{
+								char		c1 = td_hex[hstart + i * 2];
+								char		c2 = td_hex[hstart + i * 2 + 1];
+								unsigned	b = 0;
+								if (c1 >= '0' && c1 <= '9') b = (c1 - '0') << 4;
+								else if (c1 >= 'a' && c1 <= 'f') b = ((c1 - 'a') + 10) << 4;
+								else if (c1 >= 'A' && c1 <= 'F') b = ((c1 - 'A') + 10) << 4;
+								if (c2 >= '0' && c2 <= '9') b |= (c2 - '0');
+								else if (c2 >= 'a' && c2 <= 'f') b |= ((c2 - 'a') + 10);
+								else if (c2 >= 'A' && c2 <= 'F') b |= ((c2 - 'A') + 10);
+								((unsigned char *) VARDATA(pure_tuple_bytes))[i] =
+									(unsigned char) b;
+							}
+
+							pre_image_slot = reconstruct_slot_from_delta(
+								rel, pure_tuple_bytes);
+							old_version = oldver_txt ? pstrdup(oldver_txt) : NULL;
+							promotion = 0; /* pure-only mark; combined with
+											* Phase II below */
+
 						}
+						if (op_txt) pfree(op_txt);
+						if (oldver_txt) pfree(oldver_txt);
+						if (td_hex) pfree(td_hex);
+					}
+					SPI_finish();
+				}
+
+				/* ---------- Phase II: MAIN heap ctid lookup (MAIN-FIRST) --- */
+				if (oc_action != ONCONFLICT_NONE && pk_attno > 0)
+				{
+					StringInfoData spiq2;
+					TupleDesc	reldesc;
+					int			pk_attidx = pk_attno - 1;
+					Oid			pk_type;
+					int			ret3;
+					char	   *pkval_esc;
+					bool		pk_isnull = false;
+					Datum		pkdatum;
+					MemoryContext oldmc;
+
+					reldesc = RelationGetDescr(rel);
+					pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
+
+					/* TTS safe read: direct tts_values access.  UPSERT
+					 * VALUES subplan returns TTSOpsVirtual slots; we
+					 * MUST use tts_values[attidx] / tts_isnull[attidx]
+					 * directly (after ensuring tts_nvalid >= attno)
+					 * instead of slot_getattr / slot_getallattrs which
+					 * would MATERIALIZE the virtual slot and corrupt
+					 * its by-ref contents. */
+					if (TTS_IS_VIRTUAL(slot))
+					{
+						if (slot->tts_nvalid < (AttrNumber) (pk_attidx + 1))
 						{
+							TupleDesc	std = slot->tts_tupleDescriptor;
+							if (std)
+								slot->tts_nvalid = std->natts;
+						}
+						pkdatum = slot->tts_values[pk_attidx];
+						pk_isnull = slot->tts_isnull[pk_attidx];
+					}
+					else
+					{
+						pkdatum = slot_getattr(slot, pk_attno, &pk_isnull);
+					}
+
+					if (pk_isnull)
+					{
+						/* PK cannot be NULL for valid conflict detection.
+						 * If user passes PK=NULL, this is a plain insert.
+						 * promotion remains 0/1 from Phase I. */
+					}
+					else
+					{
+						Oid			pk_out_func;
+						bool		pk_is_varlena;
+						char   *pkval_txt;
+						getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
+						pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
+						pkval_esc = quote_literal_cstr(pkval_txt);
+						pfree(pkval_txt);
+
+						initStringInfo(&spiq2);
+						appendStringInfo(&spiq2,
+							"SELECT ctid FROM %s WHERE (%s) = %s::text::%s LIMIT 1",
+							quote_qualified_identifier(
+								get_namespace_name(RelationGetNamespace(rel)),
+								RelationGetRelationName(rel)),
+							quote_identifier(NameStr(
+								TupleDescAttr(reldesc, pk_attidx)->attname)),
+							pkval_esc,
+							format_type_be(pk_type));
+						pfree(pkval_esc);
+
+						overlay_overlay_helper_enter();
+						overlay_write_redirect_exit();
+						ret3 = ob_spi_one_shot(spiq2.data, true, 0);
+						overlay_write_redirect_enter();
+						overlay_overlay_helper_exit();
+						pfree(spiq2.data);
+
+						if (ret3 == SPI_OK_SELECT && SPI_tuptable != NULL &&
+							SPI_processed >= 1)
+						{
+							char *ctid_txt = SPI_getvalue(SPI_tuptable->vals[0],
+														  SPI_tuptable->tupdesc, 1);
+
+							if (ctid_txt != NULL)
+							{
+								char *s;
+								char *e;
+								/* FIX-H2 ctid sanitize: ctid arrives as
+								 * "(blk,off)" textual form.  Strip only
+								 * leading/trailing whitespace and validate
+								 * parentheses are present — the tid type
+								 * REQUIRES the '(X,Y)' string form.
+								 * FIX-H3 main: allocate long-lived copy in
+								 * es_query_cxt to survive per-tuple
+								 * ExprContext reset at loop tail. */
+								s = ctid_txt;
+								while (*s == ' ' || *s == '\t') s++;
+								e = s + strlen(s);
+								while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+								{
+									int clen = (int) (e - s);
+									oldmc = MemoryContextSwitchTo(
+										queryDesc->estate->es_query_cxt);
+									main_ctid = palloc(clen + 1);
+									memcpy(main_ctid, s, clen);
+									main_ctid[clen] = '\0';
+									MemoryContextSwitchTo(oldmc);
+								}
+								pfree(ctid_txt);
+							}
+						}
+						SPI_finish();
+					}
+				}
+
+				/* ================================================================
+				 * === Promo dispatch (4-way) ===
+				 * ================================================================ */
+				{
+					bool main_hit = (main_ctid != NULL);
+					bool pure_hit = (pre_image_slot != NULL);
+					if (oc_action == ONCONFLICT_NONE)
+					{
+						/* Plain INSERT: always promo=1 */
+						promotion = 1;
+					}
+					else if (!main_hit && !pure_hit)
+					{
+						/* No conflict → promo=1 INSERT (both DO NOTHING /
+						 * DO UPDATE fall through to insert) */
+						promotion = 1;
+					}
+					else if (oc_action == ONCONFLICT_NOTHING)
+					{
+						/* Any conflict + DO NOTHING → promo=0 skip */
+						promotion = 0;
+					}
+					else /* ONCONFLICT_UPDATE + at least one hit */
+					{
+						/* ========== WHERE cond (for DO UPDATE only) ========== */
+						bool where_ok = true;
+						if (oc_where != NULL)
+						{
+							ExprContext *ecx;
+							EState *estate = mt->ps.state;
+							TupleTableSlot *t_where_scan = NULL;
+							bool		main_where_fetched = false;
+							ecx = GetPerTupleExprContext(estate);
+							if (ecx->ecxt_scantuple)
+								ExecClearTuple(ecx->ecxt_scantuple);
+							if (ecx->ecxt_innertuple)
+								ExecClearTuple(ecx->ecxt_innertuple);
+							if (main_hit)
+							{
+								t_where_scan = fetch_tuple_by_ctid(rel, main_ctid);
+								main_where_fetched = true;
+							}
+							else
+							{
+								t_where_scan = pre_image_slot;
+								main_where_fetched = false;
+							}
+							ecx->ecxt_scantuple = t_where_scan;
+							ecx->ecxt_innertuple = slot; /* EXCLUDED */
+							if (ecx->ecxt_scantuple && TTS_IS_VIRTUAL(ecx->ecxt_scantuple))
+							{
+								TupleDesc std = ecx->ecxt_scantuple->tts_tupleDescriptor;
+								if (std && ecx->ecxt_scantuple->tts_nvalid < std->natts)
+									ecx->ecxt_scantuple->tts_nvalid = std->natts;
+							}
+							if (ecx->ecxt_innertuple && TTS_IS_VIRTUAL(ecx->ecxt_innertuple))
+							{
+								TupleDesc itd = ecx->ecxt_innertuple->tts_tupleDescriptor;
+								if (itd && ecx->ecxt_innertuple->tts_nvalid < itd->natts)
+									ecx->ecxt_innertuple->tts_nvalid = itd->natts;
+							}
+							ResetExprContext(ecx);
+							where_ok = ExecQual(oc_where, ecx);
+							ExecClearTuple(ecx->ecxt_scantuple);
+							ExecClearTuple(ecx->ecxt_innertuple);
+							if (main_where_fetched && t_where_scan)
+								ExecDropSingleTupleTableSlot(t_where_scan);
+						}
+						if (!where_ok)
+						{
+							promotion = 0;
+						}
+						else
+						{
+							/* MAIN-first tie-break: both hit → MAIN wins promo=2 */
+							if (main_hit)
+							{
+								promotion = 2;
+							}
+							else
+							{
+								promotion = 3;
+							}
+						}
+					}
+				}
+
+				/* ================================================================
+				 * === ExecProject SET merge (promo=2/3) + delta write ===
+				 * ================================================================ */
+				if (promotion == 2 || promotion == 3)
+				{
+					TupleTableSlot *post_image;
+					EState	   *estate = mt->ps.state;
+					ExprContext *ecx;
+					MemoryContext oldprojctx;
+					bool		proj_switched = false;
+
+					/* ========== Build pre_image (scantuple) ========== */
+					if (promotion == 2)
+					{
+						/* promo=2: MAIN row → fetch by ctid */
+						pre_image_slot = fetch_tuple_by_ctid(rel, main_ctid);
+						if (old_version == NULL)
+							old_version = overlay_tuple_version(rel, pre_image_slot);
+					}
+					else
+					{
+						/* promo=3: pure delta.  If pre_image_slot was NOT
+						 * built (pure_tuple_bytes was NULL due to Phase I
+						 * read failure or op mismatch), fall back to
+						 * INSERT pass: treat same as promo=1 to avoid
+						 * false concurrent-delete conflict on NULL
+						 * old_version.  Per engineering spec "Apply
+						 * logic" invariant. */
+						if (pre_image_slot == NULL)
+						{
+							/* promo=3 but no pure pre-image → treat as fresh INSERT */
+							promotion = 1;
+						}
+					}
+
+					if (promotion == 2 || promotion == 3)
+					{
+						if (tdata != NULL)
+						{
+							pfree(tdata);
+							tdata = NULL;
+						}
+
+						if (oc_proj == NULL || estate == NULL ||
+							pre_image_slot == NULL || TupIsNull(pre_image_slot) ||
+							slot == NULL || TupIsNull(slot))
+						{
+							/* Fallback: no projection info or any critical
+							 * input NULL → bypass ExecProject, directly use
+							 * EXCLUDED slot as post-image (matches "DO
+							 * UPDATE SET = EXCLUDED.*" semantic which is
+							 * the common case).  This also handles the
+							 * pathological edge case where ri_onConflict is
+							 * present but oc_ProjInfo was not built by the
+							 * planner. */
+							post_image = slot;
+						}
+						else
+						{
+							ecx = oc_proj->pi_exprContext;
+							if (ecx == NULL)
+							{
+								elog(ERROR, "overlay_branch: oc_proj pi_exprContext is NULL for UPSERT projection");
+							}
+							oldprojctx = MemoryContextSwitchTo(ecx->ecxt_per_tuple_memory);
+							proj_switched = true;
+							if (ecx->ecxt_scantuple)
+								ExecClearTuple(ecx->ecxt_scantuple);
+							if (ecx->ecxt_innertuple)
+								ExecClearTuple(ecx->ecxt_innertuple);
+							ecx->ecxt_scantuple = pre_image_slot;
+							ecx->ecxt_innertuple  = slot; /* EXCLUDED */
+							if (ecx->ecxt_scantuple && TTS_IS_VIRTUAL(ecx->ecxt_scantuple))
+							{
+								TupleDesc	std = ecx->ecxt_scantuple->tts_tupleDescriptor;
+								if (std && ecx->ecxt_scantuple->tts_nvalid < std->natts)
+									ecx->ecxt_scantuple->tts_nvalid = std->natts;
+							}
+							if (ecx->ecxt_innertuple && TTS_IS_VIRTUAL(ecx->ecxt_innertuple))
+							{
+								TupleDesc	itd = ecx->ecxt_innertuple->tts_tupleDescriptor;
+								if (itd && ecx->ecxt_innertuple->tts_nvalid < itd->natts)
+									ecx->ecxt_innertuple->tts_nvalid = itd->natts;
+							}
+							ResetExprContext(ecx);
+
+							post_image = ExecProject(oc_proj);
+							if (post_image != NULL && !TupIsNull(post_image))
+							{
+								ExecMaterializeSlot(post_image);
+								if (TTS_IS_VIRTUAL(post_image))
+								{
+									TupleDesc	ptd = post_image->tts_tupleDescriptor;
+									if (ptd && post_image->tts_nvalid < ptd->natts)
+										post_image->tts_nvalid = ptd->natts;
+								}
+							}
+
+							ExecClearTuple(ecx->ecxt_scantuple);
+							ExecClearTuple(ecx->ecxt_innertuple);
+						}
+
+						tdata = overlay_serialize_tuple(rel, post_image);
+
+						{
+							MemoryContext oldmc;
+							oldmc = MemoryContextSwitchTo(
+								queryDesc->estate->es_query_cxt);
+							overlay_delta_insert(bid, relid, pk,
+												 DELTA_OP_UPDATE, old_version, tdata);
+							MemoryContextSwitchTo(oldmc);
+						}
+						ninserted++;
+
+						/* RETURNING */
+						if (has_returning)
+						{
+							TupleTableSlot *rslot =
+								ob_project_returning(rri, post_image, slot, rel);
+							if (rslot != NULL && !TupIsNull(rslot))
+							{
+								MemoryContext oldmcq;
+								oldmcq = MemoryContextSwitchTo(
+									queryDesc->estate->es_query_cxt);
+								if (nretslots >= nretslots_alloc)
+								{
+									int newsz = nretslots_alloc == 0 ? 16
+										: nretslots_alloc * 2;
+									if (retslots == NULL)
+										retslots = palloc(sizeof(TupleTableSlot *) * newsz);
+									else
+										retslots = repalloc(retslots,
+													sizeof(TupleTableSlot *) * newsz);
+									nretslots_alloc = newsz;
+								}
+								{
+								TupleTableSlot *cp;
+								TupleDesc	tdesc = rslot->tts_tupleDescriptor;
+								ExecMaterializeSlot(rslot);
+								if (TTS_IS_VIRTUAL(rslot) && rslot->tts_nvalid < tdesc->natts)
+									rslot->tts_nvalid = tdesc->natts;
+								cp = MakeSingleTupleTableSlot(tdesc, &TTSOpsHeapTuple);
+								ExecCopySlot(cp, rslot);
+								ExecMaterializeSlot(cp);
+								retslots[nretslots] = cp;
+							}
+							nretslots++;
+							MemoryContextSwitchTo(oldmcq);
+						}
+					}
+					if (proj_switched)
+						MemoryContextSwitchTo(oldprojctx);
+					}
+
+					if (pre_image_slot != NULL)
+					{
+						ExecDropSingleTupleTableSlot(pre_image_slot);
+						pre_image_slot = NULL;
+					}
+				}
+
+				if (promotion == 1)
+				{
+					/* promo=1: fresh INSERT pass */
+					{
+						MemoryContext oldmc;
+						oldmc = MemoryContextSwitchTo(
+							queryDesc->estate->es_query_cxt);
+						overlay_delta_insert(bid, relid, pk,
+											 DELTA_OP_INSERT, NULL, tdata);
+						MemoryContextSwitchTo(oldmc);
+					}
+					ninserted++;
+
+					if (has_returning)
+					{
+						TupleTableSlot *rslot =
+							ob_project_returning(rri, slot, slot, rel);
+						if (rslot != NULL && !TupIsNull(rslot))
+						{
+							MemoryContext oldmcq;
+							oldmcq = MemoryContextSwitchTo(
+								queryDesc->estate->es_query_cxt);
+							if (nretslots >= nretslots_alloc)
+							{
+								int newsz = nretslots_alloc == 0 ? 16
+									: nretslots_alloc * 2;
+								if (retslots == NULL)
+									retslots = palloc(sizeof(TupleTableSlot *) * newsz);
+								else
+									retslots = repalloc(retslots,
+												sizeof(TupleTableSlot *) * newsz);
+								nretslots_alloc = newsz;
+							}
+							{
 							TupleTableSlot *cp;
 							TupleDesc	tdesc = rslot->tts_tupleDescriptor;
-							cp = MakeSingleTupleTableSlot(tdesc, &TTSOpsVirtual);
-							slot_getallattrs(rslot);
+							ExecMaterializeSlot(rslot);
+							if (TTS_IS_VIRTUAL(rslot) && rslot->tts_nvalid < tdesc->natts)
+								rslot->tts_nvalid = tdesc->natts;
+							cp = MakeSingleTupleTableSlot(tdesc, &TTSOpsHeapTuple);
 							ExecCopySlot(cp, rslot);
 							ExecMaterializeSlot(cp);
 							retslots[nretslots] = cp;
@@ -1017,9 +1971,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						MemoryContextSwitchTo(oldmcq);
 					}
 				}
+			}
+
+				/* promotion == 0 → no-op skip (WHERE false or DO NOTHING hit) */
 
 				pfree(pk);
-				pfree(tdata);
+				if (tdata) pfree(tdata);
+				if (old_version) pfree(old_version);
 				ExecClearTuple(slot);
 			}
 
@@ -1028,6 +1986,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					int			k;
 					for (k = 0; k < nretslots; k++)
 						(*queryDesc->dest->receiveSlot) (retslots[k], queryDesc->dest);
+					for (k = 0; k < nretslots; k++)
+						ExecDropSingleTupleTableSlot(retslots[k]);
 				}
 
 				queryDesc->estate->es_processed = ninserted;

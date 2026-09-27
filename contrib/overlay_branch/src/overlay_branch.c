@@ -565,6 +565,22 @@ overlay_guc_assign_current_branch(const char *newval, void *extra)
 
 	/* Non-empty → use branch. */
 
+	/* FIX-B: Zombie empty-ctx pass-through.
+	 *
+	 * When GUC "" reset runs on a session where CurrentBranchContext was
+	 * never fully populated (bid=0 / name='') but is_active is still TRUE
+	 * (leftover baseline init state), the next non-empty SET would enter
+	 * use_internal() with a stale zombie context.  Guard above at L552
+	 * handles empty newval (exit_branch_cleanup path), but that path only
+	 * fires when is_active && (bid>0 || name[] nonempty).  Here we catch
+	 * the bid=0 / name[0]='' / is_active=true zombie shell and let the
+	 * GUC proceed without ERROR. */
+	if (CurrentBranchContext != NULL &&
+		CurrentBranchContext->is_active &&
+		CurrentBranchContext->branch_id == 0 &&
+		CurrentBranchContext->branch_name[0] == '\0')
+		return;
+
 	/* LAYER-1 (PL/pgSQL abort-restore guard):
 	 *   If CurrentBranchContext EXISTS but is_active == FALSE, we are
 	 *   on a PL/pgSQL subxact-abort GUC RESTORE PATH.  Throttle /

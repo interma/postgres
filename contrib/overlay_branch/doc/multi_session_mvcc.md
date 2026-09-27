@@ -1446,3 +1446,264 @@ overlay_overlay_helper_exit();
 | 4 | D7 PANIC：PL/pgSQL subxact-abort **RESTORE path** 调 assign hook use_internal → SPI inside abort-unwind | DO block 中 UPDATE 触发 throttle kickout（invalidated state），EXCEPTION handler 内 PG 自动恢复被 kickout 掉的 GUC old value → backend PANIC | PL/pgSQL 对 GUC 做 subxact savepoint；subxact abort 时 unwind 阶段即使 exception block 内也会跑 RESTORE（GUC assign hook）。老 assign hook 此时仍然无脑调 use_internal → SPI_connect/plan 在 abort-restore 上下文 → PANIC。 | assign hook non-empty path **LAYER-1 guard**：`if (ctx exists && !ctx->is_active) return immediately`。因为一旦 kickout 已经把 ctx.is_active=false + 清 snapshot ref，RESTORE 路径不需要做任何 use_internal（branch 实际已经 dead）。D7 PANIC 消除 | T5 中期 |
 | 5 | re-enter same snapshot branch **重新 capture** 破坏 freeze 语义 | n1_a_frozen_still_3_not_4 = f：虽然 WARNING xmin=1194（B apply 后新事务 xmin）而非 1189（首次 capture） | 早期设计（D.9.4 重写前）"每次 use_branch snapshot 重新 GetTransactionSnapshot capture 新的"，exit 再 enter 就重新 capture（新事务 xmin），B apply 的 MAIN row 4 在新 snapshot 内自然可见 → 破坏 frozen at t0。根本原因：snapshot 是 "per-session-local ctx-owned" 而不是 "per-branch-id cache-owned"。 | **架构重写** D.9.4：引入全局 TopMC HTAB `ob_snapshot_cache`（bid key）；每个 bid 最多 capture 一次（hash miss 时），hash hit 永远复用同一 frozen 指针，ctx 只做 pin/unpin。freeze 测试 Section N 的 n1_frozen 从 f→t。 | T5 后期（重大根因） |
 
+
+## D.12 B2 Pure Delta UPSERT (ON CONFLICT … DO UPDATE / NOTHING)
+
+### D.12.1 范围与硬约束（MVP）
+
+B2 只通过 `CMD_INSERT`（UPSERT 语法糖 = INSERT ON CONFLICT）路径拦截，**绝对禁止**
+落入 PG 标准的 speculative insertion 路径（会直接写 MAIN heap → drift）。所有 UPSERT
+写入 100% 通过 WR delta path 或显式 ERROR（55000 MVP-out-of-scope）
+
+**3 条不可妥协的约束**：
+1. 冲突检测顺序 = **MAIN heap baseline FIRST, pure delta SECOND**。
+2. 严格 **2-phase**：Phase I pure delta SPI, Phase II MAIN ctid SPI。
+3. WHERE cond + DO NOTHING + DO UPDATE 4 种组合统一通过 **4-way promo dispatch** 表。
+
+### D.12.2 冲突检测 2-phase 流程
+
+**Phase I (pure)**：SPI 查询 `pg_branch_delta` WHERE bid=current AND relid=target AND key=pk，
+取 `op, old_version, tuple_data(bytea)`。
+- `op='I'/'U'` → pure_hit=true；否则 pure_hit=false。
+- BYTEA `SPI_getvalue` 总是返回 `\x` 前缀 hex 串 → **FIX-H1-2** hstart=2 跳过前缀后按 nibble decode，否则首 byte = 0x00 触发 UTF8 NUL ERROR。
+- `pure_tuple_bytes` / `old_version` / reconstructed `pre_image_slot` 必须在 **es_query_cxt**（long-lived query-level）分配 → **FIX-H3** `MemoryContextSwitchTo(es_query_cxt)` before palloc，否则 Phase II/RETURNING 用 ExprContext reset（每 tuple 尾部）会毒化指针。
+
+**Phase II (MAIN)**：SPI `SELECT ctid FROM rel WHERE pk = $1` 拿 MAIN heap 行的
+6-byte TID `(blockno, offsetno)`。拿到 ctid 后：
+- main_hit=true → `fetch_tuple_by_ctid(rel, ctid)` 重建 MAIN 原始 pre_image_slot；
+  `old_version` 再补生成（ctid + xmin composite token）。
+- main_hit=false → promo 退化判断，无 MAIN 冲突但 pure 有冲突走 promo=3。
+- **FIX-H2**：返回的 ctid 字符串要保留 `()` 括号（原始 PostgreSQL tid literal 语法要求），
+  只 trim 两端空白，绝对不能 strip parens（会导致 tid cast ERROR）。
+
+### D.12.3 oc_action 派生规则（PG17 特殊性）
+
+PG17 planner 对 DO NOTHING 不填充 `plan->onConflictAction`（保持 0 = NONE），
+也不构建 `rri->ri_onConflict`；**只能用 `plan->arbiterIndexes` 做主判据**。
+
+| arbiterIndexes | onConflictSet / ri_onConflict.oc_ProjInfo | 派生 oc_action |
+|---|---|---|
+| NIL | any | ONCONFLICT_NONE=0（普通 INSERT，非 UPSERT，完全跳过 promo 走 legacy CMD_INSERT） |
+| NON-NIL | any one NON-NIL → UPDATE projection exists | ONCONFLICT_UPDATE=2（promo 2/3） |
+| NON-NIL | both NIL → no projection | ONCONFLICT_NOTHING=1（promo 0，no-op skip） |
+
+**FIX Q1 root cause**：Case C DO NOTHING 最初用 `plan->onConflictAction==NONE || rri.ri_onConflict==NULL → oc_action=0` 当普通 INSERT，promo 退化 promo=1 fresh INSERT，写了 pk=3 EXCLUDED v=999 delta→APPLY 冲突 ERROR，LIVE 视图覆盖 MAIN id=3→v=999（DRIFT BUG）。改用上表派生后 Case C oc_action=1 promo=0 正确 no-op。
+
+### D.12.4 4-Way Promo Dispatch Table（MAIN×PURE×oc_action×WHERE）
+
+promo 定义：
+- promo=0 → no-op（WHERE-cond false skip / DO NOTHING hit / both no-conflict 不允许 write）
+- promo=1 → fresh INSERT pass（MAIN no-conflict 且 pure no-conflict → delta INSERT op='I'）
+- promo=2 → MAIN-conflict DO UPDATE（main_hit=1, oc_action=2, WHERE=true）
+- promo=3 → pure-conflict DO UPDATE（pure_hit=1, main_hit=0, oc_action=2, WHERE=true，or 双 hit tie-break promo=2 main 优先）
+
+WHERE-cond 求值：若 `oc_where != NULL` 则 `oc_where_exprContext
+→ scantuple=pre_image, innertuple=EXCLUDED`；WHERE=false → 强制 promo=0（即使 main_hit=1 / pure_hit=1）。
+
+### D.12.5 Promo 2/3 SET Projection 执行正确契约
+
+`ExecBuildUpdateProjection` 产出 merged post-image： scantuple=pre_image（MAIN/pure旧值）, innertuple=EXCLUDED（新候选值），ExecProject 输出 post_image = merged SET 后结果。
+
+**SIGSEGV 重大根因 & FIX**：PG17 `executor.h:L382` ExecProject 宏
+**直接 deref `projInfo->pi_exprContext`** 拿 scan/inner tuples 和 econtext 做求值。
+最初代码把 scantuple/innertuple 赋值到了 `GetPerTupleExprContext(estate)`（另一个 ExprContext，完全是不同的对象）。ExecProject 执行时读到的 scan/inner 全是 NULL → NULL pointer deref crash at eval line 1。
+
+正确写法：**`ecx = oc_proj->pi_exprContext`**，scan/inner 赋到 ecx 的对应成员上，然后才调用 `ExecProject(oc_proj)`。
+
+**Lifetime 配套 Fix**：
+1. ExecProject 出的 post_image 是 TTSOpsVirtual 槽，其 by-ref 值被 backing `ecx->ecxt_per_tuple_memory` 持有 → 必须 `ExecMaterializeSlot(post_image)` 拷贝到槽自己的 buffers，防止下一次 ResetExprContext 毒化。
+2. 进入 per-tuple memory 的 `MemoryContextSwitchTo`（proj_switched=true）后，**switchBack 必须延迟到 `overlay_serialize_tuple` + RETURNING block 全部跑完**（write_redirect.c 约 L1618），不能在 ExecProject 结束就立刻切回，否则 serialize/RETURNING 需要用到的 by-ref data 在旧上下文里也会失效。
+
+### D.12.6 BranchScan Q2: pure-origin UPDATE 行在 LIVE VIEW 丢失
+
+Phase I 纯种子 INSERT id=11 op='I' → UPSERT promo=3 写了新 delta op='U'（因为 prom=3 是 UPDATE 语义）。旧 BranchScan Pass2 `if (!emitted && op==INSERT)` emit 只发 op=I pure rows → id=11 被漏掉（S8 8 rows instead of 9）。**FIX**：Pass2 emit condition 扩展为 `op == DELTA_OP_INSERT || op == DELTA_OP_UPDATE`，见 [branch_scan.c:L374-L377](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L374-L377)。
+
+### D.12.7 Apply Q3: pure-origin UPDATE MAIN miss → insert_pass fallback
+
+Apply UPDATE pass 对每个 UPDATE delta：MAIN 查 WHERE pk=key → 正常 main_slot 非空 SET 合并。但 pure-origin UPDATE 对应行 **从未存在于 MAIN**，main_slot=NULL，old_version=NULL（Phase I reconstruct 出来的 old_version 也是 NULL，因为 pure seed 时 MAIN 没行，自然没 ctid/xmin）。
+
+旧代码："main_slot == NULL" 无条件 overlay_guard_ereport_fail "UPDATE pk=[11] MAIN row missing at apply time (concurrent DELETE)" 冲突 ERROR → APPLY 失败。
+
+**FIX**：在 main_slot==NULL 分支里，先判断 `if (dt->old_version == NULL) → pfree(where_clause); apply_relation_insert_pass(rel, dt); return;`，把 pure-origin UPDATE 当作 INSERT 重放到 INSERT pass。见 [branch_lifecycle.c:L2194-L2217](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_lifecycle.c#L2194-L2217)。
+
+### D.12.8 RETURNING: ob_project_returning 返回的 slot 禁止 ExecDrop
+
+`ob_project_returning(ResultRelInfo *rri, …)` 内部：`proj = rri->ri_projectReturning; out = ExecProject(proj); materialize; return out;`。返回的 `out` 是 **`proj->pi_slot`** —— 属于 ProjectionInfo / ModifyTable plan 树**内部持有的缓冲槽**，并非 `MakeSingleTupleTableSlot` 独立分配。
+
+**Signal 6 Abort 根因 & FIX**：错误添加 `ExecDropSingleTupleTableSlot(rslot)` 在 RETURNING block 结尾。PG ResourceOwner 追踪这个 TupleDesc 的 refcount：第一次 Drop 释放 internal slot → rri ProjectionInfo 下次运行用 DANGLING TupleDesc → 第二次 PG 内部 EndPlan 时再次 Drop → Assert `ptr == NULL || nodeTag(ptr) == type`（nodes.h:L171）失败 → `TRAP failed Assert` → Signal 6 Abort backend。顺带引发的 "resource was not closed TupleDesc" WARNING 也是同一 double-free 的早期症状。
+
+**FIX**：删除两处 `ExecDropSingleTupleTableSlot(rslot)`（promo 2/3 一处，promo 1 INSERT 一处）。rslot 的生命周期由 ModifyTable/ResultRelInfo 管理，WR 只需 `ExecCopySlot(cp, rslot) + ExecMaterializeSlot(cp)` 到 es_query_cxt 拥有的 cp 即可。
+
+### D.12.9 B2 RCA 归档表（按发现时间序）
+
+| # | Bug ID | Symptoms / Error Text | Root Cause | Fix |
+|---|---|---|---|---|
+| 1 | SIGSEGV inside ExecProject promo=2 | "server closed connection unexpectedly" + server LOG: G_promo_proj without G_promo_proj_done; signal 11 | scantuple/innertuple assigned to wrong ExprContext (estate GetPerTuple instead of `oc_proj->pi_exprContext`); ExecProject macro dereferences projInfo->pi_exprContext directly → NULL read ptr. | Use `ecx = oc_proj->pi_exprContext`; set scantuple/innertuple ON ecx; `ResetExprContext(ecx)` before ExecProject. Materialize post_image after proj. Delay proj_switch_back after serialize+RETURNING end. |
+| 2 | UTF8 0x00 Case B pure id=11 reconstruct | ERROR: `invalid byte sequence for encoding UTF8: 0x00` during Phase I reconstruct; CONVERT_FROM bytea first byte 0x00 instead of '{'. | `SPI_getvalue` on BYTEA always emits `\x` prefixed hex; old hex-decode loop treated '\'/'x' chars as nibbles (both 0) → first output byte = 0x00 NUL. | `hstart = 0` guard; if `hexlen>=2 AND td_hex[0]=='\\' AND td_hex[1]=='x'` → hstart=2, hexlen-=2 before nibble pair loop. |
+| 3 | Q1 Case C DO NOTHING → INSERT drift | id=3 MAIN baseline v=30 → UPSERT DO NOTHING id=3,v=999 incorrectly writes delta; LIVE VIEW shows id=3 v=999; APPLY later "pk already present" conflict ERROR. | PG17 DO NOTHING plan shape: onConflictAction=0 (NONE), ri_onConflict=NULL. Old code used these NULLs=oc_action=0 NONE → plain INSERT promo=1 fallback. | Derive oc_action **PRIMARILY from plan->arbiterIndexes** (ON CONFLICT present) + plan->onConflictSet NIL/NON-NIL (NOTHING vs UPDATE). ri_onConflict ProjInfo only as secondary tie-break. DO NOTHING now oc_action=1 promo=0 no-op correctly. |
+| 4 | Q2 LIVE VIEW id=11 missing S8_count=8 vs 9 expected | promo=3 pure UPDATE id=11→v=101 delta written op=U; BranchScan Pass1 never emits because MAIN id=11 no row → no loop; Pass2 only emits op==I → id=11 silently drops. | Pass2 filter too narrow: pure UPDATE rows (op=U) not emitted; only op=I. | Pass2 condition widened to `(!dt->emitted && (op == INSERT || op == UPDATE))` at [branch_scan.c:L374-L377](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L374-L377). |
+| 5 | Q3 APPLY pure UPDATE conflict ERROR | apply br7: ERROR UPDATE pk=["11"] "MAIN row missing at apply time (concurrent DELETE)" at branch_lifecycle UPDATE pass MAIN miss path. | pure-origin UPDATE has old_version=NULL (never existed on MAIN); old code unconditionally reports missing row as concurrent DELETE conflict ERROR, even though correct semantics is INSERT this row. | Before conflict ERROR guard, check `dt->old_version == NULL` branch → `apply_relation_insert_pass()` fallback + return. Main miss only errors for real MAIN-origin UPDATEs (old_version non-NULL → actual MAIN row expected). |
+| 6 | Signal 6 Abort: Assert nodeTag nodes.h:L171 | After WR_enter → G_promo_delta insert ok, RETURNING block begins → TRAP failed Assert("ptr == NULL || nodeTag(ptr) == type"); server LOG signal 6 not 11. | `ExecDropSingleTupleTableSlot(rslot)` WRONG double-free. rslot = `proj->pi_slot` (internally owned by ResultRelInfo projection), never allocated via MakeSingleTupleTableSlot. First Drop → ResourceOwner decref; PG EndPlan drops same slot second time → Assert nodeTag over garbage bytes (freed memory page = nodeTag junk). | Delete both `ExecDropSingleTupleTableSlot(rslot)` from promo 2/3 RETURNING block and promo=1 INSERT RETURNING block. Resource ownership of rslot stays with plan tree; WR owner only owns cp (copy made in es_query_cxt). |
+
+
+
+### D.13 Pure-Delta UPDATE/DELETE MAIN-miss (B1 MVP)
+
+**Scope:** MVP supports only PK-based heap tables with an explicit `WHERE`
+qualifier on the DML statement.  `UPDATE t SET …` or `DELETE FROM t`
+without a WHERE clause (full-table DML) is intentionally **skipped**
+for pure-delta rows (MVP guard at [write_redirect.c:L996](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/write_redirect.c#L996)).
+
+#### D.13.1 Problem statement
+
+Without this patch, branch-INSERTed rows cannot be modified via plain
+`UPDATE … WHERE pk = …` or `DELETE … WHERE pk = …` when the plan's
+outer scan node only walks the MAIN heap (standard `SeqScan` /
+`IndexScan` / `BitmapHeapScan`, **not** a `BranchScan`).  The planner
+hook intentionally only injects `BranchScan` into `CMD_SELECT`
+commandType plans, so UPDATE/DELETE statements lose sight of
+pure-delta rows → the SQL statement returns `UPDATE 0` / `DELETE 0`
+even though the live overlay contains the PK.
+
+This MVP closes the gap with a **post-hoc WR loop** that runs *after*
+the normal ModifyTable node finishes handling MAIN-hit rows.  The
+design deliberately avoids rewriting planner paths for non-SELECT
+commandType; the trade-off is one extra SPI lookup per DML statement
+(limited to the pure-delta row key space).
+
+#### D.13.2 Overall flow (6 phases)
+
+```
+ ExecutorRun intercept (CMD_UPDATE / CMD_DELETE)
+ ├─ Phase 1. ExecProcNode(subplan) loop — MAIN-hit write path
+ │    └─ returns slot WITH ctid → fetch_tuple_by_ctid → SET-merge
+ │       → overlay_delta_insert(old_version != NULL) → ndone++
+ ├─ Phase 2. SPI SELECT key, tuple_data, old_version        [PURE-DELTA KEY SPACE]
+ │    └─ FROM pg_branch_delta WHERE bid=? AND relid=? AND op IN ('I','U')
+ │       * op='U' is included because delta_store uses UPSERT on
+ │         (branch_id,relid,key): the first pure-delta UPDATE will
+ │         overwrite the INSERT row's op from 'I'→'U' in place, so
+ │         a subsequent UPDATE would otherwise never see the key.
+ ├─ Phase 3. Build raw_rows[] in es_query_cxt (long-lived)
+ ├─ Phase 4. Build cand_inserts[] = pure-delta-only slots
+ │    ├─ (a) Filter: skip rows with non-NULL old_version
+ │    │     → these originate from MAIN baseline U&H writes, they
+ │    │        were already handled in Phase 1.  Prevents double-write.
+ │    ├─ (b) PK de-duplication: seen List, O(n²) strcmp, n ≤ ~1e3.
+ │    └─ (c) overlay_delta_lookup → reconstruct from LIVE
+ │         folded tuple_data (NOT stale SPI copy).
+ ├─ Phase 5. Per-candidate ExecQual on qual_scan ∪ qual_extra
+ │    ├─ scan_ps descent: stop at baserel node (Seq/Index/BitmapHeap).
+ │    ├─ TTS_IS_VIRTUAL: tts_nvalid = natts (promote to fully-valid
+ │    │   direct-read; NEVER call slot_getattr / getsomeattrs on
+ │    │   TTSOpsVirtual — see project hard-constraint §0).
+ │    ├─ MVP guard: (qual_scan || qual_extra) must be true — no
+ │    │   full-table DML on pure-deltas (avoid tombstone injection).
+ │    └─ passes = qual_scan & qual_extra.
+ └─ Phase 6. Per-passing-slot write path
+      ├─ CMD_DELETE: overlay_serialize_pk → DELTA_OP_DELETE insert
+      │            (old_version = NULL → pure-delta origin)
+      └─ CMD_UPDATE:
+           ├─ 6a. ExecProject on subplan→ps_ProjInfo to compute SET
+           │   expressions (junk ctid / attnum≤0 columns are SKIPPED
+           │   in datum copy — CMD_UPDATE Fallback hard rule).
+           ├─ 6b. post_image = TTSOpsHeapTuple physical slot.
+           │   Baseline datumCopy from the promoted candidate slot.
+           ├─ 6c. name-based SET merge: walk reldesc × junkdesc attname
+           │   → match → datumCopy onto post_image tts_values.
+           ├─ 6d. heap_form_tuple(reldesc, post_image values/nulls)
+           │   + ExecStoreHeapTuple → SERIALIZE bytea (keeps the
+           │   physical TTSOpsHeapTuple contract; no ExecCopySlot
+           │   across virtual/physical boundary).
+           └─ 6e. overlay_delta_insert(DELTA_OP_UPDATE, old_version=NULL, tdata)
+                → RETURNING project → ndone++
+```
+
+#### D.13.3 Multi-op folding: READ-side vs WRITE-side
+
+Two independent mechanisms converge on the same "latest folded state"
+semantics for a given PK chain (INSERT → UPDATE → UPDATE → …):
+
+| Mechanism | Where | Data shape | Output |
+|---|---|---|---|
+| **BranchScan Pass2 fold** (READ) | [branch_scan.c:L365-L477](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L365-L477) | `List *delta_list` from delta_fetch for this relid | For each non-emitted key with `op ∈ {I,U}` → reconstruct & emit one slot (Pass1 MAIN-hit emitted rows are skipped via `dt->emitted`) |
+| **overlay_delta_lookup fold** (WRITE) | [delta_store.c:overlay_delta_lookup]() | SPI cursor over UNION of (delta+PushLatestSnapshot writes in same txn) | **Single DeltaTuple** with per-PK *latest* op + tuple_data (UPSERT-style "last write wins") |
+
+Invariant: for any PK that is NOT present in MAIN baseline the two
+mechanisms MUST agree on the final `(op, tuple_data)` pair.  This is
+the contract that lets the **live SELECT overlay** and the **post-hoc
+WR UPDATE/DELETE** both see the same row value before mutating.
+
+#### D.13.4 R-MULTIOP-1 Bug — "UPDATE 0 on second chained write"
+
+**Classification** (see RCA §D.12.9 style table below for formal entry):
+The delta store uses `INSERT … ON CONFLICT (branch_id, relid, key) DO
+UPDATE` for every write.  The first pure-delta UPDATE on PK=X overwrites
+the INSERT row's `op` column from `'I'` → `'U'` **in-place**.  The old
+Skeleton SPI query used `WHERE op = 'I'` to enumerate the pure-delta
+key space.  Result: the 2nd UPDATE never saw PK=X in raw_rows →
+cand_inserts empty → `UPDATE 0`.
+
+**Fix dimensions** (applied together; partial fixes were tried and
+rejected per §0):
+
+1. **SPI query expansion** — `WHERE op IN ('I','U')` plus the new
+   `old_version` column projection.
+2. **MAIN-hit / pure-delta disambiguation** — The `old_version`
+   column is the sentinel:
+   - `old_version IS NULL` → row origin = pure-delta INSERT → Phase 6
+     must handle it.
+   - `old_version IS NOT NULL` → row origin = MAIN baseline UPDATE
+     (Phase 1 already processed; SKIP to prevent double-write — see
+     S7-2 U→U scenario).
+3. **Live data source** — The candidate slot is reconstructed from
+   `dtu.tuple_data` returned by `overlay_delta_lookup`, **NOT** from
+   the stale `r->t bytea` pulled by the SPI SELECT.  The SPI query is
+   now only used to enumerate the **PK key universe**; the value is
+   always supplied by the canonical folding routine.
+4. **PK de-duplication** — The op-inclusion expansion means one PK
+   can appear multiple times across op='I' / op='U' rows if the delta
+   store ever splits writes (currently it is UPSERT so duplicates
+   cannot occur, but the de-dupe guard is retained as defense in
+   depth against future storage-layer changes).
+
+#### D.13.5 Apply & Discard Consistency
+
+The `old_version = NULL` marker written in Phase 6 is the **same
+sentinel** that the apply 3-pass optimistic merger uses in
+branch_lifecycle.c (see §D.12.9 / #5 "Q3 APPLY pure UPDATE conflict
+ERROR").  Because Phase 4 (cand_inserts) + Phase 6e (write) both use
+`old_version = NULL` for every pure-delta origin mutation, the UPDATE
+pass in `apply_branch` will correctly route the row through the
+`insert_pass` fallback when the MAIN baseline still has no row at
+apply time.  This is the property that validates scenario P10 in the
+L3 regression.
+
+`discard_branch` physically deletes all rows in `pg_branch_delta` for
+the discarded branch_id (regardless of op / old_version).  No WR-side
+invalidation is required because `overlay_branch_get_current_id()`
+returns the new MAIN id after discard → subsequent lookups naturally
+find zero pure-delta rows.
+
+#### D.13.6 TTS Safe-Copy Pattern
+
+Throughout Phase 5 + Phase 6 the following **NO-MIX** rules apply
+(enforced by code structure, no runtime assertion exists because PG
+core catches it with hard TRAPs):
+
+| Action | TTSOpsHeapTuple target | TTSOpsVirtual target |
+|---|---|---|
+| `ExecStoreHeapTuple` | ✅ allowed, canonical physicalize | ❌ SIGSEGV / Assert mismatch |
+| `ExecStoreVirtualTuple` | ❌ TTS_EMPTY trap later (see §0 B2 case A/G) | ✅ for plan output only |
+| `ExecCopySlot` across diff ops | ❌ src virtual triggers slot_getallattrs ERROR | ❌ same |
+| **direct `tts_values[k] = datumCopy(d)` then `heap_form_tuple + ExecStoreHeapTuple`** | ✅ RECOMMENDED canonical pattern used in Phase 6b/6c/6d | N/A — physicalize first |
+
+#### D.13.7 BUG RCA Table — Pure-Delta Phase
+
+| # | Bug ID | Symptoms | Root Cause | Fix |
+|---|---|---|---|---|
+| 1 | PDR SIGSEGV v1 (CMD_UPDATE) | Crash inside `ExecBuildProjectionInfo + ExecProject` for pure-delta UPDATE | Custom-built ProjectionInfo used wrong inputDesc / ExprContext (owned by plan, not WR caller stack) | Reuse `subplan->ps_ProjInfo` + reset its ExprContext ecxt_scantuple/outertuple per row. |
+| 2 | PDR TTS_EMPTY Assert v4 | TRAP `TTS_EMPTY(slot)` ExecForceStoreHeapTuple after ExecCopySlot(set_plan_slot, proj_slot) | Mixing TTSOpsHeapTuple target + ExecStoreVirtualTuple via ExecCopySlot internal path creates an inconsistent slot state | Project → **direct datumCopy into set_plan_slot tts_values[k]** (no ExecCopySlot anywhere).  Physicalize via `heap_form_tuple + ExecStoreHeapTuple` exclusively. |
+| 3 | PDR HTAB entrysize trap | Signal 6 `Assert("entrysize >= keysize") dynahash.c:L363` on first pure-delta UPDATE with S5 keyspace | PK dedup HTAB created with `entrysize = sizeof(char*) = 8 < keysize = NAMEDATALEN = 64`; PG dynahash requires entrysize ≥ keysize for HASH_STRINGS | Replace HTAB with O(n²) `List *seen` + `strcmp` (n ≤ 1e3 rows for WR pure-delta MVP, perf is irrelevant). |
+| 4 | **R-MULTIOP-1 — S5 UPDATE 0** | UPDATE id=15 WHERE id=pk → UPDATE 0 on second chained write (I→U→U); value stuck at 1st UPDATE result | 3-part cause: (a) SPI WHERE op='I' misses the key after UPSERT changes op→U in-place; (b) `dtu.op == DELTA_OP_INSERT` filter skips folded op=U entries; (c) reconstruct uses stale `r->t` INSERT-era bytea even if (a)+(b) pass. | (a) SPI op IN ('I','U') + project `old_version`; (b) filter `r->ov == NULL` (main-origin vs pure-delta disambiguation — also fixes S7-2 double-write); (c) slot built from `dtu.tuple_data` post-live-fold. |
+| 5 | S7-2 MAIN baseline double-write | UPDATE id=2 twice → `UPDATE 2` (spurious extra row touched); apply_branch later conflict ERROR on id=2 old_version mismatch / MAIN latest double-token | SPI WHERE op IN ('I','U') from fix 4a picked up Phase-1-written op=U rows (MAIN baseline origin old_version≠NULL).  These got added to cand_inserts → Phase 6 ran on a row that Phase 1 already processed. | Added fix 4b: `if (r->ov != NULL) continue;` before PK-dedup + lookup loop.  Phase 1 (MAIN-hit) owns every row with a real old_version. |
