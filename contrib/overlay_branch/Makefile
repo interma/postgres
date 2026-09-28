@@ -23,7 +23,18 @@ override CPPFLAGS += -I$(srcdir)/include
 #   test/isolation/isolation_schedule
 #   test/bench/                   L2 pgbench manual race-detection fixture
 # Temp instance shared-libs conf lives at root level (shared by both harnesses).
-REGRESS = overlay_branch_basic overlay_branch_user overlay_branch_advanced overlay_branch_mvcc overlay_branch_puredelta
+REGRESS = \
+  overlay_branch_basic \
+  overlay_branch_user \
+  overlay_branch_scan_pk \
+  overlay_branch_scan_type \
+  overlay_branch_puredelta_mix \
+  overlay_branch_upsert \
+  overlay_branch_puredelta \
+  overlay_branch_mvcc_usage \
+  overlay_branch_mvcc_bounds \
+  overlay_branch_mvcc_review \
+  overlay_branch_rentry
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \

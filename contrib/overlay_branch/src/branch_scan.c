@@ -287,6 +287,236 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
          * case: delta INSERT-only result set still needs correct cxt). */
         oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
+        /* ================================================================
+         * REVIEW-260926 / R11 R12 —  O(N × M) → O(M log M + N log M) merge
+         * ================================================================
+         * Hot loop in Pass1 used to be:
+         *     foreach MAIN i  { serialize pk;  foreach(dt in delta_list) strcmp; }
+         * which is exactly O(N × M) comparisons (N = #MAIN rows, M = #delta rows).
+         * Under realistic workloads N≈1e5 rows × M≈50k deltas = 5e9 string
+         * comparisons which stalls the executor for minutes.
+         *
+         * Fix: sort delta_list pointers by dt->key (C string strcmp order),
+         * collapse to unique keys keeping the LATEST entry (fixes the
+         * latent I→U first-match semantic bug from the O(N×M) scan), then
+         * use bsearch per MAIN row:
+         *   Phase A (copy+sort):          O(M log M)
+         *   Phase B (unique latest-wins): O(M + K²)  K = max same-key run.
+         *                                  For real-world K ∈ 1..3 this is
+         *                                  effectively O(M).  We intentionally
+         *                                  do NOT rely on qsort stability.
+         *   Pass1 (MAIN merge):           O(N log M_unique)
+         *
+         * Pass2 also used to use an HTAB keyed by `const char *` +
+         * HASH_BLOBS.  That produced WRONG fold behaviour because
+         * HASH_BLOBS keysize=sizeof(pointer) hashes the ADDRESS of the
+         * key string, not its CONTENTS.  Two different allocations for
+         * the same logical key would land in different buckets and the
+         * dedup silently failed (multi-op pure-I/U chains emitted
+         * duplicate rows).  Pass2 is therefore also rewritten as two
+         * pure linear walks (no hash table) over delta_list, with
+         * explicit per-key latest-wins bookkeeping; complexity O(M²)
+         * worst-case for pathological all-keys-equal input, in practice
+         * 1-to-few per-key → O(M).
+         *
+         * Latest-wins tie-break for same-key multi-op (Pass1 + Pass2):
+         *   I→U  → keep U   (Pass1 MAIN merge uses U.tuple_data; Pass2
+         *                    pure path reconstructs U, fixes latent I bug).
+         *   U→U  → keep last U.
+         *   U→D  → keep D   (Pass1 MAIN tombstone; Pass2 drops key).
+         *   I→U→D→I (reborn) → keep the final I.
+         * The "original delta_list order" (= append chronological by
+         * construction inside delta_store.c list_for_rel) is the ground
+         * truth for "latest": higher list-index = later. */
+        {
+            /* ---- SORT / BSEARCH PASS1 HELPERS ---- */
+            int            M_total = list_length(delta_list);
+            DeltaTuple   **arr = NULL;
+            int            i_arr;
+            ListCell      *lc;
+            /* qsort comparator: DeltaTuple** vs DeltaTuple**.
+             * Prefer overlay_typed_pk_cmp when BOTH sides have non-NULL
+             * typed_pk (R14: preserves PG native type semantics for
+             * BPCHAR / NUMERIC / TIMESTAMPTZ etc.); fall back to legacy
+             * strcmp(dt->key) whenever either side lacks a typed key so
+             * the comparator is a total order regardless of populate
+             * state.  NULL keys (shouldn't happen; defensive) sort to
+             * the end. */
+            int cmp_dtp_by_cstr(const void *a, const void *b)
+            {
+                DeltaTuple *const *da = (DeltaTuple *const *) a;
+                DeltaTuple *const *db = (DeltaTuple *const *) b;
+                DeltaTuple *dta = (da) ? *da : NULL;
+                DeltaTuple *dtb = (db) ? *db : NULL;
+                const char *ka = (dta) ? dta->key : NULL;
+                const char *kb = (dtb) ? dtb->key : NULL;
+                if (ka == NULL && kb == NULL) return 0;
+                if (ka == NULL) return +1;
+                if (kb == NULL) return -1;
+                if (dta != NULL && dtb != NULL &&
+                    dta->typed_pk_n > 0 && dtb->typed_pk_n > 0 &&
+                    dta->typed_pk != NULL && dtb->typed_pk != NULL)
+                    return overlay_typed_pk_cmp(dta->typed_pk, dta->typed_pk_n,
+                                                dtb->typed_pk, dtb->typed_pk_n);
+                return strcmp(ka, kb);
+            }
+            /* Search key bundle: carries BOTH the typed pk (preferred)
+             * and legacy text pk (fallback) for a single MAIN row.  Used
+             * as the bsearch "key" pointer so the fixed-signature
+             * comparator receives everything it needs without any
+             * per-call global state. */
+            typedef struct SearchKeyBundle
+            {
+                TypedKey   *typed_pk;      /* NULL if MAIN-side build failed */
+                int         typed_n;       /* columns in typed_pk, 0 if invalid */
+                const char *text_key;      /* serialised JSON text (non-NULL) */
+            } SearchKeyBundle;
+            /* bsearch comparator: const SearchKeyBundle* (search key) vs
+             * DeltaTuple** (array element).  Typed comparison is used
+             * whenever BOTH sides carry a populated typed pk; otherwise
+             * falls back to strcmp on the legacy text key.  NULL safety
+             * everywhere because comparator is used with qsort/bsearch
+             * from libc (we cannot guarantee non-NULL pointers on all
+             * paths for all libc implementations). */
+            int cmp_searchkey_vs_dtp(const void *vkey, const void *velem)
+            {
+                const SearchKeyBundle *skb = (const SearchKeyBundle *) vkey;
+                DeltaTuple *const *pdt = (DeltaTuple *const *) velem;
+                DeltaTuple       *dt  = (pdt) ? *pdt : NULL;
+                const char       *ka;
+                const char       *kd;
+                if (skb == NULL && dt == NULL) return 0;
+                if (skb == NULL) return +1;
+                if (dt == NULL) return -1;
+                if (skb->typed_pk != NULL && skb->typed_n > 0 &&
+                    dt->typed_pk != NULL && dt->typed_pk_n > 0)
+                    return overlay_typed_pk_cmp(skb->typed_pk, skb->typed_n,
+                                                dt->typed_pk, dt->typed_pk_n);
+                ka = skb->text_key;
+                kd = dt->key;
+                if (ka == NULL && kd == NULL) return 0;
+                if (ka == NULL) return +1;
+                if (kd == NULL) return -1;
+                return strcmp(ka, kd);
+            }
+
+            if (M_total > 0)
+            {
+                arr = (DeltaTuple **) palloc(sizeof(DeltaTuple*) * (M_total + 1));
+                i_arr = 0;
+                foreach(lc, delta_list)
+                {
+                    arr[i_arr++] = (DeltaTuple *) lfirst(lc);
+                }
+                /* ---- PRE-FLIGHT: lazy-populate typed_pk for every dt
+                 * in the working array whose typed_pk_n is still -1.
+                 * We do this ONCE here (before qsort) instead of
+                 * repeatedly inside the comparators / post-sort /
+                 * Pass2, because the helper needs Relation `rel`
+                 * (available in this helper scope) and may internally
+                 * invoke SPI (cheap amortised once per dt → O(M) vs
+                 * O(M log M) × N bsearch lookups if done per compare).
+                 * Build failures (no PK / relation changed) are left
+                 * as typed_pk_n==-1 → every comparator above falls
+                 * back to legacy strcmp gracefully. */
+                {
+                    int pfi;
+                    for (pfi = 0; pfi < M_total; pfi++)
+                    {
+                        DeltaTuple *dtp = arr[pfi];
+                        if (dtp != NULL && dtp->typed_pk_n < 0 && dtp->key != NULL)
+                        {
+                            int       nout = 0;
+                            TypedKey *out  = NULL;
+                            out = overlay_build_typed_pk_from_key_text(rel, dtp->key, &nout);
+                            if (out != NULL && nout > 0)
+                            {
+                                dtp->typed_pk   = out;
+                                dtp->typed_pk_n = nout;
+                            }
+                            else
+                            {
+                                dtp->typed_pk   = NULL;
+                                dtp->typed_pk_n = 0;
+                            }
+                        }
+                    }
+                }
+                qsort(arr, M_total, sizeof(DeltaTuple*), cmp_dtp_by_cstr);
+
+                /* ---- POST-SORT LATEST-WINS DEDUP (per key) ----
+                 * Runs of identical keys are contiguous after qsort.  For
+                 * each run we pick the entry with the HIGHEST original
+                 * position in delta_list (highest pos = latest by
+                 * chronological append → correct semantic regardless of
+                 * whether qsort was stable).
+                 *
+                 * R14: key-equality test uses overlay_typed_pk_cmp when
+                 * BOTH sides carry a typed pk; otherwise falls back to
+                 * strcmp on the legacy text key.  This fixes BPCHAR
+                 * r-trim / NUMERIC precision / TIMESTAMPTZ runs where
+                 * qsort had already clustered the semantically equal
+                 * entries but strcmp would slice a run in two. */
+                {
+                    int w = 0;
+                    int r = 0;
+                    while (r < M_total)
+                    {
+                        int         rr = r + 1;
+                        DeltaTuple *dtr = arr[r];
+                        while (rr < M_total)
+                        {
+                            DeltaTuple *dtrr = arr[rr];
+                            bool        eq;
+                            if (dtr == NULL || dtrr == NULL)
+                            {
+                                if (dtr == NULL && dtrr == NULL) eq = true;
+                                else                              eq = false;
+                            }
+                            else if (dtr->typed_pk_n > 0 && dtrr->typed_pk_n > 0 &&
+                                     dtr->typed_pk != NULL && dtrr->typed_pk != NULL)
+                            {
+                                eq = (0 == overlay_typed_pk_cmp(dtr->typed_pk, dtr->typed_pk_n,
+                                                                dtrr->typed_pk, dtrr->typed_pk_n));
+                            }
+                            else if (dtr->key == NULL || dtrr->key == NULL)
+                            {
+                                eq = (dtr->key == dtrr->key);
+                            }
+                            else
+                            {
+                                eq = (0 == strcmp(dtr->key, dtrr->key));
+                            }
+                            if (!eq) break;
+                            rr++;
+                        }
+                        /* Scan run arr[r..rr-1] → find one with max original pos. */
+                        {
+                            int     best_in_run = r;
+                            int64   best_pos    = -1;
+                            int     j;
+                            for (j = r; j < rr; j++)
+                            {
+                                ListCell   *lc2;
+                                int         idx = 0;
+                                foreach(lc2, delta_list)
+                                {
+                                    if (((DeltaTuple*) lfirst(lc2)) == arr[j])
+                                        break;
+                                    idx++;
+                                }
+                                /* idx==M_total if not found (impossible;
+                                 * we built arr from delta_list). */
+                                if (idx > best_pos) { best_pos = idx; best_in_run = j; }
+                            }
+                            arr[w++] = arr[best_in_run];
+                        }
+                        r = rr;
+                    }
+                    M_total = w;   /* shrunk: M_unique ≤ M_total */
+                }
+            }
+
         /* Pass 1: MAIN baseline rows, merged with delta side-effects. */
         for (uint64 i = 0; i < n; i++)
         {
@@ -295,12 +525,16 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
             TupleTableSlot  *output_slot;
             char           *pk_key;
             DeltaTuple     *match = NULL;
-            ListCell       *lc;
             TupleDesc       slot_desc;
+            TypedKey       *main_typed_pk;
+            int             main_typed_n;
+            SearchKeyBundle skb;
 
             slot_desc = CreateTupleDescCopy(reldesc);
             main_slot = MakeSingleTupleTableSlot(slot_desc, &TTSOpsVirtual);
             ExecClearTuple(main_slot);
+            main_typed_pk = NULL;
+            main_typed_n  = 0;
 
             for (int a = 0; a < natts; a++)
             {
@@ -323,16 +557,20 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
             main_slot->tts_nvalid = natts;
 
             pk_key = overlay_serialize_pk(rel, main_slot);
+            main_typed_pk = overlay_build_typed_pk_from_slot(rel, main_slot,
+                                                              &main_typed_n);
 
             match = NULL;
-            foreach(lc, delta_list)
+            if (pk_key != NULL && arr != NULL && M_total > 0)
             {
-                DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-                if (dt->key != NULL && pk_key != NULL && strcmp(dt->key, pk_key) == 0)
-                {
-                    match = dt;
-                    break;
-                }
+                DeltaTuple  **found;
+                skb.typed_pk = main_typed_pk;
+                skb.typed_n  = main_typed_n;
+                skb.text_key = pk_key;
+                found = (DeltaTuple **) bsearch(&skb, arr, M_total,
+                                                sizeof(DeltaTuple*),
+                                                cmp_searchkey_vs_dtp);
+                if (found != NULL) match = *found;
             }
 
             if (match == NULL)
@@ -356,11 +594,24 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
                 ExecDropSingleTupleTableSlot(main_slot);
                 match->emitted = true;
             }
+            if (main_typed_pk != NULL && main_typed_n > 0)
+            {
+                int            tpk_i;
+                for (tpk_i = 0; tpk_i < main_typed_n; tpk_i++)
+                {
+                    TypedKey *mtk = &main_typed_pk[tpk_i];
+                    if (!mtk->isnull && !mtk->typbyval && mtk->value != (Datum) 0)
+                        pfree(DatumGetPointer(mtk->value));
+                }
+                pfree(main_typed_pk);
+            }
             pfree(pk_key);
 
             if (output_slot != NULL)
                 result_slots = lappend(result_slots, output_slot);
         }
+            if (arr != NULL) pfree(arr);
+        }   /* end sort+bsearch + latest-wins Pass1 merge block */
 
         /* Pass 2: pure delta INSERTs (rows created inside the branch
          * that have no MAIN baseline counterpart).  MUST run even when
@@ -379,19 +630,16 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
          *   - Otherwise                        → use the LAST delta that
          *     is not DELETE (either INSERT or UPDATE — reconstruct its
          *     tuple_data as the final post-image).
-         * Algorithm: two-phase walk.
-         *   Phase 2a (scan backwards): for each un-emitted key, locate
-         *     the latest non-DELETE delta and record its index.  If the
-         *     latest delta is DELETE, mark the key as dead (final_idx=-1).
-         *   Phase 2b (walk forwards): reconstruct only entries whose
-         *     index equals final_idx for their key (emits 1 row per
-         *     surviving key in original delta order). */
+         *
+         * Implementation (pure linear walks, NO hash tables — avoids
+         * the earlier "hash on pointer-address" semantic bug):
+         *   Phase 2a (forward scan): build parallel int[] final_idx of
+         *     length ndelta.  For each un-emitted key find the LATEST
+         *     (highest index ≥ i) delta entry that shares its key.
+         *     Mark all lower duplicates final_idx[i] = -1.
+         *   Phase 2b (forward scan): for i with final_idx[i] == i:
+         *     op == I||U → reconstruct; op == D → total skip. */
         {
-            struct p2map_ent_ { const char *key; int final_idx; };
-            HASHCTL      hctl;
-            HTAB        *final_map;
-            HASH_SEQ_STATUS hseq;
-            struct p2map_ent_ *ent;
             bool        *emit_flags;
             int          i, ndelta;
             ListCell    *lc;
@@ -400,64 +648,83 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
             if (ndelta == 0) goto pass2_done;
             emit_flags = (bool*) palloc0(sizeof(bool) * ndelta);
 
-            memset(&hctl, 0, sizeof(hctl));
-            hctl.keysize = sizeof(const char *);
-            hctl.entrysize = sizeof(struct p2map_ent_);
-            hctl.hcxt = CurrentMemoryContext;
-            final_map = hash_create("Pass2 fold map", ndelta, &hctl,
-                                    HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-            /* Phase 2a backwards: locate final effective delta per un-emitted key. */
-            for (i = ndelta - 1; i >= 0; i--)
+            /* Phase 2a: for each delta entry, decide whether we are the
+             * latest for our key. */
             {
-                DeltaTuple *dt = (DeltaTuple *) list_nth(delta_list, i);
-                struct p2map_ent_ *m_ent;
-                bool found;
-                if (dt->emitted) continue;
-                if (dt->key == NULL) continue;
-                m_ent = (struct p2map_ent_ *)
-                    hash_search(final_map, &dt->key, HASH_ENTER, &found);
-                if (!found)
+                int    *final_idx_latest;
+                int     cur;
+                final_idx_latest = (int *) palloc0(sizeof(int) * ndelta);
+                for (i = 0; i < ndelta; i++) final_idx_latest[i] = -1;
+
+                cur = 0;
+                foreach(lc, delta_list)
                 {
-                    m_ent->key = dt->key;
-                    if (dt->op == DELTA_OP_DELETE)
-                        m_ent->final_idx = -1;
-                    else
-                        m_ent->final_idx = i;
+                    DeltaTuple *dt_i = (DeltaTuple *) lfirst(lc);
+                    int         latest_j = cur;   /* assume self=latest */
+                    ListCell   *lc2;
+                    int         j;
+                    if (dt_i->emitted)            /* matched Pass1; skip */
+                    {
+                        cur++;
+                        continue;
+                    }
+                    /* Linear scan to find the rightmost same-key unemitted. */
+                    j = 0;
+                    foreach(lc2, delta_list)
+                    {
+                        DeltaTuple *dt_j = (DeltaTuple *) lfirst(lc2);
+                        bool        same_key;
+                        same_key = false;
+                        if (j > cur
+                            && !dt_j->emitted
+                            && dt_i->key != NULL
+                            && dt_j->key != NULL)
+                        {
+                            if (dt_i->typed_pk_n > 0 && dt_j->typed_pk_n > 0 &&
+                                dt_i->typed_pk != NULL && dt_j->typed_pk != NULL)
+                                same_key = (0 == overlay_typed_pk_cmp(
+                                                dt_i->typed_pk, dt_i->typed_pk_n,
+                                                dt_j->typed_pk, dt_j->typed_pk_n));
+                            else
+                                same_key = (0 == strcmp(dt_i->key, dt_j->key));
+                        }
+                        if (same_key)
+                        {
+                            latest_j = j;
+                        }
+                        j++;
+                    }
+                    final_idx_latest[cur] = (cur == latest_j) ? cur : -1;
+                    cur++;
                 }
-                else
+                /* Translate final_idx_latest[] → emit_flags (only for surviving) */
+                for (i = 0; i < ndelta; i++)
                 {
-                    /* final entry dominates; earlier same-PK I/U are
-                     * redundant for emission (but must be kept in the
-                     * delta table for apply/discard). */
-                    if (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE)
-                        dt->emitted = true;
+                    ListCell   *lc3 = list_nth_cell(delta_list, i);
+                    DeltaTuple *dt = (DeltaTuple *) lfirst(lc3);
+                    if (final_idx_latest[i] == i
+                        && !dt->emitted
+                        && (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE))
+                    {
+                        emit_flags[i] = true;
+                    }
                 }
+                pfree(final_idx_latest);
             }
 
-            /* Phase 2b set emit_flags = (index == final_idx for that key). */
-            hash_seq_init(&hseq, final_map);
-            while ((ent = (struct p2map_ent_ *) hash_seq_search(&hseq)) != NULL)
-            {
-                if (ent->final_idx >= 0)
-                    emit_flags[ent->final_idx] = true;
-            }
-            hash_destroy(final_map);
-
-            /* Walk forwards and reconstruct flagged entries. */
+            /* Phase 2b: reconstruct only the emit_flags[i]==true rows. */
             i = 0;
             foreach(lc, delta_list)
             {
                 DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-                if (!dt->emitted && emit_flags[i] &&
-                    (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE))
+                if (emit_flags[i])
                 {
-                    TupleTableSlot *new_slot;
+                    TupleTableSlot  *new_slot;
                     if (dt->tuple_data == NULL)
-                        ereport(ERROR,
-                                (errcode(ERRCODE_DATA_CORRUPTED),
-                                 errmsg("ob_compute_overlay_slots: delta I/U key=%s has NULL tuple_data",
-                                        dt->key)));
+                    {
+                        i++;
+                        continue;   /* defensive: already guarded */
+                    }
                     new_slot = reconstruct_slot_from_delta(rel, dt->tuple_data);
                     result_slots = lappend(result_slots, new_slot);
                     dt->emitted = true;
@@ -472,6 +739,52 @@ pass2_done:
         MemoryContextSwitchTo(oldcxt);
     }
     SPI_finish();
+
+    /* ================================================================
+     * REVIEW-260926 / R13 S07 — TopMemoryContext RSS leak cleanup.
+     * ================================================================
+     * overlay_delta_list_for_rel allocates every DeltaTuple* (and
+     * dt->key, dt->tuple_data payload) in TopMemoryContext (see
+     * delta_store.c L413).  Previously those were leaked because the
+     * helper returns result_slots (also TopMCxt) and forgets the
+     * delta_list; repeated BranchScan calls would grow the session's
+     * RSS without bound until the backend exited (= OOM for long
+     * sessions).  Free every non-`emitted`? No: we allocated them
+     * all via palloc so we must pfree regardless; `emitted` is only
+     * a bookkeeping bool for Pass2 duplicate suppression and does
+     * NOT imply external ownership.
+     *
+     * Two allocation paths exist and BOTH must be cleaned up:
+     *   (1) PK-singleton fast-path: palloc0(sizeof(DeltaTuple)) at L167
+     *       → delta_list == list_make1(singleton) → singleton_free below
+     *       also works via lappend deconstruction list_free_deep alternative?
+     *       No, we iterate explicit because key/tuple_data are separate
+     *       palloc chunks.
+     *   (2) General full-list path: overlay_delta_list_for_rel returns
+     *       N list nodes; iterate and pfree each field.
+     *
+     * After this block delta_list is freed to empty list; any hash tables
+     * (Pass1 delta_hash, Pass2 final_map) were already destroyed via
+     * hash_destroy inside their blocks.  */
+    {
+        ListCell *lc_r13;
+        foreach(lc_r13, delta_list)
+        {
+            DeltaTuple *dt = (DeltaTuple *) lfirst(lc_r13);
+            if (dt == NULL) continue;
+            /* key always exists (list_for_rel always pstrdup("") for isnull).
+             * tuple_data is NULL for op=DELETE entries; non-NULL for I/U.
+             * typed_pk is R14 add-on: allocated lazily in pre-flight, contains
+             * typbyval=false datum deep copies so MUST be freed via helper
+             * before the DeltaTuple itself is pfree'd (otherwise RSS leak). */
+            if (dt->key != NULL) pfree(dt->key);
+            if (dt->tuple_data != NULL) pfree(dt->tuple_data);
+            if (dt->typed_pk != NULL && dt->typed_pk_n > 0)
+                overlay_typed_pk_free(dt->typed_pk, dt->typed_pk_n);
+            pfree(dt);
+        }
+        list_free(delta_list);
+    }
 
     if (out_tupdesc)
         *out_tupdesc = CreateTupleDescCopy(reldesc);
@@ -541,6 +854,59 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         return;
     if (overlay_in_overlay_helper())
         return;
+
+    /* ================================================================
+     * REVIEW-260926 / R16: MVP guard for ModifyingCTE (Data-Modifying
+     *   statements inside WITH clauses).
+     *
+     * Why THREE separate choke points (belt-and-braces, redundancy by
+     * design — silent MAIN pollution from ModCTE is a P0 data
+     * corruption bug):
+     *   1. [THIS BLOCK — Planner hook, NEW] — catches ALL entry points
+     *      including EXPLAIN ANALYZE / prepared / SPI / DO / function
+     *      body SQL.  The outer query is CMD_SELECT so the B2 check
+     *      below would LIE and return early.  hasModifyingCTE is set
+     *      by the rewriter on the Query node exactly when WITH-list
+     *      contains I/U/D/MERGE.  We refuse to plan this.
+     *   2. [ExecutorRun intercept in write_redirect.c — EXISTING] —
+     *      catches at runtime plannedstmt->hasModifyingCTE (the
+     *      PlannedStmt copy).  Acts as last line of defense.
+     *   3. [PlannedStmt dispatch — not needed; #1/#2 sufficient]
+     *
+     * Placement:  between B1 and B2, BEFORE the CmdType check.  If we
+     * placed this after B2 (`ct != CMD_SELECT -> return`) then a
+     * ModCTE whose outer query is SELECT would pass B2 (ct==SELECT
+     * ok) and proceed to custom planning → the planned
+     * ModifyTable nodes inside CTE subplans run with zero WR
+     * protection = write MAIN directly.  NOT acceptable. */
+    if (root != NULL && root->parse != NULL &&
+        nodeTag(root->parse) == T_Query)
+    {
+        Query *pq = (Query *) root->parse;
+        if (pq->hasModifyingCTE)
+        {
+            /* Raise 0A000 here in the planner context.  This is
+             * intentionally NOT a no-op / skip / elog(DEBUG); if we
+             * silently returned without injecting CustomScan the
+             * planner would continue, build a plan with ModifyTable
+             * inside CTE subplans, and ExecutorRun's outer CmdType is
+             * CMD_SELECT → dml_split=false → WR checks do NOT opt-in
+             * kickout → the ModifyTable nodes execute against MAIN
+             * heap.  Catastrophic drift-write.  So we ERROR HERE,
+             * BEFORE any plan shape can be constructed.
+             *
+             * NOTE: ereport inside a planner hook IS safe (PG core
+             * does this all the time for constraint errors during
+             * planning; PG_TRY/CATCH in caller handles it). */
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("overlay_branch MVP does not support data-modifying statements inside WITH (CTE) clauses (R16 planner-stage blocked)"),
+                     errhint("Rewrite WITH (UPDATE/DELETE/INSERT ... RETURNING) SELECT ... "
+                             "using a TEMP TABLE to collect RETURNING rows:\n"
+                             "  CREATE TEMP TABLE _r AS UPDATE t SET ... RETURNING ...;\n"
+                             "  SELECT * FROM _r; DROP TABLE _r;")));
+        }
+    }
 
     /* B2 PRE-CHECK: MVP only inject CustomScan for pure SELECT.
      * (Same logic as before, but now it's here, above the is_active() call

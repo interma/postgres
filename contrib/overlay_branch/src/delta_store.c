@@ -30,7 +30,9 @@
 #include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "parser/parse_oper.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
@@ -298,6 +300,8 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 		 * SPI proc 上下文，SPI_finish() 一调用就全部悬垂！ */
 		oldmc = MemoryContextSwitchTo(TopMemoryContext);
 		memset(out_tuple, 0, sizeof(DeltaTuple));
+		out_tuple->typed_pk = NULL;
+		out_tuple->typed_pk_n = -1;
 
 		d = SPI_getbinval(tup, td, 1, &isnull);
 		out_tuple->branch_id = isnull ? 0 : DatumGetInt32(d);
@@ -421,6 +425,8 @@ overlay_delta_list_for_rel(int32 branch_id, Oid relid)
 			Datum				d;
 
 			dt = (DeltaTuple *) palloc0(sizeof(DeltaTuple));
+			dt->typed_pk = NULL;
+			dt->typed_pk_n = -1;
 
 			d = SPI_getbinval(tup, td, 1, &isnull);
 			dt->branch_id = isnull ? 0 : DatumGetInt32(d);
@@ -1226,6 +1232,92 @@ overlay_modify_insert(Relation rel, TupleTableSlot *slot)
 	pfree(tdata);
 }
 
+/* ob_enrich_tuple_with_base_image: attach "_base" top-level key to the
+ * new-image JSON produced by overlay_serialize_tuple().  Used for
+ * UPDATE/DELETE deltas so apply can compare the persisted MAIN base
+ * image with the currently-locked MAIN row.  INSERTs carry no base
+ * image (they have no MAIN baseline to compare against).
+ *
+ * Produces output like:  {"c1":"v1","c2":"v2","_base":{"c1":"old1","c2":"old2"}}
+ * Caller is responsible for pfree()'ing the returned palloc'd cstring. */
+static char *
+ob_enrich_tuple_with_base_image(const char *new_image_json,
+								const char *base_image_json)
+{
+	StringInfoData out;
+	const char *p;
+	bool		inside_string;
+	bool		escaped;
+	bool		object_closed;
+	int			depth;
+
+	if (new_image_json == NULL)
+		return NULL;
+	if (base_image_json == NULL || *base_image_json == '\0')
+		return pstrdup(new_image_json);
+
+	initStringInfo(&out);
+
+	/* Walk the new-image JSON up to its final '}', strip a trailing '}',
+	 * append ,"_base":<base_json>, then close with '}'.  We verify strict
+	 * object syntax by tracking brace depth and string/escape state. */
+	inside_string = false;
+	escaped = false;
+	depth = 0;
+	object_closed = false;
+	for (p = new_image_json; *p != '\0'; p++)
+	{
+		char c = *p;
+
+		if (inside_string)
+		{
+			appendStringInfoChar(&out, c);
+			if (escaped)
+				escaped = false;
+			else if (c == '\\')
+				escaped = true;
+			else if (c == '"')
+				inside_string = false;
+			continue;
+		}
+		switch (c)
+		{
+			case '"':
+				inside_string = true;
+				appendStringInfoChar(&out, c);
+				break;
+			case '{':
+				depth++;
+				appendStringInfoChar(&out, c);
+				break;
+			case '}':
+				depth--;
+				if (depth == 0)
+				{
+					/* Replace the final closing '}' with our enriched tail. */
+					appendStringInfoString(&out, ",\"_base\":");
+					appendStringInfoString(&out, base_image_json);
+					appendStringInfoChar(&out, '}');
+					object_closed = true;
+				}
+				else
+					appendStringInfoChar(&out, c);
+				break;
+			default:
+				appendStringInfoChar(&out, c);
+				break;
+		}
+	}
+
+	if (!object_closed)
+	{
+		/* Malformed input — fall back to returning original without base. */
+		pfree(out.data);
+		return pstrdup(new_image_json);
+	}
+	return out.data;
+}
+
 void
 overlay_modify_update(Relation rel, TupleTableSlot *oldslot,
 					  TupleTableSlot *newslot)
@@ -1233,17 +1325,23 @@ overlay_modify_update(Relation rel, TupleTableSlot *oldslot,
 	int32		bid = overlay_branch_get_current_id();
 	char	   *pk;
 	char	   *oldver;
-	char	   *tdata;
+	char	   *tdata_new;
+	char	   *tdata_base;
+	char	   *tdata_enriched;
 
 	pk = overlay_serialize_pk(rel, newslot);
 	oldver = overlay_tuple_version(rel, oldslot);
-	tdata = overlay_serialize_tuple(rel, newslot);
+	tdata_new = overlay_serialize_tuple(rel, newslot);
+	tdata_base = overlay_serialize_tuple(rel, oldslot);
+	tdata_enriched = ob_enrich_tuple_with_base_image(tdata_new, tdata_base);
 
 	overlay_delta_insert(bid, RelationGetRelid(rel), pk,
-						 DELTA_OP_UPDATE, oldver, tdata);
+						 DELTA_OP_UPDATE, oldver, tdata_enriched);
 	pfree(pk);
 	if (oldver) pfree(oldver);
-	pfree(tdata);
+	pfree(tdata_new);
+	pfree(tdata_base);
+	pfree(tdata_enriched);
 }
 
 void
@@ -1252,14 +1350,30 @@ overlay_modify_delete(Relation rel, TupleTableSlot *slot)
 	int32		bid = overlay_branch_get_current_id();
 	char	   *pk;
 	char	   *oldver;
+	char	   *base_json;
+	char	   *sentinel_new;
+	char	   *tdata_enriched;
 
 	pk = overlay_serialize_pk(rel, slot);
 	oldver = overlay_tuple_version(rel, slot);
+	base_json = overlay_serialize_tuple(rel, slot);
+
+	/* DELETEs carry no new-image columns.  We still want the base image
+	 * attached for apply conflict detection, so we synthesise an empty
+	 * new-image object {"_deleted":true} and enrich it with _base.  The
+	 * apply INSERT fallback path already guards on dt->op; jsonb_populate_
+	 * record() ignores extra keys it doesn't recognise, so the sentinel
+	 * will not corrupt existing reconstructions. */
+	sentinel_new = pstrdup("{\"_deleted\":true}");
+	tdata_enriched = ob_enrich_tuple_with_base_image(sentinel_new, base_json);
 
 	overlay_delta_insert(bid, RelationGetRelid(rel), pk,
-						 DELTA_OP_DELETE, oldver, NULL);
+						 DELTA_OP_DELETE, oldver, tdata_enriched);
 	pfree(pk);
 	if (oldver) pfree(oldver);
+	pfree(base_json);
+	pfree(sentinel_new);
+	pfree(tdata_enriched);
 }
 
 /* ================================================================
@@ -1410,6 +1524,66 @@ overlay_get_pk_single_attno(Relation rel,
 }
 
 /*
+ * overlay_get_pk_attnos_list
+ *
+ *   Returns a list of 1-based attno integers for every column in the
+ *   relation's PRIMARY KEY (supports composite PKs).  Returns NIL if
+ *   the relation has no primary key.
+ *
+ *   Caller is responsible for list_free_deep() / pfree-ing the result
+ *   (a List in CurrentMemoryContext).
+ *
+ *   This is used by write_redirect.c R03 PK-mutation guard to detect
+ *   when a SET targetlist includes ANY of the PK columns. */
+List *
+overlay_get_pk_attnos_list(Relation rel)
+{
+	List	   *result = NIL;
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pk_index_oid = InvalidOid;
+	Relation	pk_rel = NULL;
+
+	if (rel == NULL)
+		return NIL;
+
+	indexoids = RelationGetIndexList(rel);
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		if (idxrel->rd_index && idxrel->rd_index->indisprimary)
+		{
+			pk_index_oid = idxoid;
+			pk_rel = idxrel;
+			break;
+		}
+		index_close(idxrel, AccessShareLock);
+	}
+	list_free(indexoids);
+
+	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
+		return NIL;
+
+	{
+		int			n = pk_rel->rd_index->indnatts;
+		int			i;
+
+		for (i = 0; i < n; i++)
+		{
+			AttrNumber	attno = pk_rel->rd_index->indkey.values[i];
+
+			if (attno > 0)
+				result = lappend_int(result, attno);
+		}
+	}
+
+	index_close(pk_rel, AccessShareLock);
+	return result;
+}
+/*
  * overlay_serialize_pk_from_single_datum
  *
  *   从单个 Datum（MVP 单列 PK 场景）构造与 overlay_serialize_pk
@@ -1528,3 +1702,442 @@ overlay_serialize_pk_from_single_datum(Relation rel,
 	SPI_finish();
 	return result;
 }
+
+/* ====================================================================
+ * ===== Typed PK helpers — REVIEW-260926/R14 MVP
+ *
+ * Perform semantic PostgreSQL-native equality/ordering on the real
+ * primary-key column types instead of JSON-text strcmp on dt->key.
+ * strcmp is WRONG for BPCHAR (r-trim semantics), NUMERIC precision
+ * (12.3 vs 12.30 are numerically equal), and TIMESTAMPTZ UTC absolute
+ * time vs textual-offset representations.  The typed-pk path always
+ * wins when available; callers fall back to legacy strcmp ONLY when
+ * the cache has not been populated (old/direct-call paths).
+ *
+ * All helpers follow ISO C90: variables declared at block top, no
+ * mixed declarations, no goto across initialisations.
+ * ====================================================================
+ */
+
+TypedKey *
+overlay_build_typed_pk_from_slot(Relation rel,
+								 TupleTableSlot *slot,
+								 int *out_n_pk)
+{
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pk_index_oid;
+	Relation	pk_rel;
+	int			n_pk;
+	int			i;
+	TupleDesc	reldesc;
+	TypedKey  *result;
+	MemoryContext oldmc;
+
+	Assert(rel != NULL && slot != NULL && out_n_pk != NULL);
+
+	pk_index_oid = InvalidOid;
+	pk_rel = NULL;
+	indexoids = RelationGetIndexList(rel);
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		if (idxrel->rd_index != NULL && idxrel->rd_index->indisprimary)
+		{
+			pk_index_oid = idxoid;
+			pk_rel = idxrel;
+			break;
+		}
+		index_close(idxrel, AccessShareLock);
+	}
+	list_free(indexoids);
+	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_build_typed_pk_from_slot requires a primary key on %s",
+						RelationGetRelationName(rel))));
+	n_pk = pk_rel->rd_index->indnatts;
+	if (n_pk <= 0)
+	{
+		index_close(pk_rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_build_typed_pk_from_slot found 0-column PK on %s",
+						RelationGetRelationName(rel))));
+	}
+
+	reldesc = RelationGetDescr(rel);
+
+	/* ---------------------------------------------------------------
+	 * R14 hardening: all allocations (TypedKey array + per-column
+	 * datum deep copies) MUST live in TopMemoryContext, otherwise
+	 * they could end up inside a SPI_proc context (when this helper
+	 * is called from within a SPI-connected code path) and get
+	 * freed on SPI_finish — producing the classic
+	 * "pfree called with invalid pointer 0x... (header 0x7f..7f)"
+	 * crash when the caller later releases the returned array.
+	 * --------------------------------------------------------------- */
+	oldmc = MemoryContextSwitchTo(TopMemoryContext);
+	result = (TypedKey *) palloc0(sizeof(TypedKey) * n_pk);
+	MemoryContextSwitchTo(oldmc);
+
+	for (i = 0; i < n_pk; i++)
+	{
+		AttrNumber	attno = pk_rel->rd_index->indkey.values[i];
+		Form_pg_attribute att;
+		TypedKey  *tk;
+		bool		attisnull;
+		Datum		d;
+
+		if (attno == 0)
+		{
+			index_close(pk_rel, AccessShareLock);
+			overlay_typed_pk_free(result, i);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("overlay typed pk does not support expression index "
+							"attno=0 on column %d of relation \"%s\"",
+							i, RelationGetRelationName(rel))));
+		}
+		att = TupleDescAttr(reldesc, attno - 1);
+		tk = &result[i];
+		tk->typid = att->atttypid;
+		tk->typmod = att->atttypmod;
+		if (att->attcollation != InvalidOid)
+			tk->collid = att->attcollation;
+		else
+			tk->collid = InvalidOid;
+		tk->typlen = get_typlen(tk->typid);
+		tk->typbyval = get_typbyval(tk->typid);
+
+		/* Project memory rule (see project_memory.md §2.3): strictly
+		 * forbid calling slot_getattr on a TTSOpsVirtual slot whose
+		 * tts_nvalid trails the requested attno.  Either materialise
+		 * or ensure the virtual slot has been fully validated first.
+		 * Here we use the portable slot_getsomeattrs() pre-condition
+		 * (works for all TTSOps variants, not only virtual). */
+		slot_getsomeattrs(slot, attno);
+		d = slot_getattr(slot, attno, &attisnull);
+		tk->isnull = attisnull;
+		if (!attisnull)
+		{
+			/* datumCopy() into TopMemoryContext so the payload outlives
+			 * any enclosing SPI / expression-eval context that may be
+			 * active during this call. */
+			oldmc = MemoryContextSwitchTo(TopMemoryContext);
+			tk->value = datumCopy(d, tk->typbyval, tk->typlen);
+			MemoryContextSwitchTo(oldmc);
+		}
+		else
+		{
+			tk->value = (Datum) 0;
+		}
+	}
+
+	index_close(pk_rel, AccessShareLock);
+	*out_n_pk = n_pk;
+	return result;
+}
+
+TypedKey *
+overlay_build_typed_pk_from_key_text(Relation rel,
+									 const char *key_json,
+									 int *out_n_pk)
+{
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pk_index_oid;
+	Relation	pk_rel;
+	int			n_pk;
+	int			i;
+	TupleDesc	reldesc;
+	TypedKey  *result;
+	char	   *q_key;
+	MemoryContext oldmc;
+
+	Assert(rel != NULL && key_json != NULL && out_n_pk != NULL);
+
+	pk_index_oid = InvalidOid;
+	pk_rel = NULL;
+	indexoids = RelationGetIndexList(rel);
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		if (idxrel->rd_index != NULL && idxrel->rd_index->indisprimary)
+		{
+			pk_index_oid = idxoid;
+			pk_rel = idxrel;
+			break;
+		}
+		index_close(idxrel, AccessShareLock);
+	}
+	list_free(indexoids);
+	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_build_typed_pk_from_key_text requires PK on %s",
+						RelationGetRelationName(rel))));
+	n_pk = pk_rel->rd_index->indnatts;
+	if (n_pk <= 0)
+	{
+		index_close(pk_rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_build_typed_pk_from_key_text 0-col PK on %s",
+						RelationGetRelationName(rel))));
+	}
+	reldesc = RelationGetDescr(rel);
+
+	/* Build the TypedKey skeleton in TopMemoryContext so the returned
+	 * payload outlives any SPI context (see build_from_slot rationale). */
+	oldmc = MemoryContextSwitchTo(TopMemoryContext);
+	result = (TypedKey *) palloc0(sizeof(TypedKey) * n_pk);
+	MemoryContextSwitchTo(oldmc);
+
+	q_key = quote_literal_cstr(key_json);
+
+	for (i = 0; i < n_pk; i++)
+	{
+		AttrNumber	attno;
+		Form_pg_attribute att;
+		TypedKey  *tk;
+		const char *pktypname;
+		Datum		binval;
+		bool		isnull;
+		StringInfoData valsql;
+		int			ret;
+
+		attno = pk_rel->rd_index->indkey.values[i];
+		if (attno == 0)
+		{
+			index_close(pk_rel, AccessShareLock);
+			pfree(q_key);
+			overlay_typed_pk_free(result, i);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("typed key expression-index PK not supported at col %d of %s",
+							i, RelationGetRelationName(rel))));
+		}
+		att = TupleDescAttr(reldesc, attno - 1);
+		tk = &result[i];
+		tk->typid = att->atttypid;
+		tk->typmod = att->atttypmod;
+		if (att->attcollation != InvalidOid)
+			tk->collid = att->attcollation;
+		else
+			tk->collid = InvalidOid;
+		tk->typlen = get_typlen(tk->typid);
+		tk->typbyval = get_typbyval(tk->typid);
+		pktypname = format_type_with_typemod(tk->typid, tk->typmod);
+
+		initStringInfo(&valsql);
+		appendStringInfo(&valsql,
+						 "SELECT (((%s::jsonb)->%d) #>> '{}'::text[])::%s",
+						 q_key, i, pktypname);
+		ret = ob_spi_one_shot(valsql.data, true, 1);
+		pfree(valsql.data);
+		if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+			SPI_tuptable == NULL || SPI_tuptable->vals == NULL)
+		{
+			/* NB: overlay_typed_pk_free already pfree's the TypedKey array
+			 * itself after releasing the per-column datum payloads, so we
+			 * MUST NOT call pfree(result) separately (would double-free
+			 * the palloc chunk and corrupt the memory context). */
+			overlay_typed_pk_free(result, i);
+			SPI_finish();
+			pfree(q_key);
+			index_close(pk_rel, AccessShareLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("typed pk from key_text: SPI failed at col %d", i)));
+		}
+		binval = SPI_getbinval(SPI_tuptable->vals[0],
+							   SPI_tuptable->tupdesc, 1, &isnull);
+		tk->isnull = isnull;
+		if (!isnull)
+		{
+			/* datumCopy into TopMemoryContext: the SPI_tuptable pool is
+			 * released at SPI_finish below so any non-typbyval payload
+			 * must be copied to a stable memory context NOW. */
+			oldmc = MemoryContextSwitchTo(TopMemoryContext);
+			tk->value = datumCopy(binval, tk->typbyval, tk->typlen);
+			MemoryContextSwitchTo(oldmc);
+		}
+		else
+		{
+			tk->value = (Datum) 0;
+		}
+		SPI_finish();
+	}
+	pfree(q_key);
+	index_close(pk_rel, AccessShareLock);
+	*out_n_pk = n_pk;
+	return result;
+}
+
+int
+overlay_typed_pk_cmp(const TypedKey *a, int a_n,
+					 const TypedKey *b, int b_n)
+{
+	int			i;
+	int			sign;
+
+	if (a_n != b_n)
+		return a_n < b_n ? -1 : 1;
+	if (a_n == 0)
+		return 0;
+
+	sign = 0;
+	for (i = 0; i < a_n; i++)
+	{
+		const TypedKey *ta;
+		const TypedKey *tb;
+
+		ta = &a[i];
+		tb = &b[i];
+
+		if (ta->isnull || tb->isnull)
+		{
+			if (!(ta->isnull && tb->isnull))
+				return ta->isnull ? 1 : -1;
+			continue;
+		}
+		if (ta->typid != tb->typid)
+			return ta->typid < tb->typid ? -1 : 1;
+
+		/* ------------------------------------------------------------
+		 * Native-PG per-column compare using the type's registered
+		 * btree sort operators.  THIS IS THE CRITICAL FIX that
+		 * replaces the previous SPI-CASE-SELECT comparator which:
+		 *   (a) allocated transient stuff inside SPI_proc memory
+		 *       context that got torn down on SPI_finish, causing
+		 *       "pfree called with invalid pointer" when the
+		 *       comparator's side-effects leaked out to the caller;
+		 *   (b) could not be safely invoked from inside libc qsort/
+		 *       bsearch callbacks because longjmp(SPI error) would
+		 *       leave libc comparator state undefined.
+		 *
+		 * Strategy (standard PG btree compare recipe):
+		 *   1. get_sort_group_operators(ta->typid, true, true, false,
+		 *      &ltOpr, &eqOpr, &dummy, NULL) to recover the canonical
+		 *      < and = operators for the PK type (works for all PK
+		 *      eligible types because any PK requires a btree opclass).
+		 *   2. Look up each operator OID via SysCache OPEROID to
+		 *      recover its underlying function regproc (oprcode).
+		 *   3. Call the equality function first via
+		 *      OidFunctionCall2Coll(oprcode_eq, ta->collid, a, b)
+		 *      returning 0 if true; otherwise call the less-than
+		 *      function returning -1 if true, else 1.
+		 *   4. Collation is threaded through so text/bpchar/varchar
+		 *      follow the column's real collation rather than the
+		 *      default C locale that memcmp() would impose.
+		 * ------------------------------------------------------------ */
+		{
+			Oid			ltOpr = InvalidOid;
+			Oid			eqOpr = InvalidOid;
+			Oid			gtOpr = InvalidOid;
+			HeapTuple	tup_eq;
+			HeapTuple	tup_lt;
+			Datum		d_eqfn;
+			Datum		d_ltfn;
+			bool		isnull_fn;
+			Oid			fn_eq;
+			Oid			fn_lt;
+			Datum		eq_result;
+			bool		eq_null;
+			Datum		lt_result;
+			bool		lt_null;
+
+			get_sort_group_operators(ta->typid,
+									 true, true, false,
+									 &ltOpr, &eqOpr, &gtOpr,
+									 NULL);
+			if (!OidIsValid(eqOpr) || !OidIsValid(ltOpr))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("overlay_typed_pk_cmp: no btree sort operators "
+								"for PK column type %u at col %d",
+								ta->typid, i)));
+
+			tup_eq = SearchSysCache1(OPEROID, ObjectIdGetDatum(eqOpr));
+			if (!HeapTupleIsValid(tup_eq))
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("overlay_typed_pk_cmp: eqOpr %u not in OPEROID cache at col %d",
+								eqOpr, i)));
+			d_eqfn = SysCacheGetAttr(OPEROID, tup_eq, 13, &isnull_fn);
+			if (isnull_fn)
+			{
+				ReleaseSysCache(tup_eq);
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("overlay_typed_pk_cmp: eqOpr %u has NULL oprcode at col %d",
+								eqOpr, i)));
+			}
+			fn_eq = DatumGetObjectId(d_eqfn);
+			ReleaseSysCache(tup_eq);
+
+			tup_lt = SearchSysCache1(OPEROID, ObjectIdGetDatum(ltOpr));
+			if (!HeapTupleIsValid(tup_lt))
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("overlay_typed_pk_cmp: ltOpr %u not in OPEROID cache at col %d",
+								ltOpr, i)));
+			d_ltfn = SysCacheGetAttr(OPEROID, tup_lt, 13, &isnull_fn);
+			if (isnull_fn)
+			{
+				ReleaseSysCache(tup_lt);
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("overlay_typed_pk_cmp: ltOpr %u has NULL oprcode at col %d",
+								ltOpr, i)));
+			}
+			fn_lt = DatumGetObjectId(d_ltfn);
+			ReleaseSysCache(tup_lt);
+
+			/* Equality short-circuit first. */
+			eq_result = OidFunctionCall2Coll(fn_eq, ta->collid,
+											  ta->value, tb->value);
+			eq_null = false;
+			if (DatumGetBool(eq_result) && !eq_null)
+			{
+				sign = 0;
+				continue;
+			}
+
+			/* Not equal: strict less-than → -1, otherwise → +1. */
+			lt_result = OidFunctionCall2Coll(fn_lt, ta->collid,
+											  ta->value, tb->value);
+			lt_null = false;
+			if (DatumGetBool(lt_result) && !lt_null)
+				sign = -1;
+			else
+				sign = 1;
+			return sign;
+		}
+	}
+	return 0;
+}
+
+void
+overlay_typed_pk_free(TypedKey *pk, int n_pk)
+{
+	int			i;
+
+	if (pk == NULL || n_pk <= 0)
+		return;
+	for (i = 0; i < n_pk; i++)
+	{
+		if (!pk[i].isnull && !pk[i].typbyval &&
+			pk[i].value != (Datum) 0)
+			pfree(DatumGetPointer(pk[i].value));
+	}
+	pfree(pk);
+}
+

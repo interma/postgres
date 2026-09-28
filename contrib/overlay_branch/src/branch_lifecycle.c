@@ -260,9 +260,97 @@ ob_mode_cache_remove(int32 bid)
 
 static char *ob_build_pk_where_clause(Relation rel, const char *pk_json_array);
 static TupleTableSlot *ob_fetch_main_current_slot(Relation rel, const char *where_clause);
+static void apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_clause);
 static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt);
 static void apply_relation_update_pass(Relation rel, DeltaTuple *dt);
 static void apply_relation_insert_pass(Relation rel, DeltaTuple *dt);
+
+/* ================================================================
+ * §G06 最小防泄漏：检测当前数据库是否存在任何 publication
+ *   - puball=true（FOR ALL TABLES），或
+ *   - pubschema=true 且 publication 包含 overlay_branch schema 的 FOR TABLES IN SCHEMA
+ * 命中任一情况时 emit WARNING（不阻断 MVP 正常使用；S26 产品化批次可升级到 ERROR）。
+ * 访问控制：SPI SELECT pg_publication；若表不存在（--without-publication 构建）就静默 skip。
+ * 使用 throttling：同一连接的 5 个站点（create/enter/exit/apply/discard）同进程只报一次，
+ * 避免每 use_branch() 都刷屏。
+ * ================================================================ */
+static void
+ob_g06_check_publication_leak_throttled(void)
+{
+	/* 单 session throttled flag；reset only on process exit */
+	static bool s_warned = false;
+	static bool s_checked = false;
+	StringInfoData sql;
+	int			ret;
+	bool		found = false;
+	bool		isnull;
+	bool		spi_connected = false;
+
+	if (s_warned || s_checked)
+		return;
+
+	/*
+	 * 用 SPI 做 SELECT EXISTS 精确检测；用 PG_TRY/PG_CATCH 包裹，
+	 * 防止在 catalog not ready / --without-publication 构建时 PANIC。
+	 */
+	initStringInfo(&sql);
+	appendStringInfoString(&sql,
+						   "SELECT EXISTS ("
+						   " SELECT 1 FROM pg_catalog.pg_publication p WHERE p.puballtables = true"
+						   "  OR EXISTS ("
+						   "    SELECT 1 FROM pg_catalog.pg_publication_namespace pn"
+						   "    JOIN pg_catalog.pg_namespace n ON pn.pnnspid = n.oid"
+						   "    WHERE pn.pnpubid = p.oid AND n.nspname = 'overlay_branch'))");
+
+	PG_TRY();
+	{
+		if (SPI_connect() == SPI_OK_CONNECT)
+			spi_connected = true;
+
+		if (spi_connected)
+		{
+			ret = SPI_execute(sql.data, true, 1);
+			if (ret == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				Datum		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+				if (!isnull)
+					found = DatumGetBool(d);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		/*
+		 * 任何异常（relation not exists / permission / SPI error / catalog
+		 * error）都 fail-open：静默 skip。不阻断用户流程，不污染日志。
+		 */
+		if (spi_connected)
+		{
+			SPI_finish();
+			spi_connected = false;
+		}
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
+	pfree(sql.data);
+	if (spi_connected)
+		SPI_finish();
+	s_checked = true;
+
+	if (found)
+	{
+		s_warned = true;
+		ereport(WARNING,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("overlay_branch: detected publication FOR ALL TABLES or FOR TABLES IN SCHEMA overlay_branch"),
+				 errhint("Internal tables pg_branch/pg_branch_delta (stored in schema overlay_branch) will be "
+						 "included in any logical replication slot reading FOR ALL TABLES publications. "
+						 "Production deployments should restrict publications to an explicit table list "
+						 "and keep schema overlay_branch excluded. See §G06 of review_260926.md.")));
+	}
+}
 
 /* ================================================================
  * ---------- Branch Context (internal implementations) ----------
@@ -274,9 +362,11 @@ overlay_branch_create_internal(const char *branch_name)
 	int			ret;
 	Oid			owner;
 	int32		new_branch_id;
+	bool		isnull;
 	char	   *esc_name;
 	StringInfoData sql;
-	static int32 s_next_return_id = 0;
+
+	ob_g06_check_publication_leak_throttled();
 
 	if (branch_name == NULL || *branch_name == '\0')
 		ereport(ERROR,
@@ -339,9 +429,53 @@ overlay_branch_create_internal(const char *branch_name)
 						branch_name, ret, (unsigned long) SPI_processed)));
 	}
 
-	new_branch_id = ++s_next_return_id;
+	/* ===== REVIEW-260926 / R09 =====
+	 *   Previously we returned a static process-local counter
+	 *   `s_next_return_id` which was NOT synchronized with the
+	 *   catalog sequence `pg_branch_branch_id_seq`.  Under concurrent
+	 *   branch creation the returned int could collide / misalign with
+	 *   the real branch_id stored in the catalog, causing later
+	 *   apply/discard/lookup to operate on the WRONG branch (silent
+	 *   data loss / wrong-row mutation).
+	 *
+	 *   Fix: after INSERT (which triggers DEFAULT nextval(...)), call
+	 *   currval() in the same session to return the value the catalog
+	 *   actually assigned.  currval() is session-local and only
+	 *   reflects our own session's last nextval() call on that
+	 *   sequence; it never collides with other sessions. */
+	resetStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT currval('%s.pg_branch_branch_id_seq'::regclass)",
+					 OBSCHEMA);
+	ret = SPI_execute(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+		SPI_tuptable == NULL || SPI_tuptable->vals == NULL ||
+		SPI_tuptable->vals[0] == NULL)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: could not retrieve currval() for new branch '%s' (SPI ret=%d processed=%lu)",
+						branch_name, ret, (unsigned long) SPI_processed)));
+	}
+	new_branch_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc,
+												1, &isnull));
+	if (isnull)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: currval() for new branch '%s' returned NULL (sequence broken)",
+						branch_name)));
+	}
 
 	SPI_finish();
+
+	/* Normal StringInfo teardown: free the data buffer (we won't reuse
+	 * `sql` any further).  `initStringInfo` earlier allocated `sql.data`
+	 * in CurrentMemoryContext; pfree is balanced here. */
+	pfree(sql.data);
 
 	elog(DEBUG1, "overlay_branch_create_internal: name='%s' return_id=%d owner=%u",
 		 branch_name, (int) new_branch_id, (unsigned) owner);
@@ -401,6 +535,7 @@ ob_exit_branch_cleanup(BranchContext *ctx)
 		ctx->branch_name[0] = '\0';
 		ctx->invalidation_counter = 0;
 		ctx->invalidation_last_check = 0;
+		ctx->entered_at = 0;
 		return;
 	}
 	ctx->is_active = false;
@@ -409,6 +544,7 @@ ob_exit_branch_cleanup(BranchContext *ctx)
 	ctx->branch_name[0] = '\0';
 	ctx->invalidation_counter = 0;
 	ctx->invalidation_last_check = 0;
+	ctx->entered_at = 0;
 	elog(DEBUG1, "overlay_branch: left current branch (cleanup helper)");
 }
 
@@ -550,6 +686,8 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 	if (mode == NULL || *mode == '\0')
 		mode = BRANCH_MODE_LIVE;
 
+	ob_g06_check_publication_leak_throttled();
+
 	if (strcmp(mode, BRANCH_MODE_LIVE) != 0 &&
 		strcmp(mode, BRANCH_MODE_SNAPSHOT) != 0)
 	{
@@ -578,6 +716,50 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 						PGC_USERSET, PGC_S_SESSION);
 			ob_in_guc_setconfig = saved_flag;
 		}
+		/* ===== REVIEW-260926 / R07 S09 PlanCache invalidation =====
+		 *   When we EXIT a branch, cached CustomScan plans (prepared plans,
+		 *   plancache entries) must be invalidated so that the NEXT query
+		 *   in the same session, which will run WITHOUT the overlay, does
+		 *   not reuse a plan that still routes through BranchScan.  Without
+		 *   this invalidation, the user could run "PREPARE / EXECUTE"
+		 *   BEFORE entering the branch, which caches a normal SeqScan
+		 *   plan on MAIN (correct).  Then inside the branch the planner
+		 *   would (correctly) re-plan and produce BranchScan.  But on
+		 *   EXIT+next EXECUTE: PG plancache might serve the stale plan
+		 *   captured INSIDE the branch (which does BranchScan overlay),
+		 *   causing "outside branch" DML to still route through overlay
+		 *   = silent wrong-row reads.
+		 *
+		 *   CacheInvalidateRelcacheAll() broadcasts SI invalidation for
+		 *   ALL relations (we don't know which ones were touched during
+		 *   the branch).  The plancache listens for those and marks
+		 *   prepared plans as invalid → next EXECUTE does a full re-plan
+		 *   against the new CURRENT state.  Cost is negligible compared
+		 *   to the wrong-read/write risk.
+		 *
+		 *   CRITICAL extra step: CacheInvalidateRelcacheAll() only
+		 *   *registers* the invalidation message into
+		 *   `PrepareInvalidationState()->CurrentCmdInvalidMsgs` (see
+		 *   inval.c L1549 RegisterRelcacheInvalidation).  Those are
+		 *   *normally* flushed to the plancache callback at the END of
+		 *   the top-level user command (CommandEndInvalidationMessages
+		 *   in exec_simple_query → finish_xact_command path).  But
+		 *   use_branch(b) itself IS the currently-executing top-level
+		 *   command (`SELECT use_branch('b');`) so NEXT command's
+		 *   prepared-plan EXECUTE might either (a) see the message and
+		 *   re-plan OR (b) the function-call portal's invalidation
+		 *   state be in a sub-transaction without propagation depending
+		 *   on how the SPI stack works.  To guarantee that the plancache
+		 *   marks cached plans invalid *before* we return to the user
+		 *   we therefore *also* run CommandEndInvalidationMessages()
+		 *   right here — LocalExecuteInvalidationMessage digests the
+		 *   queue synchronously → plancache invalidation callback fires
+		 *   → CachedPlanSource->invalidated = true → next EXECUTE
+		 *   re-plans with 100% certainty (fixes the R07 test case where
+		 *   prepared-in-main EXECUTE inside branch continued to serve
+		 *   the stale SeqScan MAIN plan). */
+		CacheInvalidateRelcacheAll();
+		CommandEndInvalidationMessages();
 		return;
 	}
 
@@ -690,6 +872,12 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 		CurrentBranchContext->created_at = 0;
 		CurrentBranchContext->invalidation_counter = 0;
 		CurrentBranchContext->invalidation_last_check = 0;
+		/* REVIEW-260926 / R19: Start snapshot-TTL clock only for
+		 * snapshot mode.  For live mode we leave entered_at=0 so the
+		 * throttled() TTL gate is never taken.  */
+		CurrentBranchContext->entered_at =
+			(strcmp(mode, BRANCH_MODE_SNAPSHOT) == 0)
+			? GetCurrentTimestamp() : 0;
 
 		ob_install_snapshot_for_mode(CurrentBranchContext, mode);
 
@@ -708,6 +896,19 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 						PGC_USERSET, PGC_S_SESSION);
 			ob_in_guc_setconfig = saved_flag;
 		}
+		/* ===== REVIEW-260926 / R07 S09 PlanCache invalidation (ENTER) =====
+		 *   ENTER branch also needs relcache invalidation: PREPARE a plan in
+		 *   plain MAIN mode (caches SeqScan path without BranchScan), then
+		 *   the user calls use_branch(b1) inside the same session.  Without
+		 *   invalidation, the NEXT EXECUTE of that prepared statement
+		 *   would serve the OLD plan from plancache (direct SeqScan) and
+		 *   completely bypass the overlay = silent drift-read from MAIN.
+		 *   By invalidating here, PREPAREd statements are forced to
+		 *   re-plan on the next EXECUTE → re-plan with branch active →
+		 *   Planner hook fires → BranchScan injected → correct overlay
+		 *   semantics. */
+		CacheInvalidateRelcacheAll();
+		CommandEndInvalidationMessages();
 		SPI_finish();
 		elog(DEBUG1, "overlay_branch_use_with_mode_internal: name='%s' mode='%s'",
 			 branch_name, mode);
@@ -832,6 +1033,13 @@ ob_invalidate_check_throttled(bool for_dml)
 	char		local_state_buf[32];
 	char		local_branch_name[NAMEDATALEN];
 	const char *local_what_happened;
+	/* REVIEW-260926 / R19: still_active and got_row live in function-scope
+	 * (not block-scope) because snapshot TTL kickout path jumps directly
+	 * to snapshot_ttl_kickout which lies PAST the Heavy SPI ground-truth
+	 * block.  Moving declarations up here keeps the variables in scope at
+	 * both the original kickout entry point and the goto landing point. */
+	bool		still_active = false;
+	bool		got_row = false;
 
 	local_state_buf[0] = '\0';
 	local_branch_name[0] = '\0';
@@ -916,6 +1124,44 @@ ob_invalidate_check_throttled(bool for_dml)
 			}
 		}
 
+		/* (B-2) REVIEW-260926 / R19: snapshot mode TTL hard cap.
+		 *
+		 *   snapshot mode pins RecentGlobalXmin for the whole cluster,
+		 *   which delays global VACUUM and grows storage indefinitely
+		 *   for all tables if a user forgets to exit snapshot mode.
+		 *   Enforce max-hold minutes once per throttled() invocation
+		 *   (every is_active / DML / DQL gate goes through here, so
+		 *   worst-case overshoot is one throttle cycle after the
+		 *   budget expires).  entered_at is set by use_with_mode_internal
+		 *   on mode==snapshot activation; live mode clears it to 0 so
+		 *   the gate is never taken on the default live path. */
+		if (ctx->entered_at != 0 &&
+			ob_snapshot_max_hold_minutes > 0)
+		{
+			long		elapsed_secs;
+			int			elapsed_usecs;
+			int64		elapsed_minutes;
+
+			TimestampDifference(ctx->entered_at, now,
+								&elapsed_secs, &elapsed_usecs);
+			elapsed_minutes = (int64) elapsed_secs / 60;
+			if (elapsed_minutes >= (int64) ob_snapshot_max_hold_minutes)
+			{
+				/* TTL expired — treat exactly the same as if the
+				 * branch had been externally invalidated.  We do NOT
+				 * touch SPI (this is a local-side guard).  Instead
+				 * we synthesize "state=expired" for the kickout
+				 * machinery below. */
+				local_is_applied = false;
+				local_is_discarded = false;
+				strcpy(local_state_buf, BRANCH_STATE_ACTIVE);
+				local_what_happened = "snapshot expired (R19 TTL)";
+				still_active = false;
+				got_row = true;
+				goto snapshot_ttl_kickout;
+			}
+		}
+
 		/* Fast path: stale-true return.  Both throttle gates say "not
 		 * yet" — the optimistic contract of FR4. */
 		if (!need_heavy_check)
@@ -929,10 +1175,11 @@ ob_invalidate_check_throttled(bool for_dml)
 			StringInfoData sql;
 			int			ret;
 			char	   *esc_name;
-			bool		still_active = false;
-			bool		got_row = false;
 			int			spi_connect_ret;
 			bool		did_spi_connect = false;
+
+			still_active = false;
+			got_row = false;
 
 			spi_connect_ret = SPI_connect();
 			if (spi_connect_ret == SPI_OK_CONNECT)
@@ -989,8 +1236,11 @@ ob_invalidate_check_throttled(bool for_dml)
 				result = true;
 				goto throttle_clean_exit;
 			}
-
+snapshot_ttl_kickout:
 			/* ===== Kickout path: ground truth says state != active ===== */
+			/* (R19 snapshot TTL jump lands here with local_state_buf
+			 * and what_happened already populated; other paths fall
+			 * through and fill both below.) */
 			strcpy(local_state_buf, got_row ? "<known>" : "missing");
 
 			if (got_row)
@@ -1134,6 +1384,11 @@ ob_invalidate_check_throttled(bool for_dml)
 								PGC_USERSET, PGC_S_SESSION);
 				ob_in_guc_setconfig = s2;
 			}
+			/* R07 S09 PlanCache invalidation (throttled kickout): see
+			 * enter/exit paths above for rationale (CacheInvalidateRelcacheAll
+			 * prevents stale BranchScan plan reuse from non-branch EXECUTE. */
+			CacheInvalidateRelcacheAll();
+			CommandEndInvalidationMessages();
 
 			kicked_out = true;
 			result = false;
@@ -1187,6 +1442,8 @@ overlay_branch_apply_internal(const char *branch_name)
 	List	   *relids = NIL;
 	ListCell   *rlc;
 	Relation	rel = NULL;
+
+	ob_g06_check_publication_leak_throttled();
 
 	if (branch_name == NULL || *branch_name == '\0')
 		ereport(ERROR,
@@ -1551,6 +1808,12 @@ overlay_branch_apply_internal(const char *branch_name)
 		SetConfigOption("overlay_branch.current", "",
 						PGC_USERSET, PGC_S_SESSION);
 		ob_in_guc_setconfig = saved_flag;
+		/* R07 S09 PlanCache invalidation (apply kickout): same rationale
+		 * as exit_path above — stale plancache entries for non-branch
+		 * mode must be invalidated otherwise next PREPAREd EXECUTE
+		 * routes through old BranchScan plan. */
+		CacheInvalidateRelcacheAll();
+		CommandEndInvalidationMessages();
 	}
 
 	pfree(esc_name);
@@ -1571,6 +1834,8 @@ overlay_branch_discard_internal(const char *branch_name)
 	bool		leaving_current = false;
 	int32		bid = 0;
 	bool		already_discarded_applied = false;
+
+	ob_g06_check_publication_leak_throttled();
 
 	if (branch_name == NULL || *branch_name == '\0')
 		ereport(ERROR,
@@ -1712,6 +1977,11 @@ overlay_branch_discard_internal(const char *branch_name)
 							PGC_USERSET, PGC_S_SESSION);
 			ob_in_guc_setconfig = saved_flag;
 		}
+		/* R07 S09 PlanCache invalidation (discard exit): prevents stale
+		 * BranchScan plans from being reused in non-branch mode (same
+		 * rationale as ENTER/EXIT paths above). */
+		CacheInvalidateRelcacheAll();
+		CommandEndInvalidationMessages();
 	}
 
 	if (leaving_current)
@@ -2070,6 +2340,171 @@ ob_fetch_main_current_slot(Relation rel, const char *where_clause)
 }
 
 /* ================================================================
+ * apply_check_base_image_match — REVIEW-260926/R15 & R18 HOT-Update
+ * Token Collision Guard
+ *
+ * overlay_tuple_version() uses the (ctid, xmin) pair as the optimistic
+ * CAS token.  On PostgreSQL HOT updates the row stays at the same
+ * ctid/xmin (heap-only tuple chain reuse) so the token does NOT change
+ * even though MAIN data columns have been rewritten by a concurrent
+ * session.  Without a secondary check an apply-UPDATE/DELETE would
+ * silently overwrite the concurrent MAIN modification → data loss.
+ *
+ * We encode the MAIN row at branch-write time as the "_base" top-level
+ * key of the stored tuple_data JSON blob.  Here we compare that saved
+ * base image (stripped of system columns that row_to_json does not
+ * include) against the CURRENTLY LOCKED MAIN row at apply time, using
+ * jsonb_object_agg(key, value ORDER BY key) to canonicalise both sides
+ * to a field-order-independent representation.  The FOR UPDATE clause
+ * on the MAIN row read guarantees we wait for any concurrent writer to
+ * commit, so we compare against final committed state.
+ *
+ * If dt->tuple_data has no "_base" key (old INSERT deltas, or pure-
+ * delta INSERT deltas generated from UPDATE fallbacks that carry no
+ * base image) the helper is a no-op.  If the canonicalised base and
+ * MAIN representations differ we raise a 55000 conflict and abort the
+ * whole branch apply.
+ * ================================================================ */
+static void
+apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_clause)
+{
+	Oid			bytea_out_func;
+	bool		bytea_out_varlena;
+	char	   *bytea_lit;
+	char	   *ql;
+	char	   *q_relname;
+	StringInfoData sql;
+	int			ret;
+	bool		has_base;
+	bool		differs;
+
+	if (dt->tuple_data == NULL)
+		return;
+
+	q_relname = quote_qualified_identifier(
+		get_namespace_name(RelationGetNamespace(rel)),
+		RelationGetRelationName(rel));
+
+	getTypeOutputInfo(BYTEAOID, &bytea_out_func, &bytea_out_varlena);
+	bytea_lit = OidOutputFunctionCall(bytea_out_func,
+									  PointerGetDatum(dt->tuple_data));
+	ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
+
+	/* Step 1: fast-path check whether the tuple_data blob actually
+	 * contains a "_base" key.  Old INSERTs and legacy deltas created
+	 * before this patch do not. */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT "
+					 " convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb ? '_base'",
+					 ql);
+	ret = ob_spi_one_shot(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+		!SPI_tuptable || !SPI_tuptable->vals || !SPI_tuptable->vals[0])
+	{
+		pfree(sql.data);
+		pfree(q_relname);
+		if (bytea_lit) pfree(bytea_lit);
+		pfree(ql);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply_check_base_image_match: _base exists SPI ret=%d", ret)));
+	}
+	{
+		bool		is_null;
+
+		has_base = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1,
+											  &is_null));
+		if (is_null)
+			has_base = false;
+	}
+	SPI_finish();
+	pfree(sql.data);
+
+	if (!has_base)
+	{
+		pfree(q_relname);
+		if (bytea_lit) pfree(bytea_lit);
+		pfree(ql);
+		return;
+	}
+
+	/* Step 2: compare canonicalised base vs canonicalised locked MAIN.
+	 * System columns (ctid/xmin/cmin/xmax/cmax/tableoid) are stripped
+	 * because overlay_serialize_tuple never writes them, and because
+	 * the whole point of the guard is to detect DATA changes regardless
+	 * of HOT reuse or updated xmin wraparound.  FOR UPDATE re-acquires
+	 * the lock so the compared MAIN row is the one we will subsequently
+	 * DELETE/UPDATE; no intervening committed writer can slip through. */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT COALESCE(base_norm, '{}'::jsonb) "
+					 "     <> COALESCE(main_norm, '{}'::jsonb) "
+					 "  FROM (SELECT (SELECT jsonb_object_agg(key, value ORDER BY key) "
+					 "                FROM jsonb_each( "
+					 "                       convert_from(decode(substring(%1$s from 3), 'hex'), 'UTF8')::jsonb "
+					 "                    -> '_base'))) b(base_norm), "
+					 "       LATERAL (SELECT jsonb_object_agg(key, value ORDER BY key) "
+					 "                  FROM jsonb_each( "
+					 "                         to_jsonb(r) "
+					 "                       - 'ctid' - 'xmin' - 'cmin' "
+					 "                       - 'xmax' - 'cmax' - 'tableoid') "
+					 "                 FROM (SELECT * FROM %2$s WHERE %3$s FOR UPDATE) r "
+					 "                ) m(main_norm) ",
+					 ql, q_relname, where_clause);
+	ret = ob_spi_one_shot(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+		!SPI_tuptable || !SPI_tuptable->vals || !SPI_tuptable->vals[0])
+	{
+		char *reason = psprintf(
+			"conflict pk=%s: MAIN row vanished during base_image compare (concurrent DELETE outside branch)",
+			dt->key ? dt->key : "(null)");
+		pfree(sql.data);
+		pfree(q_relname);
+		if (bytea_lit) pfree(bytea_lit);
+		pfree(ql);
+		SPI_finish();
+		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
+								   RelationGetRelationName(rel),
+								   reason);
+	}
+	{
+		bool		differs_null;
+		Datum		differs_val;
+
+		differs_null = false;
+		differs_val = SPI_getbinval(SPI_tuptable->vals[0],
+									SPI_tuptable->tupdesc, 1,
+									&differs_null);
+		if (differs_null)
+			differs = false;
+		else
+			differs = DatumGetBool(differs_val);
+	}
+	SPI_finish();
+	pfree(sql.data);
+	pfree(q_relname);
+	if (bytea_lit) pfree(bytea_lit);
+	pfree(ql);
+
+	if (differs)
+	{
+		char *reason = psprintf(
+			"conflict pk=%s: MAIN row has diverged from branch base_image "
+			"(ctid/xmin token unchanged, so R15/R18 HOT-update collision "
+			"was caught by the secondary per-column compare).  Resolve by "
+			"discarding this branch, re-branching from current MAIN, and "
+			"re-applying the branch edits.",
+			dt->key ? dt->key : "(null)");
+		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
+								   RelationGetRelationName(rel),
+								   reason);
+	}
+}
+
+/* ================================================================
  * --- 3 apply passes: DELETE → UPDATE → INSERT -----------------
  * ================================================================ */
 
@@ -2141,9 +2576,11 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 	}
 	elog(DEBUG1, "delpass[dbg] D pfree main_ver");
 	if (main_ver) pfree(main_ver);
-	elog(DEBUG1, "delpass[dbg] E drop slot");
+	elog(DEBUG1, "delpass[dbg] D2 drop main_slot");
 	ExecDropSingleTupleTableSlot(main_slot);
-	elog(DEBUG1, "delpass[dbg] F build DELETE SQL");
+	elog(DEBUG1, "delpass[dbg] D3 base_image vs MAIN lock check");
+	apply_check_base_image_match(rel, dt, where_clause);
+	elog(DEBUG1, "delpass[dbg] E build DELETE sql");
 
 	{
 		StringInfoData del_sql;
@@ -2233,6 +2670,7 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 	}
 	if (main_ver) pfree(main_ver);
 	ExecDropSingleTupleTableSlot(main_slot);
+	apply_check_base_image_match(rel, dt, where_clause);
 
 	{
 		TupleDesc	reldesc = RelationGetDescr(rel);

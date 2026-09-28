@@ -85,6 +85,20 @@ bool		ob_use_shared_mem_pin_table = false;
 bool		ob_in_snapshot_mode_helper = false;
 
 /* ================================================================
+ * REVIEW-260926 / R19 GUC: snapshot mode maximum hold time (minutes)
+ *
+ *   Snapshot mode captures and registers a snapshot that pins the
+ *   global RecentGlobalXmin, which delays vacuuming of dead rows
+ *   for the ENTIRE cluster.  Indefinite pinning is a resource
+ *   exhaustion DoS hazard.  To keep the MVP RESTRICTED posture, we
+ *   refuse to enter snapshot mode past this per-session lifetime
+ *   budget (0 = allow infinite; PGC_POSTMASTER so superuser chooses).
+ *   Enforcement lives in branch_lifecycle.c
+ *   use_with_mode_internal() and throttled() helper.
+ * ================================================================ */
+int			ob_snapshot_max_hold_minutes = 10; /* 10 minutes = default */
+
+/* ================================================================
  * Global session state
  * ================================================================ */
 BranchContext *CurrentBranchContext = NULL;
@@ -341,6 +355,20 @@ _PG_init(void)
 							INT_MAX / 2,
 							PGC_USERSET,
 							0,
+							NULL,
+							NULL,
+							NULL);
+
+	/* -------- REVIEW-260926 / R19 snapshot lifetime hard cap -------- */
+	DefineCustomIntVariable("overlay_branch.snapshot_max_hold_minutes",
+							"Maximum wall-clock minutes a session may remain in snapshot mode (R19 RESTRICTED guard).",
+							"Snapshots pin RecentGlobalXmin and delay VACUUM across the whole cluster.  0 = unlimited (use only in single-user test environments).  Default 10.",
+							&ob_snapshot_max_hold_minutes,
+							10,
+							0,
+							365 * 24 * 60,        /* ~1 year = upper bound */
+							PGC_POSTMASTER,
+							GUC_UNIT_MIN,
 							NULL,
 							NULL,
 							NULL);
@@ -1123,6 +1151,46 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				 * its throttled(DQL) side-effect.  Still run normal
 				 * command below. */
 				break;
+			/* ============================================================
+			 * REVIEW-260926 / R05: COPY FROM STDIN/FILE/PROGRAM bypasses
+			 *   ExecutorRun entirely (handled by CopyFrom in
+			 *   ProcessUtility).  Without this explicit block, a
+			 *   drift-write lands directly on the MAIN heap with
+			 *   ZERO write-redirect protection.  We intercept here
+			 *   because this is the single choke point for ALL COPY
+			 *   variants (COPY FROM view with INSTEAD OF trigger is
+			 *   rejected separately, but raw heap COPY is the MVP
+			 *   hazard).  COPY TO (read-side) is deliberately not
+			 *   blocked because a plain SELECT overlay-equivalent
+			 *   read is safe; we block only writes. */
+			case T_CopyStmt:
+				{
+					CopyStmt *cstmt = (CopyStmt *) pstmt->utilityStmt;
+					if (!cstmt->is_from)
+						break;			/* COPY TO = read-only; allow */
+					if (overlay_branch_is_active())
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("overlay_branch MVP does not support COPY FROM inside a branch (R05 drift-write blocked)"),
+								 errhint("Use INSERT ... VALUES / INSERT ... SELECT instead.  "
+										 "COPY FROM bypasses WriteRedirect and would silently write MAIN.")));
+					break;
+				}
+			/* ============================================================
+			 * REVIEW-260926 / R06: MERGE also routes through
+			 *   ProcessUtility for dispatch and builds a ModifyTable
+			 *   plan whose resultRelation we do not consistently
+			 *   redirect.  Block at the outermost choke point so
+			 *   users get a clear 0A000 instead of MAIN pollution. */
+			case T_MergeStmt:
+				if (overlay_branch_is_active())
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("overlay_branch MVP does not support MERGE inside a branch (R06 drift-write blocked)"),
+							 errhint("Rework MERGE as separate INSERT/UPDATE/DELETE "
+									 "wrapped in a transaction; those DML are "
+									 "properly redirected to the delta store.")));
+				break;
 			default:
 				if (overlay_branch_is_active() &&
 					!overlay_guard_ddl_ok_for_branch(pstmt->utilityStmt,
@@ -1161,24 +1229,52 @@ overlay_branch_create(PG_FUNCTION_ARGS)
 Datum
 overlay_branch_use(PG_FUNCTION_ARGS)
 {
-	Name		branch_name = PG_GETARG_NAME(0);
+	/* ===== REVIEW-260926 / R08 =====
+	 *   1-arg use_branch was previously declared STRICT in the SQL
+	 *   definition, meaning SELECT use_branch(NULL) SHORT-CIRCUITED the
+	 *   C function call entirely (PG returns NULL, no cleanup path
+	 *   runs).  CurrentBranchContext remained installed and the GUC
+	 *   overlay_branch.current retained its stale value — subsequent
+	 *   DML in that session would silently keep operating on the
+	 *   supposedly-exited branch = drift-write.
+	 *
+	 *   Fix: (1) change SQL definition to NON-STRICT (see
+	 *   overlay_branch--1.0.sql L72); (2) here explicitly check
+	 *   PG_ARGISNULL(0) and pass a NULL char* into the internal,
+	 *   which already handles NULL as EXIT.  Exactly the same code
+	 *   path is taken for NULL and '' so ctx/GUC always stay in sync. */
+	const char *branch_name;
 
-	overlay_branch_use_internal(NameStr(*branch_name));
+	if (PG_ARGISNULL(0))
+		branch_name = NULL;
+	else
+		branch_name = NameStr(*PG_GETARG_NAME(0));
+
+	overlay_branch_use_internal(branch_name);
 	PG_RETURN_VOID();
 }
 
 Datum
 overlay_branch_use_with_mode(PG_FUNCTION_ARGS)
 {
-	Name		branch_name = PG_GETARG_NAME(0);
+	const char *branch_name;
 	const char *mode;
+
+	/* REVIEW-260926 / R08: NULL branch_name → EXIT (same as 1-arg).
+	 *   PG_ARGISNULL must be checked BEFORE PG_GETARG_NAME because
+	 *   PG_GETARG_NAME on NULL datum dereferences to garbage memory
+	 *   and would SIGSEGV. */
+	if (PG_ARGISNULL(0))
+		branch_name = NULL;
+	else
+		branch_name = NameStr(*PG_GETARG_NAME(0));
 
 	if (PG_ARGISNULL(1))
 		mode = BRANCH_MODE_LIVE;
 	else
 		mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
-	overlay_branch_use_with_mode_internal(NameStr(*branch_name), mode);
+	overlay_branch_use_with_mode_internal(branch_name, mode);
 	PG_RETURN_VOID();
 }
 

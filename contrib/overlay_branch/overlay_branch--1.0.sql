@@ -55,6 +55,32 @@ CREATE INDEX pg_branch_delta_relid_idx
     ON @extschema@.pg_branch_delta (branch_id, relid);
 
 -- ============================================================
+-- §G06 最小防泄漏：显式内部表标记 publish=false (PG >=16 仅 publication 级别有效)
+--
+-- 注：PG 14-17 中 reloptions "publish=false" **并非堆表的合法 reloption**（publish
+-- 是 publication 对象的 WITH 选项，控制该 publication 产生哪类 DML 事件
+-- 'insert/update/delete/truncate'，作用于 pg_publication，不是 pg_class）。
+-- PG 14-17 FOR ALL TABLES 选择集合只通过 is_publishable_class() 过滤：
+--   - (RELKIND_RELATION / RELKIND_PARTITIONED_TABLE)
+--   - !IsCatalogRelationOid(relid)  → 必须不是 pinned OID
+--   - RELPERSISTENCE_PERMANENT
+--   - relid >= FirstNormalObjectId
+-- 扩展安装期间创建的表 relid 满足 FirstNormalObjectId 条件；用 pinned
+-- OID 的方案也不可行（CREATE EXTENSION 使用 GetNewObjectId()）。
+--
+-- 因此 G06 MVP 只能通过 RUNTIME 检测 + 文档：
+--   - E-2 ob_g06_check_publication_leak_throttled() 在 create/enter/apply/
+--     discard 入口发现 puball=true 或 pubschema 含 overlay_branch schema
+--     时 emit WARNING（S26 产品化可升级到 ERROR）；
+--   - 本处仅保留占位 reloption 注释，不 SET publish=false（否则 CREATE EXTENSION
+--     ERROR: unrecognized parameter "publish"）。
+-- ============================================================
+COMMENT ON TABLE @extschema@.pg_branch IS
+  'overlay_branch internal branch catalog table (§G06: exclude from FOR ALL TABLES publication by site-local policy, see review_260926.md §2.5)';
+COMMENT ON TABLE @extschema@.pg_branch_delta IS
+  'overlay_branch internal per-branch per-table delta store (§G06: exclude from FOR ALL TABLES publication by site-local policy, see review_260926.md §2.5)';
+
+-- ============================================================
 -- SQL-callable (C-language) management functions.
 -- We also publish them via public synonyms so callers can use
 -- bare names (SELECT create_branch('b1')) without prefix.
@@ -69,8 +95,10 @@ SET search_path = @extschema@, pg_catalog;
 CREATE FUNCTION @extschema@.use_branch(branch_name name)
 RETURNS void
 AS 'MODULE_PATHNAME', 'overlay_branch_use'
-LANGUAGE C STRICT VOLATILE
+LANGUAGE C VOLATILE
 SET search_path = @extschema@, pg_catalog;
+COMMENT ON FUNCTION @extschema@.use_branch(name) IS
+'Enter a branch by name (live mode) or exit by passing NULL/empty string.';
 
 -- ============================================================
 -- 2-parameter use_branch(name, mode) with MVCC mode override.

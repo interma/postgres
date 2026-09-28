@@ -12,7 +12,7 @@ step s1_ctrl_setup:
 
 create_branch
 -------------
-            1
+            5
 (1 row)
 
 use_branch

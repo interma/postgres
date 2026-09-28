@@ -10,7 +10,7 @@ step ctrl_setup:
 
 create_branch
 -------------
-            1
+            7
 (1 row)
 
 use_branch

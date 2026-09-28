@@ -10,7 +10,7 @@ step ctrl_p1_setup:
 
 create_branch
 -------------
-            1
+            3
 (1 row)
 
 use_branch
@@ -56,7 +56,7 @@ step ctrl_p2_setup:
 
 create_branch
 -------------
-            2
+            4
 (1 row)
 
 use_branch

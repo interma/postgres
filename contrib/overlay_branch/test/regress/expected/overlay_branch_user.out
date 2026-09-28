@@ -228,7 +228,7 @@ FROM public.bs_user;
 SELECT overlay_branch.create_branch('bs_user_b') AS id_bs_user_b;
  id_bs_user_b 
 --------------
-            2
+            1
 (1 row)
 
 SELECT overlay_branch.use_branch('bs_user_b');

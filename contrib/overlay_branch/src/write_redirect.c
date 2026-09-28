@@ -26,6 +26,7 @@
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "nodes/bitmapset.h"
 #include "nodes/execnodes.h"
 #include "storage/lmgr.h"
 #include "utils/datum.h"
@@ -145,6 +146,223 @@ mt_state_result_rel(ModifyTableState *mt, int i)
 }
 
 /* ----------------------------------------------------------------
+ * r21_check_insert_preconditions
+ *
+ *   R21 MVP pre-check pass for INSERT-path rows (called when the
+ *   final promotion decision is INSERT, i.e. promo=1 would be set).
+ *   Raises native PostgreSQL errors BEFORE any delta or MAIN write
+ *   happens so the transaction has no partial modifications.
+ *
+ *   Checks performed (MVP scope – single PK table only):
+ *     1. NOT NULL : every attnotnull=true (non-dropped, user) column
+ *                   in `slot` must be non-NULL → ERRCODE_NOT_NULL_VIOLATION
+ *     2. PK UNIQUE (MAIN side)  : same PK must not already exist in
+ *                                 the MAIN heap → ERRCODE_UNIQUE_VIOLATION
+ *     3. PK UNIQUE (delta side) : same PK must not already exist in
+ *                                 the ACTIVE pure-delta (op I/U rows)
+ *                                 → ERRCODE_UNIQUE_VIOLATION
+ *
+ *   Fail-open safe: if there is no single-column PK the MVP scope is
+ *   not applicable and we return silently (the only supported scope of
+ *   overlay_branch is single-PK heap tables anyway so this path only
+ *   triggers for the catalog DML bypass in create_branch etc.)
+ * ----------------------------------------------------------------
+ */
+static void
+r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
+							   int32 bid, Oid relid,
+							   AttrNumber pk_attno,
+							   const char *pk)
+{
+	TupleDesc	reldesc;
+	int			natts;
+	int			i;
+
+	if (rel == NULL || slot == NULL || TupIsNull(slot))
+		return;
+
+	reldesc = RelationGetDescr(rel);
+	natts = reldesc->natts;
+
+	if (TTS_IS_VIRTUAL(slot))
+	{
+		/* CRITICAL (R21 NOT NULL scan): TTSOpsVirtual tts_values/tts_isnull
+		 * are NOT populated for columns beyond tts_nvalid; simply bumping
+		 * tts_nvalid does NOT materialize them.  We MUST call
+		 * ExecMaterializeSlot-less attribute extraction — slot_getsomeattrs()
+		 * — which walks the virtual-slot "missing" bitmap and fills the
+		 * arrays in-place.  This is safe here because R21 runs BEFORE any
+		 * ExecProject/SET-merge mutation touches the slot, so no
+		 * pass-by-ref contents can be corrupted. */
+		if (slot->tts_nvalid < (AttrNumber) natts)
+			slot_getsomeattrs(slot, natts);
+	}
+
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(reldesc, i);
+		bool		isnull;
+
+		if (att->attisdropped)
+			continue;
+		if (att->attnum <= 0)
+			continue;
+		if (!att->attnotnull)
+			continue;
+
+		isnull = slot->tts_isnull[i];
+
+		if (isnull)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_NOT_NULL_VIOLATION),
+					 errmsg("null value in column \"%s\" of relation \"%s\" violates not-null constraint",
+							NameStr(att->attname),
+							RelationGetRelationName(rel)),
+					 errdetail("Failing row contains an R21 MVP pre-check violation on INSERT path.")));
+		}
+	}
+
+	if (pk_attno <= 0)
+		return;
+
+	{
+		int			pk_attidx = pk_attno - 1;
+		Oid			pk_type;
+		Datum		pkdatum;
+		bool		pk_isnull = false;
+		Oid			pk_out_func;
+		bool		pk_is_varlena;
+		char	   *pkval_txt;
+		char	   *pkval_esc;
+		const char *pk_colname;
+
+		pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
+		pk_colname = NameStr(TupleDescAttr(reldesc, pk_attidx)->attname);
+
+		if (TTS_IS_VIRTUAL(slot))
+		{
+			/* R21 PK read: mirror Phase-II safe pattern — only access
+			 * tts_values/tts_isnull AFTER slot_getsomeattrs has populated
+			 * the prefix up to pk_attidx+1. */
+			if (slot->tts_nvalid < (AttrNumber) (pk_attidx + 1))
+				slot_getsomeattrs(slot, pk_attidx + 1);
+			pkdatum = slot->tts_values[pk_attidx];
+			pk_isnull = slot->tts_isnull[pk_attidx];
+		}
+		else
+		{
+			pkdatum = slot_getattr(slot, pk_attno, &pk_isnull);
+		}
+
+		if (pk_isnull)
+			return;
+
+		getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
+		pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
+		pkval_esc = quote_literal_cstr(pkval_txt);
+
+		{
+			StringInfoData spiq_delta;
+			char	   *pk_esc;
+			int			ret_delta;
+			char		delta_latest_op = 0; /* 0 = no entry; 'I'/'U'/'D' otherwise */
+
+			pk_esc = quote_literal_cstr(pk ? pk : "");
+			initStringInfo(&spiq_delta);
+			appendStringInfo(&spiq_delta,
+							 "SELECT d.op FROM %s d WHERE d.branch_id = %u AND d.relid = %u AND d.key = %s LIMIT 1",
+							 OBTABLE_DELTA, (unsigned) bid, (unsigned) relid, pk_esc);
+			pfree(pk_esc);
+
+			overlay_overlay_helper_enter();
+			overlay_write_redirect_exit();
+			ret_delta = ob_spi_one_shot(spiq_delta.data, true, 1);
+
+			if (ret_delta == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1)
+			{
+				char *op_txt = SPI_getvalue(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1);
+				if (op_txt != NULL && op_txt[0] != '\0')
+					delta_latest_op = op_txt[0];
+				if (op_txt) pfree(op_txt);
+			}
+
+			if (delta_latest_op == 'I' || delta_latest_op == 'U')
+			{
+				char *saved_pkval = pstrdup(pkval_txt);
+				SPI_finish();
+				pfree(spiq_delta.data);
+				pfree(pkval_esc);
+				pfree(pkval_txt);
+				overlay_write_redirect_enter();
+				overlay_overlay_helper_exit();
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate key value violates unique constraint on relation \"%s\"",
+								RelationGetRelationName(rel)),
+						 errdetail("Key (%s)=(%s) already exists in branch delta (R21 pre-check).",
+								   pk_colname, saved_pkval)));
+			}
+
+			overlay_write_redirect_enter();
+			overlay_overlay_helper_exit();
+			pfree(spiq_delta.data);
+			SPI_finish();
+
+			/* ---------- MAIN-side conflict check: only if delta has NO
+			 * tombstone covering the MAIN row.  If delta already has
+			 * op='D' (DELETE tombstone), the MAIN row is logically
+			 * invisible in this branch and re-INSERT (rebirth) is
+			 * allowed. ---------- */
+			if (delta_latest_op != 'D')
+			{
+				StringInfoData spiq_main;
+				int			ret_main;
+
+				initStringInfo(&spiq_main);
+				appendStringInfo(&spiq_main,
+								 "SELECT 1 FROM %s WHERE (%s) = %s::text::%s LIMIT 1",
+								 quote_qualified_identifier(
+									 get_namespace_name(RelationGetNamespace(rel)),
+									 RelationGetRelationName(rel)),
+								 quote_identifier(pk_colname),
+								 pkval_esc,
+								 format_type_be(pk_type));
+
+				overlay_overlay_helper_enter();
+				overlay_write_redirect_exit();
+				ret_main = ob_spi_one_shot(spiq_main.data, true, 1);
+
+				if (ret_main == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1)
+				{
+					char *saved_pkval = pstrdup(pkval_txt);
+					SPI_finish();
+					pfree(spiq_main.data);
+					pfree(pkval_esc);
+					pfree(pkval_txt);
+					overlay_write_redirect_enter();
+					overlay_overlay_helper_exit();
+					ereport(ERROR,
+							(errcode(ERRCODE_UNIQUE_VIOLATION),
+							 errmsg("duplicate key value violates unique constraint on relation \"%s\"",
+									RelationGetRelationName(rel)),
+							 errdetail("Key (%s)=(%s) already exists in MAIN heap (R21 pre-check).",
+									   pk_colname, saved_pkval)));
+				}
+				overlay_write_redirect_enter();
+				overlay_overlay_helper_exit();
+				pfree(spiq_main.data);
+				SPI_finish();
+			}
+		}
+
+		pfree(pkval_esc);
+		pfree(pkval_txt);
+	}
+}
+
+/* ----------------------------------------------------------------
  * overlay_executor_run_intercept
  *
  *   Full write-redirection body extracted from overlay_ExecutorRun.
@@ -221,6 +439,53 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					 cmd == CMD_UPDATE ||
 					 cmd == CMD_DELETE ||
 					 cmd == CMD_MERGE);
+
+		/* ========= REVIEW-260926 / R06 (belt-and-braces #2) ========
+		 *   MERGE statements build a ModifyTable plan but we have NOT
+		 *   validated that every result-relation path is properly
+		 *   redirected.  To be safe, we explicitly REJECT CMD_MERGE
+		 *   here too, even though ProcessUtility has a choke point.
+		 *   This WR-level guard ensures DO-block inner SPI execution
+		 *   (which may bypass the outer ProcessUtility hook entirely)
+		 *   still refuses MERGE against a user table inside an active
+		 *   branch.  The same gate applies to ModCTE (handled above). */
+		if (cmd == CMD_MERGE && overlay_branch_is_active())
+		{
+			ListCell   *lc;
+			bool		has_managed_rel = false;
+
+			if (queryDesc->plannedstmt != NULL)
+				foreach(lc, queryDesc->plannedstmt->resultRelations)
+				{
+					Index		rti = lfirst_int(lc);
+					RangeTblEntry *rte;
+					Oid			nspoid;
+					char	   *nsp;
+
+					if (rti <= 0 || queryDesc->plannedstmt->rtable == NULL ||
+						rti > list_length(queryDesc->plannedstmt->rtable))
+						continue;
+					rte = rt_fetch(rti, queryDesc->plannedstmt->rtable);
+					if (rte == NULL || rte->rtekind != RTE_RELATION ||
+						!OidIsValid(rte->relid))
+						continue;
+					nspoid = get_rel_namespace(rte->relid);
+					if (!OidIsValid(nspoid)) continue;
+					nsp = get_namespace_name(nspoid);
+					if (nsp == NULL) continue;
+					if (strcmp(nsp, "pg_catalog") == 0 ||
+						strcmp(nsp, OBSCHEMA) == 0 ||
+						strncmp(nsp, "pg_toast", 8) == 0)
+						continue;
+					has_managed_rel = true;
+					break;
+				}
+			if (has_managed_rel)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("overlay_branch MVP does not support MERGE inside a branch (R06 WR-stage blocked)"),
+						 errhint("Rework MERGE as separate INSERT/UPDATE/DELETE statements.")));
+		}
 
 		if (dml_split && queryDesc->plannedstmt != NULL &&
 			queryDesc->plannedstmt->resultRelations != NIL)
@@ -544,8 +809,32 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				TupleTableSlot **retslots = NULL;
 				int			nretslots = 0;
 				int			nretslots_alloc = 0;
+				/* =============================================================
+				 * REVIEW-260926 / R03: PK-column mutation guard state.
+				 * Bitmap of PK attnos (bit index = 1-based attno - 1).
+				 * Non-NULL only for CMD_UPDATE with a valid primary key on
+				 * the target relation.  Declared HERE (top of block) to
+				 * comply with ISO C90 mixed-declaration-code rule (-Werror
+				 * would otherwise fail under -Wdeclaration-after-statement).
+				 * ============================================================= */
+				Bitmapset  *pk_attnums_set = NULL;
 
 				subplan = outerPlanState(mt);
+
+				if (cmd == CMD_UPDATE)
+				{
+					ListCell   *lcpk;
+					List	   *pkidxs;
+
+					pkidxs = overlay_get_pk_attnos_list(rel);
+					if (pkidxs != NULL)
+						foreach(lcpk, pkidxs)
+						{
+							int attno = lfirst_int(lcpk);
+							pk_attnums_set =
+								bms_add_member(pk_attnums_set, attno - 1);
+						}
+				}
 
 				for (;;)
 				{
@@ -626,6 +915,31 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 												  (AttrNumber) (j + 1),
 												  &jisnull);
 
+									/* ===== REVIEW-260926 / R03 =====
+									 * If this column is a primary-key
+									 * column, then the user has put the
+									 * PK inside SET targetlist.  Forbid
+									 * BEFORE writing any delta: the old
+									 * PK key would be used for the delta
+									 * row, but the post-image carries a
+									 * DIFFERENT key — live view + apply
+									 * both misbehave.  Note ratt->attnum
+									 * is the LOGICAL 1-based attno of
+									 * the column (per heap
+									 * TupleDescAttr convention) so the
+									 * bitmap offset is attnum-1. */
+									if (pk_attnums_set != NULL &&
+										bms_is_member(ratt->attnum - 1,
+													  pk_attnums_set))
+									{
+										ereport(ERROR,
+												(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+												 errmsg("overlay_branch MVP does not support UPDATE that modifies primary key columns (R03 pk-mutation blocked)"),
+												 errdetail("Target relation has primary key column \"%s\"; attempting to SET it would desync the delta key from the post-image.",
+														   rname),
+												 errhint("To change a PK value inside a branch, DELETE the old row then INSERT a new row with the desired key.  Those two DML are both properly redirected to the delta store.")));
+									}
+
 									elog(DEBUG2, "UD[dbg] D[%d] set %s: j=%d jtype=%u jisnull=%d",
 										 r, rname, j, jatt->atttypid, jisnull ? 1 : 0);
 
@@ -638,6 +952,30 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 										jvalue = datumCopy(jvalue, typbyval, typlen);
 										old_clean_slot->tts_values[r] = jvalue;
 										old_clean_slot->tts_isnull[r] = false;
+									}
+									/* ===== REVIEW-260926 / R20 =====
+									 * If `jisnull` is true we used to
+									 * fall through, i.e. the caller
+									 * requested SET col = NULL but the
+									 * merge logic treated "NULL Datum
+									 * in junk slot" the same as "this
+									 * column wasn't mentioned in SET
+									 * targetlist" — so the old value
+									 * remained in the post-image.
+									 * That is an MVP semantic bug.  Fix
+									 * below: if the column IS in the
+									 * SET targetlist (we already found
+									 * it by name in the junkdesc),
+									 * then we MUST copy the isnull
+									 * flag regardless of whether the
+									 * corresponding Datum is zero.  The
+									 * value side already handles the
+									 * non-null case above, so here we
+									 * just force tts_isnull[r]=true. */
+									else
+									{
+										old_clean_slot->tts_values[r] = (Datum) 0;
+										old_clean_slot->tts_isnull[r] = true;
 									}
 									break;
 								}
@@ -1210,6 +1548,32 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											{
 												bool jisnull;
 												Datum jvalue;
+												/* ===== REVIEW-260926 / R03
+												 * (pure-delta path) =====
+												 * Same PK-mutation guard as
+												 * MAIN-hit set-merge path: if
+												 * the SET target column is a
+												 * primary-key column, forbid
+												 * BEFORE any delta_insert.
+												 * Without this guard the
+												 * pure-delta post-image
+												 * would carry a DIFFERENT key
+												 * from the delta row's key
+												 * (the original INSERT key)
+												 * so live-view lookups and
+												 * apply both see desynced
+												 * keys. */
+												if (pk_attnums_set != NULL &&
+													bms_is_member(ratt->attnum - 1,
+																  pk_attnums_set))
+												{
+													ereport(ERROR,
+														(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+														 errmsg("overlay_branch MVP does not support UPDATE that modifies primary key columns on pure-delta rows (R03 pk-mutation blocked)"),
+														 errdetail("SET target column \"%s\" is part of the relation primary key.",
+														           rname),
+														 errhint("To change a PK on a pure-delta row, DELETE it, then INSERT a new row with the desired new primary key.  Both DELETE and INSERT DML are fully supported for pure-delta rows.")));
+												}
 												if (set_plan_slot->tts_nvalid <
 												    (AttrNumber)(j+1))
 													set_plan_slot->tts_nvalid =
@@ -1229,6 +1593,21 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 														jvalue;
 													post_image->tts_isnull[r] =
 														false;
+												}
+												/* ===== REVIEW-260926 / R20
+												 * (pure-delta path) =====
+												 * When SET col = NULL on a
+												 * pure-delta row, write the
+												 * isnull flag.  The MAIN-hit
+												 * path already does this;
+												 * we mirror it here so both
+												 * code paths behave
+												 * identically for NULL
+												 * assignments. */
+												else
+												{
+													post_image->tts_values[r] = (Datum) 0;
+													post_image->tts_isnull[r] = true;
 												}
 												break;
 											}
@@ -1683,7 +2062,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					bool pure_hit = (pre_image_slot != NULL);
 					if (oc_action == ONCONFLICT_NONE)
 					{
-						/* Plain INSERT: always promo=1 */
+						r21_check_insert_preconditions(rel, slot, bid, relid,
+													   pk_attno, pk);
 						promotion = 1;
 					}
 					else if (!main_hit && !pure_hit)
@@ -2015,5 +2395,78 @@ ob_write_redirect_done:
 	}
 	PG_END_TRY();
 	overlay_write_redirect_exit();
+
+	/* ================================================================
+	 * REVIEW-260926 / A3+A5 — TOP-LEVEL PANIC CHOKE (belt-and-braces #N):
+	 *
+	 * If we reach here with handled==false BUT the branch is still ACTIVE
+	 * AND the PlannedStmt declares at least one result relation that is
+	 * NOT a protected catalog/internal schema, then a non-standard plan
+	 * shape (e.g.  CustomScan ModifyTable, trigger-re-entrant DML,
+	 * incorrectly-tagged CmdType) has BYPASSED every WR redirect gate
+	 * above AND is about to fall through to the caller's
+	 * standard_ExecutorRun → SILENT DRIFT-WRITE DIRECTLY TO MAIN.
+	 *
+	 * This is treated as a DATA-CORRUPTION LEVEL EMERGENCY: we raise
+	 * ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE (55000) and force an
+	 * ERROR abort of the entire transaction rather than risk even a
+	 * single row landing on MAIN outside of the delta machinery.
+	 *
+	 * The check runs AFTER the PG_TRY block because handled is only
+	 * flipped to true inside each CMD_*_redirect branch via the
+	 * goto ob_write_redirect_done path.  If we are here with handled
+	 * still false after all gates, we are in the bypass danger zone.
+	 * ================================================================ */
+	if (!handled &&
+		overlay_branch_is_active() &&
+		(cmd == CMD_INSERT || cmd == CMD_UPDATE ||
+		 cmd == CMD_DELETE  || cmd == CMD_MERGE))
+	{
+		if (queryDesc->plannedstmt != NULL &&
+			queryDesc->plannedstmt->resultRelations != NIL)
+		{
+			ListCell   *lc;
+			bool		has_managed = false;
+
+			foreach(lc, queryDesc->plannedstmt->resultRelations)
+			{
+				Index		rti = lfirst_int(lc);
+				RangeTblEntry *rte;
+				Oid			nspoid;
+				char	   *nsp;
+
+				if (rti <= 0 || queryDesc->plannedstmt->rtable == NULL ||
+					rti > list_length(queryDesc->plannedstmt->rtable))
+					continue;
+				rte = rt_fetch(rti, queryDesc->plannedstmt->rtable);
+				if (rte == NULL || rte->rtekind != RTE_RELATION ||
+					!OidIsValid(rte->relid))
+					continue;
+				nspoid = get_rel_namespace(rte->relid);
+				if (!OidIsValid(nspoid)) continue;
+				nsp = get_namespace_name(nspoid);
+				if (nsp == NULL) continue;
+				if (strcmp(nsp, "pg_catalog") == 0 ||
+					strcmp(nsp, "information_schema") == 0 ||
+					strncmp(nsp, "pg_toast", 8) == 0 ||
+					strcmp(nsp, OBSCHEMA) == 0)
+					continue;
+				has_managed = true;
+				break;
+			}
+
+			if (has_managed)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("overlay_branch PANIC: write-redirection bypass "
+								"detected for a managed table inside an active branch "
+								"(A3/A5 WR-choke abort; drift-write to MAIN prevented)"),
+						 errhint("This statement uses a plan shape not certified "
+								 "by overlay_branch MVP.  Please rewrite as a plain "
+								 "INSERT/UPDATE/DELETE against one heap relation with "
+								 "an explicit PRIMARY KEY.")));
+		}
+	}
+
 	return handled;
 }

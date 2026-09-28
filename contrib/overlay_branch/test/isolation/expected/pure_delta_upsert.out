@@ -4,7 +4,7 @@ starting permutation: s1_use_p1 s3_parallel s1_upsert_a s1_apply s1_check
 step s1_use_p1: SELECT overlay_branch.create_branch('bs_up_p1'); SELECT overlay_branch.use_branch('bs_up_p1');
 create_branch
 -------------
-            1
+            8
 (1 row)
 
 use_branch
@@ -22,7 +22,7 @@ step s3_parallel:
 
 create_branch
 -------------
-            1
+            9
 (1 row)
 
 use_branch
@@ -53,7 +53,7 @@ starting permutation: s2_use_p2 s2_pure_seed s2_upsert_b s2_discard s2_check
 step s2_use_p2: SELECT overlay_branch.create_branch('bs_up_p2'); SELECT overlay_branch.use_branch('bs_up_p2');
 create_branch
 -------------
-            1
+           10
 (1 row)
 
 use_branch

@@ -363,6 +363,177 @@ NOTICE:  discarding current branch "b11", reverting to Main
  
 (1 row)
 
+-- =====================================================================
+-- Section R_SETNULL (REVIEW-260926 / R20): UPDATE SET nullable_col = NULL
+--   must actually NULL-ify the column on both MAIN-based rows and
+--   pure-delta INSERT rows (in the overlay view and after apply).
+--   Prior fix only merged SET values when Datum was non-NULL, so a
+--   deliberate SET NULL was silently ignored by the write-redirect
+--   merge loop.
+-- =====================================================================
+CREATE TABLE pd_t7 (
+    id      integer PRIMARY KEY,
+    v       text,
+    note    text    -- nullable column explicitly used for SET NULL tests
+);
+INSERT INTO pd_t7 VALUES (1, 'main_a', 'not_null_1'),
+                         (2, 'main_b', 'not_null_2');
+SELECT create_branch('b_r20');
+ create_branch 
+---------------
+             6
+(1 row)
+
+SELECT use_branch('b_r20');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R20-1: MAIN baseline row SET note = NULL (overlay view must see NULL).
+UPDATE pd_t7 SET note = NULL WHERE id = 1;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_1_MAIN_SET_NULL'
+            ELSE 'FAIL:R20_1 note=' || COALESCE(note,'NULL') END AS r20_1
+  FROM pd_t7 WHERE id = 1;
+          r20_1           
+--------------------------
+ PASS:R20_1_MAIN_SET_NULL
+(1 row)
+
+-- R20-2: Insert a pure-delta row, then UPDATE SET note = NULL.  This
+--         exercises the pure-delta UPDATE pass (S08) R20 jisnull=true
+--         branch (overlay_serialize_tuple MUST still write isnull=true).
+INSERT INTO pd_t7 VALUES (10, 'pure_c', 'still_not_null');
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_2_PURE_UPDATE_SET_NULL'
+            ELSE 'FAIL:R20_2 note=' || COALESCE(note,'NULL') END AS r20_2
+  FROM pd_t7 WHERE id = 10;
+              r20_2              
+---------------------------------
+ PASS:R20_2_PURE_UPDATE_SET_NULL
+(1 row)
+
+-- R20-5: Pure-delta row R20 NULL↔非NULL 多次 toggle 验证 pure-delta 分支
+--        isnull flag 状态正确不残留。
+UPDATE pd_t7 SET note = 'after_null_1' WHERE id = 10;
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+UPDATE pd_t7 SET note = 'after_null_2' WHERE id = 10;
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_5_PURE_TOGGLE_FINAL_NULL'
+            ELSE 'FAIL:R20_5 note=' || COALESCE(note,'NULL') END AS r20_5
+  FROM pd_t7 WHERE id = 10;
+               r20_5               
+-----------------------------------
+ PASS:R20_5_PURE_TOGGLE_FINAL_NULL
+(1 row)
+
+-- R03 (pure-delta UPDATE SET pk): 确保 pure-delta pass 也走 pk_attnums_set 0A000。
+-- DO block: EXCEPTION WHEN OTHERS → assert SQLSTATE=0A000; MAIN baseline unchanged.
+DO $$
+DECLARE
+  old_cnt int; old_sum_v int;
+BEGIN
+  SELECT count(*), coalesce(sum(id),0) INTO old_cnt, old_sum_v FROM pd_t7;
+  BEGIN
+    UPDATE pd_t7 SET id = 9901 WHERE id = 10;
+    RAISE EXCEPTION 'FAIL_R03_PURE_NO_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '0A000' THEN
+      RAISE EXCEPTION 'FAIL_R03_PURE_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+    END IF;
+  END;
+  -- assert baseline
+  IF (SELECT count(*) FROM pd_t7) <> old_cnt OR
+     (SELECT coalesce(sum(id),0) FROM pd_t7) <> old_sum_v THEN
+    RAISE EXCEPTION 'FAIL_R03_PURE_BASELINE_MUTATED_cnt_sum_%,_%',
+      (SELECT count(*) FROM pd_t7), (SELECT coalesce(sum(id),0) FROM pd_t7);
+  END IF;
+END $$;
+-- R02: pure-delta row 连续 UPDATE v = v + 1 三次 → 最终 v = 'pure_c' 加三次后缀.
+--      (pure-delta UPDATE 每次都从前一个 delta tuple_data 取 pre-image，
+--      保证 v = v || suffix 链式折叠最终正确)
+UPDATE pd_t7 SET v = v || '+1' WHERE id = 10;   -- 'pure_c+1'
+UPDATE pd_t7 SET v = v || '+2' WHERE id = 10;   -- 'pure_c+1+2'
+UPDATE pd_t7 SET v = v || '+3' WHERE id = 10;   -- 'pure_c+1+2+3'
+SELECT CASE WHEN v = 'pure_c+1+2+3' THEN 'PASS:R02_PURE_UPDATE_CHAIN_OK'
+            ELSE 'FAIL:R02 v=' || COALESCE(v, 'NULL') END AS r02_pure_chain
+  FROM pd_t7 WHERE id = 10;
+        r02_pure_chain         
+-------------------------------
+ PASS:R02_PURE_UPDATE_CHAIN_OK
+(1 row)
+
+-- R20-3: Alternate non-null and NULL assignments on MAIN id=2 to make
+--        sure successive slot merges don't leave stale isnull flags.
+UPDATE pd_t7 SET note = 'n1' WHERE id = 2;          -- non-null first
+UPDATE pd_t7 SET note = NULL WHERE id = 2;          -- then NULL
+UPDATE pd_t7 SET note = 'n3' WHERE id = 2;          -- then non-null again (should be 'n3')
+SELECT CASE WHEN note = 'n3' THEN 'PASS:R20_3_TOGGLE_BACK'
+            ELSE 'FAIL:R20_3 note=' || COALESCE(note,'NULL') END AS r20_3
+  FROM pd_t7 WHERE id = 2;
+         r20_3          
+------------------------
+ PASS:R20_3_TOGGLE_BACK
+(1 row)
+
+UPDATE pd_t7 SET note = NULL WHERE id = 2;          -- finally NULL again
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_3_FINAL_NULL'
+            ELSE 'FAIL:R20_3_final note=' || COALESCE(note,'NULL') END AS r20_3f
+  FROM pd_t7 WHERE id = 2;
+        r20_3f         
+-----------------------
+ PASS:R20_3_FINAL_NULL
+(1 row)
+
+-- R20-4: apply branch → MAIN must reflect NULL note columns for
+--        MAIN-baseline rows id=1/2, AND the pure-delta row id=10 now
+--        HAS a real delta-UPDATE record that applies via insert_pass
+--        fallback for pure rows (P10 rule).  After apply, id=10 must
+--        show: id=10, v='pure_c+1+2+3' (pure UPDATE chain OK) + note=NULL
+--        (R20 pure-path NULL OK).
+SELECT use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT apply_branch('b_r20');
+NOTICE:  overlay_branch: APPLY BRANCH 'b_r20' (passes D→U→I with optimistic conflict detection)
+NOTICE:  overlay_branch: APPLY BRANCH 'b_r20' completed (state=applied, delta rows deleted)
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_4_APPLY_ID1_NULL'
+            ELSE 'FAIL:R20_4_id1 note=' || COALESCE(note,'NULL') END AS r20_4_id1
+  FROM pd_t7 WHERE id = 1;
+         r20_4_id1         
+---------------------------
+ PASS:R20_4_APPLY_ID1_NULL
+(1 row)
+
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_4_APPLY_ID2_NULL'
+            ELSE 'FAIL:R20_4_id2 note=' || COALESCE(note,'NULL') END AS r20_4_id2
+  FROM pd_t7 WHERE id = 2;
+         r20_4_id2         
+---------------------------
+ PASS:R20_4_APPLY_ID2_NULL
+(1 row)
+
+SELECT CASE WHEN note IS NULL AND v = 'pure_c+1+2+3'
+            THEN 'PASS:R20_4_PURE_UPDATED_AND_APPLIED'
+            ELSE 'FAIL:R20_4_id10 note=' || COALESCE(note,'NULL')
+                 || ' v=' || COALESCE(v,'NULL')
+       END AS r20_4_id10
+  FROM pd_t7 WHERE id = 10;
+             r20_4_id10              
+-------------------------------------
+ PASS:R20_4_PURE_UPDATED_AND_APPLIED
+(1 row)
+
+-- Cleanup Section R_SETNULL.
+DROP TABLE pd_t7;
 -- cleanup
 DROP TABLE pd_t1, pd_t2, pd_t3, pd_t4, pd_t5, pd_t6;
 DROP EXTENSION overlay_branch CASCADE;

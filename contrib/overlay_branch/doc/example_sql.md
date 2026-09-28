@@ -37,12 +37,13 @@
 - [5. Live Branch 语义：感知 Main 变化](#5-live-branch-语义感知-main-变化)
 - [6. Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE](#6-pure-delta-场景分支里先-insert-再-updatedelete)
   - [6.1 Pure Delta INSERT 再 DELETE](#61-pure-delta-insert-再-delete)
-  - [6.2 Pure Delta UPDATE（MVP = NOP）](#62-pure-delta-updatemvp--nop)
+  - [6.2 Pure Delta UPDATE](#62-pure-delta-update)
   - [6.3 Pure Delta × typmod PK：NUMERIC / BPCHAR](#63-pure-delta--typmod-pknumeric--bpchar)
   - [6.4 Pure Delta × 空 MAIN heap 全链路](#64-pure-delta--空-main-heap-全链路)
 - [7. RETURNING 子句](#7-returning-子句)
 - [8. Data-Modifying CTE：明确 ERROR](#8-data-modifying-cte明确-error)
-- [9. MVP 暂不支持的场景（明确报错）](#9-mvp-暂不支持的场景明确报错)
+- [9. MVP 暂不支持的场景（明确报错） + 已实装 UPSERT](#9-mvp-暂不支持的场景明确报错--已实装-upsert)
+  - [9.1 新增：UPSERT 实装示例（B2）](#91-新增upsert-实装示例b2)
 - [10. V3 FR5：Snapshot vs Live 两种分支语义对比](#10-v3-fr5snapshot-vs-live-两种分支语义对比)
   - [10.1 典型场景对比](#101-典型场景对比)
   - [10.2 同一 MAIN 变化下的感知差异](#102-同一-main-变化下的感知差异)
@@ -530,11 +531,10 @@ SELECT * FROM products WHERE id = 3;
 
 ## 6. Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE
 
-> ⚠️ 容易被忽略的架构边界：**Write Redirect 的 CMD_UPDATE/DELETE 主循环只扫 MAIN heap（物理行 ctid）**，
-> 所以"分支里自己 INSERT 出来、MAIN 上从来没有过"的纯 delta 行不会进入主循环。
-> V2 已经实现 **pure-delta 单独 ExecQual pass**（8-phase），对纯 INSERT 候选重跑一次 WHERE
-> 条件（兼容 IndexScan / BitmapHeapScan / IndexOnlyScan 3 种下推 qual 存储位置），命中的写 tombstone。
-> 详见 `doc/progress_tracker.md` V2-P3 8-phase 图。
+> **架构说明（用户可见后果）**：Write Redirect 的 CMD_UPDATE/DELETE 主循环**先扫 MAIN heap（物理行 ctid）**，然后再跑一次
+> **pure-delta 8-phase fallback 循环**（针对 "分支里自己 INSERT 出来、MAIN 上从来没有过" 的纯 delta 行）：
+> 重跑一次 WHERE 条件（兼容 IndexScan / BitmapHeapScan / IndexOnlyScan 3 种下推 qual 存储位置），命中后以 latest-wins UPSERT 写回 delta 表。
+> Pure-delta 路径详情见 [multi_session_mvcc.md §D.11-D.12](./multi_session_mvcc.md) 及 AGENTS.md §4.R19。
 
 ### 6.1 Pure Delta INSERT 再 DELETE
 
@@ -581,24 +581,28 @@ SELECT id, grp, score FROM bs_pd_multi WHERE grp = 'C' ORDER BY id;
 (1 row)
 ```
 
-### 6.2 Pure Delta UPDATE（MVP = NOP）
+### 6.2 Pure Delta UPDATE
 
-分支里自己 INSERT 出来的行再 UPDATE — **V2 MVP 明确保持安全 NOP**
-（不静默脏改数据；需要改先 DELETE 再 INSERT 等效语义）。断言不会 silent 变更：
+分支里自己 INSERT 出来的纯 delta 行（MAIN 上没有对应物理行）再 UPDATE，走 **pure-delta 单独 8-phase 主循环**：
+重跑一次 WHERE 条件（兼容 IndexScan / BitmapHeapScan / IndexOnlyScan 三种下推 qual 存储位置），对命中行做 SET 列合并后，以 UPSERT 最新-wins 的方式写回 `pg_branch_delta`（`op='U'`，原 `tuple_data` 的列被 SET 覆盖）：
 
 ```sql
-INSERT INTO products VALUES (999, 'WillNotChange', 1);
+INSERT INTO products VALUES (999, 'WillBeUpdated', 1);
 SELECT id, name, price FROM products WHERE id = 999;
- id  |     name      | price
------+---------------+-------
- 999 | WillNotChange |     1
+ id  |      name       | price
+-----+-----------------+-------
+ 999 | WillBeUpdated   |     1
 
-UPDATE products SET price = 999999 WHERE id = 999;
+UPDATE products SET price = 999999, name = 'UpdatedOK' WHERE id = 999;
+UPDATE 1
 SELECT id, name, price FROM products WHERE id = 999;
- id  |     name      | price
------+---------------+-------
- 999 | WillNotChange |     1     ← 仍是原值（MVP 安全 NOP；V3 再实装 pure-delta UPDATE）
+ id  |    name     |  price
+-----+-------------+---------
+ 999 | UpdatedOK   | 999999     ← 实装：pure-origin UPDATE 生效（SET 两列都写回 delta op='U'）
 ```
+
+后续 `apply_branch()` 时 MAIN 上 id=999 不存在，会走 "UPDATE pure-origin MAIN-miss → `insert_pass` fallback"
+（因为 delta 行 `_base_ctid` / `_base_xmin` 为 NULL），最终以 `op='U'` 的语义 INSERT 进 MAIN 表。
 
 ### 6.3 Pure Delta × typmod PK：NUMERIC / BPCHAR
 
@@ -724,16 +728,56 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 |------|------|----------------|
 | 对**无主键**表写 DML | 立即拒绝，不写任何东西 | `overlay_serialize_pk requires a primary key on ...`（写 delta 阶段）或 Write Redirect guard 拦截 |
 | 在分支里执行大部分 DDL（ALTER / CREATE TABLE / DROP）| ProcessUtility 钩子拦截 | `overlay_branch: cannot execute <DDL stmt> inside active branch ...` |
-| `INSERT ... ON CONFLICT` (UPSERT) | 走标准 ModifyTable → 被 guard 拦截或按普通 INSERT 处理，MVP 建议先查询再写入 + 应用层重试 |
+| `INSERT ... ON CONFLICT` (UPSERT) | **已实装（B2）**：Plain INSERT ON CONFLICT DO NOTHING / DO UPDATE 都走 pure-delta 4-way promo 调度；ON CONFLICT 23505 冲突检测在 MAIN/delta 双侧 2-phase 进行；唯一限制：R21 写前 NOT NULL + PK UNIQUE 双侧预检仅对 plain INSERT（ONCONFLICT_NONE）生效（UPSERT 走 Phase I/II 更丰富的 2-phase 检测）；见下面 §9.1 | N/A（实装，正常支持）|
 | **分区表**（根/叶）| 6 层 guard 的 G3 级提前拒绝（relkind / partitioned） | `overlay_branch does not support partitioned tables`（guard 通用提示）|
 | **FK 级联写**（trigger 触发的子表级联 UPDATE/DELETE）| G4 级非 internal trigger 拦截或 G5 `pg_constraint` FK 检测 | `cannot modify via FK-triggered write`（guard 通用提示）|
 | 直接对 `pg_branch` / `pg_branch_delta` 用户写 | `security_barrier` view 无 INSERT/UPDATE/DELETE rule → 普通报错 | `cannot insert into view "pg_branch"`（PG 原生视图错误）|
 | **在 `create_branch()` 时指定 `isolation = 'snapshot'`** | `create_branch()` 不接受 isolation 参数（catalog 中 pg_branch.mode 恒为 live）；要开启 snapshot 语义，请在进入分支时显式 `use_branch(name, mode => 'snapshot')`（见 §1.2）| 若硬传 snapshot 到 mode 字段不生效（建议走 use_branch 的 FR5 入口）|
 | 对 VIEW / MATVIEW / FOREIGN TABLE 写 DML | 在 guard 的 G2/G3 级就拦截，不支持透明叠加读 | V2 BranchScan planner hook 直接 skip，走原路径；DML 则在 WR guard 报错 |
+| **COPY FROM / MERGE / Data-Modifying CTE** | R05/R06/R16 入口拦截（MVP 范围硬性禁止）| 0A000 feature_not_supported："COPY FROM on overlay-managed tables is not supported in MVP"（防止写穿 MAIN）|
+| **UPDATE t SET pk_col = ...**（修改主键列）| R03 拒绝：MAIN path + pure-delta path 两路都检查 targetList 是否命中 PK attnum → 0A000 | "Updating the PRIMARY KEY column of an overlay-managed table is not supported" |
 
-这些限制在后续版本逐步解除。MVP 能跑通「有 PK 的普通 heap 表 + I/U/D + V2 透明 BranchScan
-（含 P0 PK O(1) 快路径 + P2 WHERE 非 PK 下推 + P1 RETURNING）+ apply/discard + 冲突检测」
-就已证明 Overlay Branch 模型的正确性。
+这些限制在后续版本逐步解除（分类二 S13 G02 ACL / 分区支持 / FK 级联等见 review_260926 §Cat2）。
+
+### 9.1 新增：UPSERT 实装示例（B2）
+
+`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`（针对 PK 的冲突）现已在分支内正常工作：
+
+```sql
+SELECT create_branch('br_upsert_demo');
+SELECT use_branch('br_upsert_demo');
+
+-- MAIN 已有 id=1 (Apple,10)、id=2 (Banana,5)、id=3 (Cherry,20)
+
+-- 1. ON CONFLICT DO NOTHING：撞 PK → NOP，不报错
+INSERT INTO products VALUES (1, 'NewApple', 999) ON CONFLICT (id) DO NOTHING;
+INSERT 0 0
+SELECT * FROM products WHERE id = 1;
+ id | name  | price
+----+-------+-------
+  1 | Apple |    10   ← 仍为主表 / 分支 delta 的最新（live）覆盖值，不被 DO NOTHING 覆盖
+
+-- 2. ON CONFLICT DO UPDATE：撞 PK → 以 EXCLUDED 新值 SET 更新
+INSERT INTO products VALUES (3, 'Cherry_v2', 222)
+  ON CONFLICT (id) DO UPDATE SET name  = EXCLUDED.name,
+                                  price = EXCLUDED.price;
+INSERT 0 1
+SELECT * FROM products WHERE id = 3;
+ id |   name    | price
+----+-----------+-------
+  3 | Cherry_v2 |   222   ← 分支 delta op='U' 覆盖 MAIN 原 Cherry/20
+
+-- 3. 撞分支自己的 pure-origin INSERT（MAIN 上没有 id=100）
+INSERT INTO products VALUES (100, 'First', 1) ON CONFLICT (id) DO NOTHING;
+INSERT INTO products VALUES (100, 'Dupe',  2) ON CONFLICT (id) DO NOTHING;  -- 撞 1st delta I
+INSERT 0 0
+SELECT * FROM products WHERE id = 100;
+ id  | name  | price
+-----+-------+-------
+ 100 | First |     1  -- latest-wins：First 幸存
+```
+
+Apply 后 MAIN 上的最终值与分支 LIVE 视图严格对齐（UPSERT 产生的 delta op 类型按 MAIN-hit × pure-hit × oc_action × WHERE-cond 4 维表归一化成 I/U/D，然后走 D-U-I 3-pass merge）。
 
 ---
 

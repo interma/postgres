@@ -4,7 +4,7 @@ starting permutation: s1_enter_p1 s1_pure_ins s1_upd_101 s1_apply s1_check
 step s1_enter_p1: SELECT overlay_branch.create_branch('bs_upd_p1'); SELECT overlay_branch.use_branch('bs_upd_p1');
 create_branch
 -------------
-            1
+           11
 (1 row)
 
 use_branch
@@ -36,7 +36,7 @@ starting permutation: s2_enter_p2 s2_pure_ins s2_upd_22 s2_upd_222 s2_discard s2
 step s2_enter_p2: SELECT overlay_branch.create_branch('bs_upd_p2'); SELECT overlay_branch.use_branch('bs_upd_p2');
 create_branch
 -------------
-            1
+           12
 (1 row)
 
 use_branch
@@ -69,7 +69,7 @@ starting permutation: s3_enter_p3 s4_enter_p3 s4_pure_ins s3_upd_base s4_upd_pur
 step s3_enter_p3: SELECT overlay_branch.create_branch('bs_upd_p3'); SELECT overlay_branch.use_branch('bs_upd_p3');
 create_branch
 -------------
-            1
+           13
 (1 row)
 
 use_branch
@@ -80,7 +80,7 @@ use_branch
 step s4_enter_p3: SELECT overlay_branch.create_branch('bs_upd_p3b'); SELECT overlay_branch.use_branch('bs_upd_p3b');
 create_branch
 -------------
-            1
+           14
 (1 row)
 
 use_branch

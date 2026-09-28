@@ -143,7 +143,34 @@ typedef struct BranchContext
 	bool		snapshot_registered;			/* true iff UnregisterSnapshot is pending */
 	uint32		invalidation_counter;			/* FR4: throttle SPI re-checks */
 	TimestampTz	invalidation_last_check;		/* FR4: throttle SPI re-checks */
+	TimestampTz	entered_at;						/* REVIEW-260926/R19: when use_internal last activated this ctx (snapshot TTL clock).  0 = not in snapshot mode. */
 } BranchContext;
+
+/* ----------
+ * TypedKey (REVIEW-260926/R14 MVP):
+ *   Per-column typed primary-key value used for BranchScan comparisons
+ *   that MUST match PostgreSQL's native type equality semantics (BPCHAR
+ *   r-trim, NUMERIC precision-insensitive equals, TIMESTAMPTZ absolute
+ *   UTC comparison).  The legacy JSON-serialised `key` TEXT field is
+ *   kept for persistence into pg_branch_delta and for legacy helper
+ *   callers; the TypedKey array is the authoritative comparison source
+ *   inside the C extension.
+ *
+ *   Memory: typbyval=false Datum values (text/numeric/timestamptz etc.)
+ *   are palloc'd inside the same context as the owner DeltaTuple, and
+ *   are freed by overlay_typed_pk_free().
+ * ----------
+ */
+typedef struct TypedKey
+{
+	Oid			typid;			/* pg_type.oid */
+	int32		typmod;			/* resolved attribute typmod, -1 = none */
+	Oid			collid;			/* collation Oid, InvalidOid = default */
+	Datum		value;			/* datum value */
+	bool		isnull;			/* true = NULL PK part (error for strict) */
+	bool		typbyval;		/* cached: true = Datum is pass-by-value */
+	int16		typlen;			/* cached: typlen from pg_type */
+} TypedKey;
 
 /* ----------
  * DeltaTuple: in-memory representation of one delta entry
@@ -153,11 +180,14 @@ typedef struct DeltaTuple
 {
 	int32		branch_id;
 	Oid			relid;
-	char	   *key;			/* serialized PK value */
+	char	   *key;			/* serialized PK value (TEXT, for SPI storage + legacy) */
 	char		op;				/* 'I', 'U', or 'D' */
 	char	   *old_version;	/* base version for conflict check */
 	bytea	   *tuple_data;		/* serialized new tuple (NULL for delete) */
 	bool		emitted;		/* Step4b: has this entry been output in the main pass? */
+	/* ===== V3 append-only fields (ABI-safe) — typed pk, REVIEW-260926/R14 ===== */
+	TypedKey  *typed_pk;		/* NULL=fallback strcmp(dt->key); non-NULL=typed comparison */
+	int			typed_pk_n;		/* -1=uninitialised, else length of typed_pk[] */
 } DeltaTuple;
 
 /* ----------
@@ -176,6 +206,7 @@ extern int	ob_invalidation_check_interval_ms;	/* every M ms → SPI check */
 extern bool	ob_apply_strict_pins;				/* apply fails if other sessions hold pins */
 extern bool	ob_use_shared_mem_pin_table;		/* optional: shmem pin tracking */
 extern bool	ob_in_snapshot_mode_helper;		/* internal: PushActiveSnapshot guard */
+extern int	ob_snapshot_max_hold_minutes;		/* R19 RESTRICTED: snapshot mode max minutes */
 
 /* ----------
  * Recursion-guard globals (owned by overlay_branch.c; written
@@ -280,11 +311,30 @@ extern bool		overlay_relation_has_pk(Relation rel);
 extern bool		overlay_get_pk_single_attno(Relation rel,
 											 AttrNumber *out_pk_attno,
 											 const char **out_pk_colname);
+extern List    *overlay_get_pk_attnos_list(Relation rel);
 extern char    *overlay_serialize_pk_from_single_datum(Relation rel,
 													   AttrNumber pk_attno,
 													   Datum pk_val,
 													   bool pk_isnull,
 													   Oid consttype);
+
+/* ---------- Typed PK helpers (REVIEW-260926/R14) ----------
+ *
+ * All return non-NULL TypedKey* arrays on success (caller must
+ * overlay_typed_pk_free to avoid typbyval=false datum leaks).
+ * out_n_pk is set to the number of PK columns on success (>= 1).
+ * On any failure the functions raise ERROR with a descriptive message
+ * and do not return; they never return NULL with a valid *out_n_pk.
+ */
+extern TypedKey *overlay_build_typed_pk_from_slot(Relation rel,
+												  TupleTableSlot *slot,
+												  int *out_n_pk);
+extern TypedKey *overlay_build_typed_pk_from_key_text(Relation rel,
+													  const char *key_json,
+													  int *out_n_pk);
+extern int  overlay_typed_pk_cmp(const TypedKey *a, int a_n,
+								 const TypedKey *b, int b_n);
+extern void overlay_typed_pk_free(TypedKey *pk, int n_pk);
 
 /* ----------
  * Step7 HARD GUARD: shared helper for checking rel eligibility inside an

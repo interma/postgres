@@ -1075,7 +1075,7 @@ SELECT count(*) AS bs_baseline_main_count FROM public.bs_basic;
 SELECT create_branch('bs_basic_b1') AS bs_id_b1;
  bs_id_b1 
 ----------
-        9
+        1
 (1 row)
 
 SELECT use_branch('bs_basic_b1');
