@@ -34,7 +34,8 @@ REGRESS = \
   overlay_branch_mvcc_usage \
   overlay_branch_mvcc_bounds \
   overlay_branch_mvcc_review \
-  overlay_branch_rentry
+  overlay_branch_rentry \
+  overlay_branch_view_unify
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \
@@ -43,8 +44,8 @@ ISOLATION_OPTS = \
 	--inputdir=$(srcdir)/test/isolation \
 	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
 
-# L1 pg_isolation_regress concurrency tests (T8 total acceptance).
-ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete
+# L1 pg_isolation_regress concurrency tests (T9 total acceptance).
+ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan
 EXTRA_CLEAN += test_output output_iso tmp_check_iso
 
 # Handy helper: sync the just-built extension bits (so/sql/control) out of the

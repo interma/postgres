@@ -15,7 +15,7 @@
  *     CONFLICT-2 (R18 rewrite) xmin/ctid 改 → token mismatch 捕获；MAIN race preserved
  */
 
-/* -------- SECTION R-API -------- */
+/* -------- SECTION R-API --------
  *
  * 单 session 自包含；SETUP 独立（CREATE TABLE r_api_t + INSERT 2 行 baseline）。
  */
@@ -204,7 +204,7 @@ END $$;
 DISCARD ALL;
 SET client_min_messages = WARNING;
 
-/* -------- SECTION R-CTX -------- */
+/* -------- SECTION R-CTX --------
  *
  * 单 session 自包含；SETUP：r_ctx_t 18 行 baseline + 分支 b_r_ctx。
  */
@@ -411,7 +411,7 @@ SELECT discard_branch('b_r_ctx');
 DISCARD ALL;
 SET client_min_messages = WARNING;
 
-/* -------- SECTION R-VERSION -------- */
+/* -------- SECTION R-VERSION --------
  *   GLOBAL CLEANUP：DROP TABLE rv_t + PASS:R15_R18_R_VERSION_SECTION_OK
  *
  * 单 session 自包含；不含跨 session 依赖。
@@ -508,7 +508,7 @@ FROM public.rv_t WHERE id = 1;
 
 SELECT CASE WHEN (h.ctid = b.ctid_b AND h.xmin::text = b.xmin_b)
             THEN 'PASS:R15_SAME_CTID_XMIN_HOT_UPDATED (scenario prereq met)'
-            ELSE 'INFO:R15_HOT_PREREQ_UNMET ctid=' || h.ctid::text || ' base=' || b.ctid_b::text || ' xmin_h=' || h.xmin::text || ' xmin_b=' || b.xmin_b || ' (non-HOT; legacy guard catches it instead)'
+            ELSE 'INFO:R15_HOT_PREREQ_UNMET (non-HOT scenario; legacy guard catches it instead) — xmin values intentionally elided to keep test deterministic across fresh database instances'
        END AS rv_hot_prereq
 FROM public.rv_t h, _rv_ctid_before b WHERE h.id = 1;
 

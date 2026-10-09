@@ -16,6 +16,7 @@
 #include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -24,6 +25,7 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/lmgr.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -45,9 +47,351 @@
 extern bool ob_in_apply_operation;
 extern bool ob_in_guc_setconfig;
 
-/* ============ V3 FR5: per-branch frozen snapshot cache (TopMC hash) ============
+/* ================================================================
+ * §G02 ACL helpers (S13) — double-layer defense
  *
- * Key = int32 branch_id. Value = the CopySnapshot-allocated frozen MAIN
+ *   Layer 1 (SQL):  overlay_branch--1.0.sql revokes EXECUTE TO PUBLIC
+ *                   on lifecycle functions; grants only to owner +
+ *                   the builtin role OB_MGMT_ROLE_NAME.
+ *   Layer 2 (C  ):  this `ob_acl_check_lifecycle` helper, re-checked
+ *                   inside every SQL-callable wrapper so direct
+ *                   @extschema@.qualification bypasses of layer-1 still
+ *                   get 42501.  For use/apply/discard we also read the
+ *                   pg_branch.owner column and compare to the current
+ *                   user.
+ * ================================================================ */
+
+static Oid
+ob_lookup_mgmt_role_oid(void)
+{
+	return GetSysCacheOid1(AUTHNAME,
+						   Anum_pg_authid_oid,
+						   CStringGetDatum(OB_MGMT_ROLE_NAME));
+}
+
+static bool
+ob_user_is_superuser_or_mgmt(void)
+{
+	Oid			mgmt_oid;
+
+	if (superuser())
+		return true;
+
+	mgmt_oid = ob_lookup_mgmt_role_oid();
+	if (OidIsValid(mgmt_oid) && is_member_of_role(GetUserId(), mgmt_oid))
+		return true;
+
+	return false;
+}
+
+static bool
+ob_user_is_branch_owner(const char *branch_name, Oid *out_owner)
+{
+	bool		result = false;
+	int			ret;
+	StringInfoData sql;
+	char	   *esc_name;
+	Oid			owner;
+	bool		isnull;
+	Datum		v;
+
+	if (out_owner) *out_owner = InvalidOid;
+	if (branch_name == NULL || *branch_name == '\0')
+		return false;
+
+	esc_name = quote_literal_cstr(branch_name);
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT owner FROM " OBTABLE_BRANCH " "
+					 "WHERE branch_name = %s LIMIT 1",
+					 esc_name);
+
+	ret = ob_spi_one_shot(sql.data, true, 1);
+	pfree(sql.data);
+	pfree(esc_name);
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		/* Bid does not exist → let the internal function raise its usual
+		 * UNDEFINED_OBJECT error with a branch-specific message, we
+		 * return "not owner" (caller rejects with 42501 only AFTER the
+		 * bid-existence check). */
+		return false;
+	}
+
+	v = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull)
+		owner = InvalidOid;
+	else
+		owner = DatumGetObjectId(v);
+
+	if (out_owner) *out_owner = owner;
+	result = (OidIsValid(owner) && owner == GetUserId());
+	return result;
+}
+
+void
+ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
+{
+	const char *opname;
+	bool		allowed = false;
+	Oid			owner_oid = InvalidOid;
+
+	switch (op)
+	{
+		case OB_OP_CREATE_BRANCH:
+			opname = "create_branch";
+			allowed = ob_user_is_superuser_or_mgmt();
+			break;
+
+		case OB_OP_USE_BRANCH:
+			/* EXIT path (NULL / empty name) is always permitted —
+			 * it only touches the session's local context and the GUC. */
+			if (branch_name == NULL || *branch_name == '\0')
+				return;
+			opname = "use_branch";
+			if (ob_user_is_superuser_or_mgmt())
+				allowed = true;
+			else
+				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			break;
+
+		case OB_OP_APPLY_BRANCH:
+			opname = "apply_branch";
+			if (ob_user_is_superuser_or_mgmt())
+				allowed = true;
+			else
+				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			break;
+
+		case OB_OP_DISCARD_BRANCH:
+			opname = "discard_branch";
+			if (ob_user_is_superuser_or_mgmt())
+				allowed = true;
+			else
+				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			break;
+
+		default:
+			opname = "lifecycle_op";
+			allowed = false;
+			break;
+	}
+
+	if (!allowed)
+	{
+		if (op == OB_OP_CREATE_BRANCH)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to create a branch"),
+					 errhint("Must be superuser or member of role \"%s\".",
+							 OB_MGMT_ROLE_NAME)));
+		}
+		else if (!OidIsValid(owner_oid))
+		{
+			/* Bid not found → let the underlying internal function raise
+			 * UNDEFINED_OBJECT.  (We can't jump to ERROR here with the
+			 * wrong errcode.) */
+			return;
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for %s on branch \"%s\"",
+							opname, branch_name),
+					 errhint("Must be branch owner, superuser, or member of role \"%s\".",
+							 OB_MGMT_ROLE_NAME)));
+		}
+	}
+}
+
+/* ================================================================
+ * §G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ *
+ * Implementation notes:
+ *   We could walk pg_class via systable_beginscan(SysCacheRel) but a
+ *   single SPI SELECT with EXISTS(...) subqueries against the
+ *   standard catalog views is shorter, uses the same snapshot used
+ *   by every other catalog helper in this file, and is exactly as
+ *   performant (all subqueries are backed by primary btree indexes on
+ *   pg_class / pg_constraint / pg_trigger / pg_inherits /
+ *   pg_attribute / pg_namespace).  Performance is not an issue
+ *   because scope checks run ONCE per create_branch() call, not per
+ *   DML.
+ *
+ *   Output row: 1-column text "CATEGORY|relname.nspname" describing
+ *   the FIRST offending relation.  We fail-fast on the very first
+ *   row because showing a 100-row list of violations overwhelms the
+ *   user.  If the user fixes that one and re-runs, the next hit is
+ *   shown (like a standard compiler).
+ * ================================================================ */
+/* ================================================================
+ * G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ *
+ * Implementation notes:
+ *   - NO WITH-CTEs in SPI queries (we debugged WITH CTE + SPI_execute
+ *     readonly=false combinations failing silently — use flat scalar
+ *     subqueries against pg_extension/pg_namespace/pg_depend instead).
+ *   - Extension-owned objects are filtered out using pg_depend
+ *     (deptype = 'e', refobjid = overlay_branch.oid), regardless of which
+ *     namespace they live in.  This is critical because public.pg_branch
+ *     VIEW and 12 public.* synonyms live in schema public.
+ *   - 7 categories are ordered by "most user-harmful first" for fail-fast
+ *     first-hit reporting.
+ * ================================================================ */
+void
+ob_check_branch_scope(void)
+{
+	int			ret;
+	StringInfoData sql;
+	char	   *detail;
+
+	initStringInfo(&sql);
+	appendStringInfoString(&sql,
+"SELECT cat.reason FROM ( "
+"  SELECT 1 AS ord, "
+"    'FK: ' || n.nspname || '.' || c.relname || ' -> ' || c2.relname AS reason "
+"  FROM pg_constraint x "
+"  JOIN pg_class c ON c.oid = x.conrelid "
+"  JOIN pg_class c2 ON c2.oid = x.confrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE x.contype = 'f' "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_constraint'::regclass "
+"                      AND d.objid = x.oid) "
+"  UNION ALL "
+"  SELECT 2, "
+"    'TRIGGER: ' || n.nspname || '.' || c.relname || '.' || t.tgname "
+"  FROM pg_trigger t "
+"  JOIN pg_class c ON c.oid = t.tgrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE NOT t.tgisinternal "
+"    AND t.tgenabled <> 'D' "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_trigger'::regclass "
+"                      AND d.objid = t.oid) "
+"  UNION ALL "
+"  SELECT 3, "
+"    'PARTITION: ' || n.nspname || '.' || c.relname "
+"  FROM pg_class c "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE (c.relkind IN ('p','I') OR c.relispartition) "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 4, "
+"    'INHERITS: ' || n.nspname || '.' || c.relname "
+"  FROM pg_inherits i "
+"  JOIN pg_class c ON c.oid IN (i.inhrelid, i.inhparent) "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 5, "
+"    'UNLOGGED: ' || n.nspname || '.' || c.relname "
+"  FROM pg_class c "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE c.relpersistence = 'u' "
+"    AND c.relkind = 'r' "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 6, "
+"    'GENERATED STORED in ' || n.nspname || '.' || c.relname || '.' || a.attname "
+"  FROM pg_attribute a "
+"  JOIN pg_class c ON c.oid = a.attrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE a.attgenerated = 's' "
+"    AND NOT a.attisdropped "
+"    AND a.attnum > 0 "
+"    AND c.relkind = 'r' "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 7, "
+"    'UNSUPPORTED RELKIND ' || c.relkind::text || ': ' || n.nspname || '.' || c.relname "
+"  FROM pg_class c "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  WHERE c.relkind NOT IN ('r','S','i') "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  ORDER BY ord LIMIT 1 "
+") cat;");
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "overlay_branch: SPI_connect failed in ob_check_branch_scope");
+
+	ret = SPI_execute(sql.data, false, 1);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: could not run scope precheck: SPI ret=%d", ret)));
+	}
+
+	if (SPI_processed == 0 || SPI_tuptable == NULL || SPI_tuptable->vals == NULL || SPI_tuptable->vals[0] == NULL)
+	{
+		SPI_finish();
+		pfree(sql.data);
+		return;
+	}
+
+	detail = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	SPI_finish();
+	if (detail != NULL && *detail != '\0')
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MVP overlay branch cannot be created because this database contains at least one table in an unsupported category (G01 support matrix)"),
+				 errdetail("First unsupported relation: %s", detail),
+				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  MVP RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, or any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i').")));
+	}
+	pfree(sql.data);
+}
+
+/* ============ V3 FR5: per-branch frozen snapshot cache (TopMC hash) ============
  * snapshot for snapshot-mode branches that have been entered at least once.
  *
  * Why a global cache instead of just ctx->branch_main_snapshot:
@@ -353,6 +697,362 @@ ob_g06_check_publication_leak_throttled(void)
 }
 
 /* ================================================================
+ * §Gx / A7 (review_260926 S18): schema-epoch registry helpers.
+ *
+ *   All 3 helpers are SPI-only, so they can be reused 1:1 from the
+ *   same SQL query the surrounding lifecycle function already uses.
+ *   We explicitly SPI_connect/SPI_finish inside each helper because
+ *   (a) callers at different stack depths (create / use / apply /
+ *   discard) have different pre-existing SPI lifetimes; (b) a clean
+ *   open/close avoids cross-contaminating SPI_tuptable of the
+ *   caller.
+ * ================================================================ */
+
+/* ---------- ob_registry_current_db_tables_query ----------
+ * Builds the SELECT that enumerates *current* user tables in this
+ * database, with exactly the same double-filtering rules as G01 scope
+ * (sys ns / ext ns / ext-owned via pg_depend).  Returns one row per
+ * user table: (relid, schema_name, table_name, total_cols, pk_cols,
+ * col_hash bytea, pk_hash bytea).
+ *
+ * total_cols / pk_cols come first so the 55000 error detail can
+ * quote human-readable numbers without decoding a hash.
+ * ---------- */
+static char *
+ob_registry_fingerprint_sql(void)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+"SELECT\n"
+"  c.oid AS relid,\n"
+"  n.nspname::name AS schema_name,\n"
+"  c.relname::name AS table_name,\n"
+"  (SELECT count(*) FROM pg_catalog.pg_attribute a\n"
+"     WHERE a.attrelid = c.oid\n"
+"       AND a.attnum > 0 AND NOT a.attisdropped) AS total_cols,\n"
+"  COALESCE((SELECT count(*) FROM pg_catalog.pg_index i\n"
+"              JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid\n"
+"                 AND a.attnum = ANY(i.indkey)\n"
+"                 AND NOT a.attisdropped\n"
+"              WHERE i.indrelid = c.oid AND i.indisprimary), 0) AS pk_cols,\n"
+"  (SELECT decode(md5(string_agg(concat_ws('|',\n"
+"                   a.attname, a.atttypid::text, a.attlen::text,\n"
+"                   a.attbyval::text, a.atttypmod::text,\n"
+"                   a.attcollation::text, a.attnotnull::text,\n"
+"                   a.attgenerated::text), '' ORDER BY a.attnum)), 'hex')\n"
+"     FROM pg_catalog.pg_attribute a\n"
+"     WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS col_hash,\n"
+"  (SELECT decode(md5(COALESCE(string_agg(a.attname, '' ORDER BY k.n), '')), 'hex')\n"
+"     FROM pg_catalog.pg_index i\n"
+"     LEFT JOIN pg_catalog.generate_subscripts(i.indkey, 1) k(n) ON true\n"
+"     LEFT JOIN pg_catalog.pg_attribute a\n"
+"       ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n] AND NOT a.attisdropped\n"
+"     WHERE i.indrelid = c.oid AND i.indisprimary) AS pk_hash\n"
+"FROM pg_catalog.pg_class c\n"
+"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n"
+"WHERE c.relkind = 'r'\n"
+"  AND c.relpersistence = 'p'\n"
+"  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')\n"
+"  AND n.nspname <> '%s'\n"
+"  AND NOT EXISTS (\n"
+"     SELECT 1 FROM pg_catalog.pg_depend d\n"
+"     WHERE d.classid = 'pg_catalog.pg_class'::regclass\n"
+"       AND d.objid = c.oid\n"
+"       AND d.deptype = 'e'\n"
+"       AND d.refobjid = (SELECT oid FROM pg_catalog.pg_extension\n"
+"                         WHERE extname = 'overlay_branch'))\n"
+"ORDER BY c.oid",
+		OBSCHEMA);
+	return buf.data;
+}
+
+static void
+ob_registry_populate_spi_connected(int32 bid)
+{
+	const char *fingerprint = ob_registry_fingerprint_sql();
+	StringInfoData sql;
+	int ret;
+
+	if (bid <= 0)
+		return;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s "
+					 "(branch_id, relid, schema_name, table_name, "
+					 " total_cols, pk_cols, col_hash, pk_hash)\n"
+					 "SELECT %d, s.relid, s.schema_name, s.table_name, "
+					 "       s.total_cols, s.pk_cols, s.col_hash, s.pk_hash\n"
+					 "FROM (%s) s",
+					 OBTABLE_REGISTRY, (int) bid, fingerprint);
+
+	ret = SPI_execute(sql.data, false, 0);
+	pfree(sql.data);
+
+	if (ret != SPI_OK_INSERT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: registry_populate for bid=%d SPI ret=%d (expected INSERT ok)",
+						(int) bid, ret)));
+	elog(DEBUG1, "ob_registry_populate(bid=%d, first-use): inserted %lu rows",
+		 (int) bid, (unsigned long) SPI_processed);
+}
+
+void
+ob_registry_populate_for_create(int32 bid)
+{
+	if (bid <= 0)
+		return;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "overlay_branch: SPI_connect failed in registry_populate");
+
+	ob_registry_populate_spi_connected(bid);
+
+	SPI_finish();
+}
+
+void
+ob_registry_check_current_schema(int32 bid, const char *op_name)
+{
+	const char *fingerprint = ob_registry_fingerprint_sql();
+	StringInfoData sql;
+	int ret;
+	bool	any_rows;
+
+	if (bid <= 0)
+		return;
+	if (!op_name) op_name = "schema check";
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "overlay_branch: SPI_connect failed in registry_check");
+
+	/* Stage 1: does this bid have any registry rows?
+	 * If 0 rows → old branch created before 1.3 upgrade; SKIP check
+	 * (preserve backward compat).  Only when registry has data do we
+	 * run the drift LEFT JOIN below. */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT 1 FROM %s WHERE branch_id = %d LIMIT 1",
+					 OBTABLE_REGISTRY, (int) bid);
+	ret = SPI_execute(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		pfree(sql.data);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: registry_existence check for bid=%d SPI ret=%d",
+						(int) bid, ret)));
+	}
+	any_rows = (SPI_processed == 1);
+	pfree(sql.data);
+
+	if (!any_rows)
+	{
+		/* First-use snapshot: populate registry NOW at use_branch /
+		 * apply_branch entry time so subsequent entries/applies detect
+		 * drift against a stable fingerprint baseline.
+		 *
+		 * IMPORTANT: ob_registry_populate_spi_connected may ereport if
+		 * the INSERT fails — wrap the call in PG_TRY so we still call
+		 * SPI_finish on the outer (check_current_schema) SPI connection
+		 * before the error propagates.  Without this the connection
+		 * leaks and the end-of-transaction machinery raises
+		 * "WARNING:  transaction left non-empty SPI stack". */
+		bool		pop_ok = false;
+
+		PG_TRY();
+		{
+			ob_registry_populate_spi_connected(bid);
+			pop_ok = true;
+		}
+		PG_CATCH();
+		{
+			SPI_finish();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		if (pop_ok)
+			SPI_finish();
+		elog(DEBUG1, "ob_registry_check(bid=%d): no registry rows — first-use populate done at %s.",
+			 (int) bid, op_name);
+		return;
+	}
+
+	/* Stage 2a: FIRST-hit drift report for *already-registered* tables only.
+	 * 5 UNION ALL subqueries (mirror G01 scope fail-fast style):
+	 *   1 = table GONE (registry exists, current DB missing relid — DROP on
+	 *       MAIN after this table was already registered to the branch)
+	 *   2 = total_cols mismatch
+	 *   3 = pk_cols mismatch
+	 *   4 = col_hash mismatch
+	 *   5 = pk_hash mismatch
+	 * Tables currently present in MAIN but never registered are handled in
+	 * Stage 2b (incremental INSERT into registry) — they do NOT produce a
+	 * drift error because users may legitimately CREATE TABLE on MAIN
+	 * between create_branch and first/next use_branch.
+	 *
+	 * ORDER BY ord LIMIT 1 → exactly FIRST mismatch reported. */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+"SELECT ord, detail FROM (\n"
+"  SELECT 1::smallint AS ord,\n"
+"         format('table %%I.%%I (registry relid=%%s) has been DROPPED from the database after it was registered to this branch',\n"
+"                r.schema_name, r.table_name, r.relid::text) AS detail\n"
+"    FROM %s r\n"
+"    WHERE r.branch_id = %d\n"
+"      AND NOT EXISTS (SELECT 1 FROM (%s) cur WHERE cur.relid = r.relid)\n"
+"  UNION ALL\n"
+"  SELECT 2::smallint AS ord,\n"
+"         format('total_cols drift for %%I.%%I: registry=%%s, current=%%s',\n"
+"                cur.schema_name, cur.table_name, r.total_cols::text, cur.total_cols::text)\n"
+"    FROM %s r JOIN (%s) cur ON cur.relid = r.relid\n"
+"    WHERE r.branch_id = %d AND r.total_cols <> cur.total_cols\n"
+"  UNION ALL\n"
+"  SELECT 3::smallint AS ord,\n"
+"         format('pk_cols drift for %%I.%%I: registry=%%s, current=%%s (PK added/dropped/rekeyed)',\n"
+"                cur.schema_name, cur.table_name, r.pk_cols::text, cur.pk_cols::text)\n"
+"    FROM %s r JOIN (%s) cur ON cur.relid = r.relid\n"
+"    WHERE r.branch_id = %d AND r.pk_cols <> cur.pk_cols\n"
+"  UNION ALL\n"
+"  SELECT 4::smallint AS ord,\n"
+"         format('column-hash drift for %%I.%%I: column list order/type/collation/notnull/generated changed since table was registered',\n"
+"                cur.schema_name, cur.table_name)\n"
+"    FROM %s r JOIN (%s) cur ON cur.relid = r.relid\n"
+"    WHERE r.branch_id = %d AND r.col_hash <> cur.col_hash\n"
+"  UNION ALL\n"
+"  SELECT 5::smallint AS ord,\n"
+"         format('pk-hash drift for %%I.%%I: PK column order/set changed since table was registered',\n"
+"                cur.schema_name, cur.table_name)\n"
+"    FROM %s r JOIN (%s) cur ON cur.relid = r.relid\n"
+"    WHERE r.branch_id = %d AND r.pk_hash <> cur.pk_hash\n"
+") all_mismatches ORDER BY ord LIMIT 1",
+		/* 1 uses */ OBTABLE_REGISTRY, (int) bid, fingerprint,
+		/* 2 uses */ OBTABLE_REGISTRY, fingerprint, (int) bid,
+		/* 3 uses */ OBTABLE_REGISTRY, fingerprint, (int) bid,
+		/* 4 uses */ OBTABLE_REGISTRY, fingerprint, (int) bid,
+		/* 5 uses */ OBTABLE_REGISTRY, fingerprint, (int) bid);
+
+	ret = SPI_execute(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT)
+	{
+		char *saved = pstrdup(sql.data);
+		pfree(sql.data);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: schema drift LEFT JOIN for bid=%d SPI ret=%d (sql[0:80]=%.80s)",
+						(int) bid, ret, saved)));
+	}
+	if (SPI_processed == 1 && SPI_tuptable && SPI_tuptable->vals && SPI_tuptable->vals[0])
+	{
+		bool ordnull;
+		bool detailnull;
+		Datum d_detail;
+		char *detail_text;
+
+		(void) SPI_getbinval(SPI_tuptable->vals[0],
+							 SPI_tuptable->tupdesc,
+							 1, &ordnull);
+		d_detail = SPI_getbinval(SPI_tuptable->vals[0],
+								 SPI_tuptable->tupdesc,
+								 2, &detailnull);
+		if (detailnull || d_detail == (Datum) 0)
+			detail_text = "unknown schema drift";
+		else
+		{
+			text *t = DatumGetTextPP(d_detail);
+			MemoryContext oldmc;
+			oldmc = MemoryContextSwitchTo(TopMemoryContext);
+			detail_text = pstrdup(text_to_cstring(t));
+			MemoryContextSwitchTo(oldmc);
+		}
+		pfree(sql.data);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("overlay_branch: cannot %s on branch_id=%d — MAIN schema drifted since the table was registered to this branch (A7 registry mismatch, 55000)",
+						op_name, (int) bid),
+				 errdetail("%s", detail_text),
+				 errhint("Discard the branch, apply the schema change on MAIN, "
+						 "then create_branch() a fresh branch.")));
+	}
+	pfree(sql.data);
+
+	/* Stage 2b: incremental registration.  MAIN tables currently present
+	 * but not yet registered to this branch → INSERT 1 row each into the
+	 * registry so future entries/applies can detect DROP/ALTER drift on
+	 * them as well. */
+	{
+		StringInfoData ins;
+		initStringInfo(&ins);
+		appendStringInfo(&ins,
+"INSERT INTO %s "
+"(branch_id, relid, schema_name, table_name, "
+" total_cols, pk_cols, col_hash, pk_hash)\n"
+"SELECT %d, s.relid, s.schema_name, s.table_name, "
+"       s.total_cols, s.pk_cols, s.col_hash, s.pk_hash\n"
+"FROM (%s) s\n"
+"WHERE NOT EXISTS (SELECT 1 FROM %s r\n"
+"                   WHERE r.branch_id = %d AND r.relid = s.relid)",
+			OBTABLE_REGISTRY, (int) bid, fingerprint,
+			OBTABLE_REGISTRY, (int) bid);
+		ret = SPI_execute(ins.data, false, 0);
+		if (ret != SPI_OK_INSERT)
+		{
+			char *saved = pstrdup(ins.data);
+			pfree(ins.data);
+			SPI_finish();
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("overlay_branch: registry incremental INSERT bid=%d SPI ret=%d (sql[0:80]=%.80s)",
+							(int) bid, ret, saved)));
+		}
+		elog(DEBUG1, "ob_registry_check(bid=%d, %s): incremental registered %lu new rows",
+			 (int) bid, op_name, (unsigned long) SPI_processed);
+		pfree(ins.data);
+	}
+
+	SPI_finish();
+}
+
+void
+ob_registry_cascade_discard(int32 bid)
+{
+	StringInfoData sql;
+	int ret;
+
+	if (bid <= 0)
+		return;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "overlay_branch: SPI_connect failed in registry_cascade_discard");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "DELETE FROM %s WHERE branch_id = %d",
+					 OBTABLE_REGISTRY, (int) bid);
+	ret = SPI_execute(sql.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+	{
+		pfree(sql.data);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: registry_cascade_delete for bid=%d SPI ret=%d",
+						(int) bid, ret)));
+	}
+	elog(DEBUG1, "ob_registry_cascade_discard(bid=%d): deleted %lu registry rows",
+		 (int) bid, (unsigned long) SPI_processed);
+	pfree(sql.data);
+	SPI_finish();
+}
+
+/* ================================================================
  * ---------- Branch Context (internal implementations) ----------
  * ================================================================ */
 
@@ -378,6 +1078,14 @@ overlay_branch_create_internal(const char *branch_name)
 				(errcode(ERRCODE_NAME_TOO_LONG),
 				 errmsg("branch name too long (max %d characters)",
 						NAMEDATALEN - 1)));
+
+
+	/* ================================================================
+	 * G01 Branch-scope preflight.  Runs BEFORE we touch the branch
+	 * catalog (including pg_branch_branch_id_seq) so that a REJECTED
+	 * create_branch has ZERO side effects on the database.
+	 * ================================================================ */
+	ob_check_branch_scope();
 
 	owner = GetUserId();
 	esc_name = quote_literal_cstr(branch_name);
@@ -476,6 +1184,12 @@ overlay_branch_create_internal(const char *branch_name)
 	 * `sql` any further).  `initStringInfo` earlier allocated `sql.data`
 	 * in CurrentMemoryContext; pfree is balanced here. */
 	pfree(sql.data);
+
+	/* §Gx / A7: schema epoch registry — first-use snapshot at use_branch.
+	 * Populate is deliberately deferred to the first use_branch/apply_branch
+	 * call so that create_branch → CREATE TABLE on MAIN → use_branch order
+	 * (used by guard/mvcc_bounds L1 tests) correctly takes the snapshot at
+	 * entry-time, not create-time. */
 
 	elog(DEBUG1, "overlay_branch_create_internal: name='%s' return_id=%d owner=%u",
 		 branch_name, (int) new_branch_id, (unsigned) owner);
@@ -837,6 +1551,14 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 				elog(ERROR, "overlay_branch: branch_id for '%s' is NULL", branch_name);
 		}
 
+		SPI_finish();
+
+		/* §Gx / A7: schema drift guard.  Before we install ANY branch
+		 * state (ctx / snapshot / cache / GUC), re-scan current DB
+		 * user tables and compare to registry for this bid — any
+		 * total/pk/hash drift → 55000 immediately (no side effects). */
+		ob_registry_check_current_schema(real_branch_id, "use_branch");
+
 		/* V3 FR2 V1 (I8.1 L1 2026-09-17 dry-run fix): use_branch NO LONGER
 		 * takes SHARED advisory lock.
 		 *
@@ -909,7 +1631,11 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 		 *   semantics. */
 		CacheInvalidateRelcacheAll();
 		CommandEndInvalidationMessages();
-		SPI_finish();
+		/* NOTE: sql.data / esc_name are palloc'd in caller's portal context;
+		 * we do NOT manual pfree here — portal cleanup handles them.  Prior
+		 * attempts at explicit pfree caused "pfree called with invalid pointer"
+		 * because the appendStringInfo pipeline had realloc'd the buffer and
+		 * the old pointer was stale after the 3-stage reset/rewrite cycle. */
 		elog(DEBUG1, "overlay_branch_use_with_mode_internal: name='%s' mode='%s'",
 			 branch_name, mode);
 	}
@@ -1514,6 +2240,11 @@ overlay_branch_apply_internal(const char *branch_name)
 		SPI_finish();
 	}
 
+	/* §Gx / A7: schema drift guard.  Run BEFORE we take the advisory
+	 * lock (fast fail before any serialization) so drift errors don't
+	 * block other apply/discard operations on unrelated branches. */
+	ob_registry_check_current_schema(bid, "apply_branch");
+
 	/* V3 FR2: take branch-level EXCLUSIVE advisory lock BEFORE any catalog
 	 * UPDATE / RowExclusiveLock on user tables, so we strictly follow
 	 * Advisory → (catalog locks + user RowExclusiveLock) deadlock order.
@@ -1944,6 +2675,28 @@ overlay_branch_discard_internal(const char *branch_name)
 				 errmsg("overlay_branch: discard delete delta rows failed for '%s' SPI ret=%d",
 						branch_name, ret)));
 	}
+
+	/* §Gx / A7: registry cascade DELETE.  Shares the still-open SPI
+	 * connection (discard started one at entry L2198) so we avoid a
+	 * second SPI_connect().  ON DELETE CASCADE on pg_branch_registry
+	 * FK would clean this automatically, but we want to log the row
+	 * count via DEBUG1 AND guarantee a deterministic SPI ret code in
+	 * case the catalog schema is ever broken. */
+	resetStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "DELETE FROM %s WHERE branch_id = %d",
+					 OBTABLE_REGISTRY, (int) bid);
+	ret = SPI_execute(sql.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_branch: discard delete registry rows failed for '%s' SPI ret=%d",
+						branch_name, ret)));
+	}
+	elog(DEBUG1, "discard_internal: removed %lu registry rows for bid=%d",
+		 (unsigned long) SPI_processed, (int) bid);
 
 	SPI_finish();
 

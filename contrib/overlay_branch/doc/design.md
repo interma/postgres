@@ -530,3 +530,145 @@ tuple_data
 > **单表 + PK + UPDATE/INSERT/DELETE + Branch SeqScan + APPLY conflict detection**
 
 这个跑通以后，基本就能判断这个想法到底是不是一个真正的新 PostgreSQL primitive。
+
+---
+
+## §G02 S13 权限最小化（ACL Double-Defense Matrix）
+
+> 设计目标：最小暴露面 + 不可绕过硬门禁。PG 没有行级 GRANT；分支 OWNER（pg_branch.owner只是一列 oid，不能动态 GRANT。我们用两层。
+
+### §G02.1 角色与保留名
+
+- 内置 NOLOGIN 管理角色：**overlay_branch_administrators**
+  - 改名原因：PG 禁止 `pg_` 前缀的用户角色（保留名），原 pg_manage_overlay_branches 直接 ERROR role name reserved。
+  - 注释：Members may create overlay branches and administer any branch. Owners of a specific branch implicitly have use/apply/discard privileges on their own branch without being added to this role.
+  - 升级注意：**角色名硬编码，任何扩展脚本（包括 AGENTS / SQL 不得改名，不得删除。
+- 有效身份三元组：1) Superuser=全权限；2) overlay_branch_administrators 成员=管理员；3) 分支 OWNER（pg_branch.owner==GetUserId())=自己分支的 use/apply/discard。
+
+### §G02.2 两层防御矩阵
+
+| 层 | 位置 | 能力 | 局限 |
+|----|------|------|------|
+| SQL Layer 1 | overlay_branch--1.0.sql 的 REVOKE/GRANT + SECURITY INVOKER | 阻止纯 SQL 级绕过（直接 @extschema@ fn 调用） | 不能做行级 owner 对比 |
+| C Layer 2 | ob_acl_check_lifecycle() + 每个 wrapper 入口第一行 | 真正 owner/mgmt/superuser gate；SQL 层就算被 hack 也逃不掉 | 不代不了 SQL 层 revoke
+
+SQL Layer 1 细目：
+- REVOKE ALL ON @extschema@.pg_branch / pg_branch_delta / seq FROM PUBLIC
+- GRANT SELECT ON @extschema@.pg_branch TO PUBLIC（public.pg_branch VIEW 已对 PUBLIC SELECT，对称开放 base table SELECT 给 C 层 SPI 查 owner 时不出 42501
+- GRANT SELECT,INSERT,UPDATE,DELETE ON @extschema@.pg_branch / pg_branch_delta TO overlay_branch_administrators
+- GRANT ALL ON @extschema@.pg_branch_branch_id_seq TO overlay_branch_administrators
+- GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC（public.* synonym 用 SECURITY INVOKER，INVOKER 语义下调用者自己需要 schema 权限
+- public.pg_branch_delta VIEW REVOKE ALL FROM PUBLIC（R22：delta 行有业务数据，default 无访问
+- public.pg_branch VIEW 保持 GRANT SELECT TO PUBLIC
+
+public synonym 关键权衡（为什么不 SECURITY DEFINER：SECURITY DEFINER 切换 current_user = function owner(超级用户)，导致 C 层 GetUserId() 返回 superuser oid，ob_user_is_superuser_or_mgmt 恒真，ACL 被完全绕过。因此固定为 SECURITY INVOKER + search_path=(@extschema@, pg_catalog) + PUBLIC EXECUTE，配合 SCHEMA USAGE。
+
+### §G02.3 C Layer 2：ob_acl_check_lifecycle
+
+实现文件：src/branch_lifecycle.c §G02 helper：
+1. ob_lookup_mgmt_role_oid()：AUTHNAME syscache 拿 overlay_branch_administrators 的 Oid
+2. ob_user_is_superuser_or_mgmt()：superuser() 或 is_member_of_role(GetUserId(), mgmt_oid)
+3. ob_user_is_branch_owner(bid)：SPI SELECT owner FROM @extschema@.pg_branch，比对 owner == GetUserId()
+4. ob_acl_check_lifecycle(ObLifecycleOp, name)：统一 ereport(ERROR, 42501 + hint
+
+授权矩阵：
+| 操作 | 允许身份 |
+|------|---------|
+| CREATE_BRANCH | superuser 或 mgmt（OWNER 不允许自己建防 DOS）
+| USE_BRANCH    | superuser 或 mgmt 或 owner；name = NULL/空 → EXIT Main 所有人放行
+| APPLY_BRANCH  | superuser 或 mgmt 或 owner
+| DISCARD_BRANCH| superuser 或 mgmt 或 owner
+
+统一错误码 ERRCODE_INSUFFICIENT_PRIVILEGE(42501)，统一 hint：Must be branch owner, superuser, or member of role "overlay_branch_administrators"。
+
+### §G02.4 Wrapper 调用点（C 层硬门禁）
+
+| 函数名 | 位置 | 检查时机 |
+|-------|------|---------|
+| overlay_branch_create | src/overlay_branch.c create branch wrapper 顶部 | PG_ARGISNULL 处理后第一行 |
+| overlay_branch_use | 同上 | name NULL/empty 直接 return（EXIT Main，Pub 级），否则 ACL |
+| overlay_branch_use_with_mode | 同上 | 同 use |
+| overlay_branch_apply | 同上 | - |
+| overlay_branch_discard | 同上 | - |
+
+### §G02.5 升级与回滚注意
+
+- 角色名永久：任何 ALTER EXTENSION UPDATE 脚本里都必须保持 overlay_branch_administrators，GRANT 链不
+- SECURITY DEFINER 公共同义词禁止加回，除非 ACL 的 user oid 来源同步改成 GetSessionUserId()/GetOuterUserId() 绝对不能用 GetUserId()，否则 superuser() 直通
+- discard 后 pg_branch state=discarded，不 DELETE（便于 audit，同名 recreate 时 UNIQUE 报错提示；因此 D2 检查 state = 'discarded'，不是 NOT EXISTS。
+
+---
+
+## §G02 S13 权限最小化（ACL Double-Defense Matrix）
+
+> 设计目标：**「最小暴露面 + 非绕过式硬门禁」**。PostgreSQL 扩展没有行级 GRANT；分支的 OWNER（`pg_branch.owner`）只是 catalog 里的一列 oid，不能直接 `GRANT use_branch(bid) TO xxx`。所以我们把权限分两层建模：
+
+### §G02.1 角色 & 保留名
+
+- 内置 NOLOGIN 管理角色：**`overlay_branch_administrators`**
+  - 原因：PG 禁止用户创建 `pg_` 前缀的非模板数据库角色（保留名），原 `pg_manage_overlay_branches` 直接 `CREATE ROLE` 时 `ERROR:  role name "pg_manage_overlay_branches" is reserved`，因此改名。
+  - 不可改名 / 不可删除（upgrade 脚本里用此名硬编码，`DO $$ IF NOT EXISTS … COMMENT ON ROLE …$$` 保证幂等）。
+  - 注释含义：「Members may create overlay branches and administer any branch. Owners of a specific branch implicitly have use/apply/discard privileges on their own branch without being added to this role.」
+- 三大有效调用身份：
+  1. **Superuser**（extension 安装者通常是 superuser）= 全部权限
+  2. **overlay_branch_administrators 成员** = 管理员
+  3. **分支 OWNER**（`pg_branch.owner = GetUserId()`）= 自己分支的 use/apply/discard
+
+### §G02.2 两层防御矩阵
+
+| 层 | 位置 | 能防什么 | 局限 |
+|----|------|---------|------|
+| SQL Layer 1 | `overlay_branch--1.0.sql` 的 `REVOKE / GRANT` + `SECURITY INVOKER` | 防止纯 SQL 绕过（比如直接调 `@extschema@.<fn>`）；PUBLIC 无权限的元数据表不能读 | **不能按 owner 做行级控制**（PG 没有 row-level GRANT，owner == 当前会话 user 这种条件必须 C 层写死） |
+| C Layer 2 | `src/branch_lifecycle.c` 的 `ob_acl_check_lifecycle()` + 每个 `PG_FUNCTION_INFO_V1` wrapper **入口第一行无条件调用** | 真正的 owner / mgmt / superuser 判定；即使 SQL 层被注入（例如直接 hack @extschema@ 的 usage）也逃不过 | 不能代替 SQL 层 revoke；没有 SQL 层的话，调用者还能看见 delta 表内容 |
+
+**SQL Layer 1 细目：**
+- `REVOKE ALL ON @extschema@.pg_branch / pg_branch_delta / seq FROM PUBLIC;`
+- `GRANT SELECT ON @extschema@.pg_branch TO PUBLIC;`
+  - 原因：public.pg_branch VIEW 已经 GRANT SELECT 给所有人（纯 metadata，与 public.pg_branch 同结构），为对称 C 层 `ob_user_is_branch_owner()` 用 SPI 查物理表时不被 42501，显式开放 base table 的 SELECT。
+- `GRANT SELECT,INSERT,UPDATE,DELETE ON @extschema@.pg_branch / pg_branch_delta TO overlay_branch_administrators;`
+- `GRANT ALL ON @extschema@.pg_branch_branch_id_seq TO overlay_branch_administrators;`
+- `GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;`
+  - 原因：public.* synonym wrapper 声明为 `SECURITY INVOKER`（见下），不能用 SECURITY DEFINER 的切换身份绕过 pg_branch.owner 比对——必须让会话 user（也就是调用者本人）能 resolve `@extschema@.<c_fn>`。
+- `public.pg_branch_delta`（VIEW）`REVOKE ALL FROM PUBLIC;`（§R22：delta 存整行业务数据，不能被 unprivileged session 看见）
+- `public.pg_branch`（VIEW）保持 `GRANT SELECT TO PUBLIC`
+
+**public.* 生命周期 synonym 设计权衡（SECURITY INVOKER vs DEFINER）：**
+> 原设计误用 SECURITY DEFINER，会使 C 层 ACL 里的 `GetUserId()` = function owner（即 superuser），导致「任意调用者都被 ob_user_is_superuser_or_mgmt() 通过」的大漏洞。
+> 当前实现固定为 **SECURITY INVOKER + 固定 search_path = @extschema@, pg_catalog + PUBLIC EXECUTE**，配合上面的 SCHEMA USAGE grant，使 wrapper 内解析到 `@extschema@.create_branch(...)` 的 C fn，而 C 层拿到的 GetUserId() **严格等于会话当前有效 user（SET ROLE 后的角色）**。
+
+### §G02.3 C Layer 2：`ob_acl_check_lifecycle(op, branch_name)`
+
+> 实现位置：`src/branch_lifecycle.c` §G02 区，4 个 helper：
+> 1. `ob_lookup_mgmt_role_oid()` — AUTHNAME syscache 拿 `overlay_branch_administrators` 的 oid
+> 2. `ob_user_is_superuser_or_mgmt()` — `superuser() || is_member_of_role(GetUserId(), mgmt_oid)`
+> 3. `ob_user_is_branch_owner(bid, out_owner_oid)` — SPI SELECT `owner FROM @extschema@.pg_branch WHERE branch_name = $1`，返回 `owner == GetUserId()`
+> 4. `ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)` — 统一 ereport 入口
+
+**操作 → 授权矩阵：**
+| 操作 op | 允许身份 |
+|---------|---------|
+| `OB_OP_CREATE_BRANCH` | superuser **OR** mgmt（普通 OWNER 不能自己建分支，避免资源 DOS；由管理员分配） |
+| `OB_OP_USE_BRANCH`    | superuser **OR** mgmt **OR** `pg_branch.owner` == 当前 user；`NULL/''` 参数 → EXIT Main，对所有人开放 |
+| `OB_OP_APPLY_BRANCH`  | superuser **OR** mgmt **OR** `pg_branch.owner` == 当前 user |
+| `OB_OP_DISCARD_BRANCH`| superuser **OR** mgmt **OR** `pg_branch.owner` == 当前 user |
+
+错误码统一：`ERRCODE_INSUFFICIENT_PRIVILEGE (42501)`，hint：`Must be branch owner, superuser, or member of role "overlay_branch_administrators"`。
+
+### §G02.4 Wrapper 调用点
+
+所有 5 个 SQL-callable C fn 在进入实际业务逻辑 **前** 先过 ACL（`PG_ARGISNULL` 语义保留在最前面）：
+
+| 函数 | 调用行 |
+|------|-------|
+| `overlay_branch_create`       | `src/overlay_branch.c` create branch 顶部 |
+| `overlay_branch_use`          | 同上；PG_ARGISNULL(name) 直接 return void（EXIT Main，Public 权限） |
+| `overlay_branch_use_with_mode`| 同上；name NULL/empty 不检查，直接 EXIT |
+| `overlay_branch_apply`        | 同上 |
+| `overlay_branch_discard`      | 同上 |
+
+### §G02.5 升级 / 回滚注意
+
+- **角色名不可改**：任何 future `ALTER EXTENSION UPDATE` 脚本里都必须仍然叫 `overlay_branch_administrators`，否则旧实例的 GRANT 链会断。
+- SECURITY DEFINER 的 public synonyms 已回滚：任何未来加回 SECURITY DEFINER 的 patch 都必须同步改 C 层 ACL 的 user oid 来源为 `GetSessionUserId() / GetOuterUserId()`，否则 GetUserId() = 函数 owner 会导致 ACL 被完全绕过。
+- apply / discard 是 **idempotent**：state == applied/discarded 时重复调用 no-op，不做额外 ACL 以外的副作用。
+- discard 完成后 catalog 行保留为 `state='discarded'`，**不 DELETE**（便于 audit + future `CREATE BRANCH` 同名时触发 UNIQUE 提示）；这就是 rentry.sql D2 test 用 `state = 'discarded'` 检查而非 NOT EXISTS 的原因。

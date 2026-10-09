@@ -923,7 +923,9 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 		case T_CreateStmt:
 		{
 			if (operation) *operation = pstrdup(ob_utility_opname(nodeTag(parsetree)));
-			if (reason) *reason = psprintf("%s inside a branch is not supported in V1 (would modify MAIN's catalog schemas in place)",
+			if (reason) *reason = psprintf("%s on MAIN user objects during an active branch would "
+										  "modify underlying schema/tables in place and break MAIN/delta "
+										  "join semantics after apply.  (§A7 DDL RESTRICTED 0A000 — schema-drift guard)",
 										  operation ? *operation : "DDL");
 			return false;
 		}
@@ -947,7 +949,10 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 						if (OidIsValid(rid) && ob_relid_is_user_table(rid, NULL, &rn))
 						{
 							if (objname) *objname = rn;
-							if (reason) *reason = psprintf("DROP ... of MAIN user objects inside a branch is not supported in V1");
+							if (reason) *reason = psprintf("DROP of MAIN user objects during an active branch "
+														  "breaks MAIN/delta relid-based joins on apply; registry "
+														  "fingerprint for this relid will no longer match on next "
+														  "enter (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 							return false;
 						}
 						switch (d->removeType)
@@ -956,7 +961,12 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 							case OBJECT_SEQUENCE: case OBJECT_FOREIGN_TABLE: case OBJECT_COLUMN:
 							case OBJECT_POLICY: case OBJECT_TRIGGER: case OBJECT_RULE:
 							case OBJECT_TABCONSTRAINT: case OBJECT_DOMCONSTRAINT:
-								if (reason && !*reason) *reason = psprintf("DROP of this object class inside a branch is not supported in V1 (would affect MAIN)");
+							case OBJECT_INDEX:
+								if (reason && !*reason) *reason = psprintf("DROP of this class during an active "
+																			"branch affects MAIN's catalog (pg_class / "
+																			"pg_attribute / pg_index etc.) and will "
+																			"cause a schema mismatch on apply (§A7 "
+																			"DDL RESTRICTED 0A000 — schema-drift guard)");
 								return false;
 							default:
 								break;
@@ -980,7 +990,10 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 				if (OidIsValid(rid) && ob_relid_is_user_table(rid, NULL, &rn))
 				{
 					if (objname) *objname = rn;
-					if (reason) *reason = psprintf("TRUNCATE inside a branch is not supported in V1 (would immediately empty the MAIN table)");
+					if (reason) *reason = psprintf("TRUNCATE empties the MAIN heap immediately; subsequent "
+												  "apply of branch-delta I/U/D against missing MAIN rows will "
+												  "either produce wrong counts or loose PK integrity (§A7 "
+												  "DDL RESTRICTED 0A000 — schema-drift guard)");
 					return false;
 				}
 			}
@@ -996,7 +1009,11 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 			if (OidIsValid(rid) && ob_relid_is_user_table(rid, NULL, &rn))
 			{
 				if (objname) *objname = rn;
-				if (reason) *reason = psprintf("CREATE INDEX inside a branch is not supported in V1 (would write to MAIN's pg_index/pg_class catalogs)");
+				if (reason) *reason = psprintf("CREATE INDEX writes to MAIN's pg_index/pg_class catalogs "
+											  "and modifies MAIN-side plan costs — planner inside branch uses "
+											  "live MAIN costs but writes deltas whose apply-time plan might "
+											  "choose different indexes — silent wrong-plan corruption risk "
+											  "(§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 				return false;
 			}
 			return true;
@@ -1004,28 +1021,61 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 
 		case T_ReindexStmt:
 			if (operation) *operation = pstrdup("REINDEX");
-			if (reason) *reason = psprintf("REINDEX inside a branch is not supported in V1 (modifies MAIN indexes in place)");
+			if (reason) *reason = psprintf("REINDEX rebuilds MAIN indexes in place; concurrently held branch "
+										  "sessions with pending I/U/D may read stale MAIN tuples during "
+										  "the rebuild window (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 		case T_ClusterStmt:
 			if (operation) *operation = pstrdup("CLUSTER");
-			if (reason) *reason = psprintf("CLUSTER inside a branch is not supported in V1 (rewrites MAIN heap in place)");
+			if (reason) *reason = psprintf("CLUSTER rewrites the MAIN heap in place under ACCESS EXCLUSIVE lock; "
+										  "all active-branch sessions holding the same MAIN rows would lose "
+										  "visibility continuity (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 		case T_VacuumStmt:
 			if (operation) *operation = pstrdup("VACUUM/ANALYZE");
-			if (reason) *reason = psprintf("VACUUM/ANALYZE inside a branch is not supported in V1 (modifies MAIN visibility map and statistics)");
+			if (reason) *reason = psprintf("VACUUM/ANALYZE modifies MAIN visibility map and planner statistics "
+										  "during an active branch — plancache replans inside the branch will "
+										  "pick MAIN-based cost estimates that diverge from apply-time plans, "
+										  "causing silent wrong-row reads (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 		case T_RenameStmt:
 			if (operation) *operation = pstrdup("RENAME");
-			if (reason) *reason = psprintf("RENAME inside a branch is not supported in V1 (modifies MAIN catalog names in place)");
+			if (reason) *reason = psprintf("RENAME (column/table/constraint) mutates MAIN's pg_class/pg_attribute "
+										  "catalogs in place — stored registry fingerprints for this branch "
+										  "will fail to match on next enter/apply and raise 55000 (§A7 DDL "
+										  "RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 		case T_RuleStmt:
 			if (operation) *operation = pstrdup("CREATE RULE");
-			if (reason) *reason = psprintf("CREATE RULE inside a branch is not supported in V1 (modifies MAIN pg_rules)");
+			if (reason) *reason = psprintf("CREATE RULE installs ON DO/INSTEAD semantics directly on MAIN — "
+										  "branch writes via write_redirect go directly to delta store WITHOUT "
+										  "traversing the rule rewriter, causing MAJOR MAIN/delta divergence "
+										  "on apply (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 		case T_CreatePolicyStmt:
 		case T_AlterPolicyStmt:
 			if (operation) *operation = pstrdup("(ALTER) POLICY");
-			if (reason) *reason = psprintf("CREATE/ALTER POLICY inside a branch is not supported in V1 (modifies MAIN row-level security in place)");
+			if (reason) *reason = psprintf("CREATE/ALTER POLICY toggles MAIN-side row-level security permissions "
+										  "in place — branch reads from MAIN via BranchScan happen against the "
+										  "LIVE MAIN row-security bitmap and will diverge from the snapshot "
+										  "captured at create_branch (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
+			return false;
+		case T_AlterObjectSchemaStmt:
+			if (operation) *operation = pstrdup("SET SCHEMA / ALTER ... SET SCHEMA");
+			if (reason) *reason = psprintf("SET SCHEMA moves a MAIN object between namespaces in place — "
+										  "stored (schema_name, table_name) fingerprints for this branch will "
+										  "fail to match on next enter/apply and raise 55000 (§A7 DDL "
+										  "RESTRICTED 0A000 — schema-drift guard)");
+			return false;
+		case T_CommentStmt:
+			/* COMMENT only modifies pg_description — safe for MAIN/delta
+			 * join semantics (no columns, no pk, no schema drift). */
+			return true;
+		case T_AlterOwnerStmt:
+			if (operation) *operation = pstrdup("ALTER ... OWNER TO");
+			if (reason) *reason = psprintf("ALTER OWNER mutates pg_class.relowner in place on MAIN; writes "
+										  "from the branch by original owner during apply may get ACL-rejected "
+										  "after apply commits (§A7 DDL RESTRICTED 0A000 — schema-drift guard)");
 			return false;
 
 		default:
@@ -1222,6 +1272,7 @@ overlay_branch_create(PG_FUNCTION_ARGS)
 	Name		branch_name = PG_GETARG_NAME(0);
 	int32		new_branch_id;
 
+	ob_acl_check_lifecycle(OB_OP_CREATE_BRANCH, NameStr(*branch_name));
 	new_branch_id = overlay_branch_create_internal(NameStr(*branch_name));
 	PG_RETURN_INT32(new_branch_id);
 }
@@ -1229,20 +1280,6 @@ overlay_branch_create(PG_FUNCTION_ARGS)
 Datum
 overlay_branch_use(PG_FUNCTION_ARGS)
 {
-	/* ===== REVIEW-260926 / R08 =====
-	 *   1-arg use_branch was previously declared STRICT in the SQL
-	 *   definition, meaning SELECT use_branch(NULL) SHORT-CIRCUITED the
-	 *   C function call entirely (PG returns NULL, no cleanup path
-	 *   runs).  CurrentBranchContext remained installed and the GUC
-	 *   overlay_branch.current retained its stale value — subsequent
-	 *   DML in that session would silently keep operating on the
-	 *   supposedly-exited branch = drift-write.
-	 *
-	 *   Fix: (1) change SQL definition to NON-STRICT (see
-	 *   overlay_branch--1.0.sql L72); (2) here explicitly check
-	 *   PG_ARGISNULL(0) and pass a NULL char* into the internal,
-	 *   which already handles NULL as EXIT.  Exactly the same code
-	 *   path is taken for NULL and '' so ctx/GUC always stay in sync. */
 	const char *branch_name;
 
 	if (PG_ARGISNULL(0))
@@ -1250,6 +1287,7 @@ overlay_branch_use(PG_FUNCTION_ARGS)
 	else
 		branch_name = NameStr(*PG_GETARG_NAME(0));
 
+	ob_acl_check_lifecycle(OB_OP_USE_BRANCH, branch_name);
 	overlay_branch_use_internal(branch_name);
 	PG_RETURN_VOID();
 }
@@ -1274,6 +1312,7 @@ overlay_branch_use_with_mode(PG_FUNCTION_ARGS)
 	else
 		mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
+	ob_acl_check_lifecycle(OB_OP_USE_BRANCH, branch_name);
 	overlay_branch_use_with_mode_internal(branch_name, mode);
 	PG_RETURN_VOID();
 }
@@ -1472,6 +1511,7 @@ overlay_branch_apply(PG_FUNCTION_ARGS)
 {
 	Name		branch_name = PG_GETARG_NAME(0);
 
+	ob_acl_check_lifecycle(OB_OP_APPLY_BRANCH, NameStr(*branch_name));
 	overlay_branch_apply_internal(NameStr(*branch_name));
 	PG_RETURN_VOID();
 }
@@ -1481,6 +1521,7 @@ overlay_branch_discard(PG_FUNCTION_ARGS)
 {
 	Name		branch_name = PG_GETARG_NAME(0);
 
+	ob_acl_check_lifecycle(OB_OP_DISCARD_BRANCH, NameStr(*branch_name));
 	overlay_branch_discard_internal(NameStr(*branch_name));
 	PG_RETURN_VOID();
 }

@@ -55,6 +55,67 @@ CREATE INDEX pg_branch_delta_relid_idx
     ON @extschema@.pg_branch_delta (branch_id, relid);
 
 -- ============================================================
+-- §Gx / A7 (review_260926 S18 2026-10-08): Schema-epoch registry.
+--
+--   MVP anti-drift hard guard: at create_branch() time, we scan every
+--   user permanent table currently in the database (same filtering
+--   rules as G01 create_branch scope: no system namespaces, no ext
+--   schema, no objects owned by this extension) and record, for each
+--   user relation, a compact 4-tuple fingerprint:
+--     (relid, total_cols, pk_cols, md5(concat_ws('|', sorted attnames
+--            with typbyval/typlen/typmod/collid and pk ordinality))).
+--
+--   registry rows are keyed by (branch_id, relid).  Before we allow a
+--   session to enter a branch (use_branch/apply_branch), we re-run the
+--   same scan and compare.  Any mismatch on total_cols / pk_cols /
+--   hash → 55000 OBJECT_NOT_IN_PREREQUISITE_STATE — the DB schema has
+--   drifted between create and enter, so MAIN/delta joins are no
+--   longer valid.  This catches (a) out-of-band ALTER TABLE on a
+--   parallel connection; (b) column type/pk reorder from restore
+--   scripts; (c) any future DDL statement the ProcessUtility guard
+--   list might temporarily miss.
+--
+--   On discard/remove branch we DELETE rows via bid (single statement
+--   after the pg_branch_delta cascade delete; same SPI connection).
+--
+--   col_hash / pk_hash are stored as 16-byte MD5 bytea; total_cols
+--   and pk_cols are included as plain integers so the error message
+--   can tell the user "drift: total_cols 5→6, pk_cols 2→1" without
+--   needing to decode a hash.
+-- ============================================================
+CREATE TABLE @extschema@.pg_branch_registry (
+    branch_id       integer NOT NULL,
+    relid           oid NOT NULL,
+    schema_name     name NOT NULL,
+    table_name      name NOT NULL,
+    total_cols      integer NOT NULL,
+    pk_cols         integer NOT NULL,
+    col_hash        bytea NOT NULL,
+    pk_hash         bytea NOT NULL,
+    created_at      timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT pg_branch_registry_pkey PRIMARY KEY (branch_id, relid),
+    CONSTRAINT pg_branch_registry_bid_fkey FOREIGN KEY (branch_id)
+        REFERENCES @extschema@.pg_branch(branch_id) ON DELETE CASCADE
+);
+
+CREATE INDEX pg_branch_registry_bid_idx
+    ON @extschema@.pg_branch_registry (branch_id);
+
+COMMENT ON TABLE @extschema@.pg_branch_registry IS
+  '§Gx/A7 schema epoch registry: per-create_branch fingerprint of every user table. Discard/recreate branch forces a fresh fingerprint snapshot.';
+COMMENT ON COLUMN @extschema@.pg_branch_registry.total_cols IS 'Number of user columns (attnum>0, attisdropped=false) at create_branch time';
+COMMENT ON COLUMN @extschema@.pg_branch_registry.pk_cols IS 'Cardinality of PRIMARY KEY (0 if table has no PK) at create_branch time';
+COMMENT ON COLUMN @extschema@.pg_branch_registry.col_hash IS 'MD5 of sorted (attname|typid|typlen|typbyval|typmod|collid|attnotnull|attgenerated) for all user columns';
+COMMENT ON COLUMN @extschema@.pg_branch_registry.pk_hash IS 'MD5 of sorted attname in PK (pk_cols=0 → digest of empty string)';
+
+-- §G02/R22 ACL: lifecycle functions are SECURITY INVOKER, so plain callers
+-- need SQL-level privileges on @extschema@.pg_branch_registry when C code
+-- runs SPI SELECT/INSERT/DELETE.  The registry stores metadata only (no
+-- tuple payload), so SELECT/INSERT/DELETE to public is safe (tampering is
+-- self-sabotage, not a data leak).
+REVOKE ALL ON @extschema@.pg_branch_registry FROM PUBLIC;
+GRANT SELECT, INSERT, DELETE ON @extschema@.pg_branch_registry TO PUBLIC;
+-- ============================================================
 -- §G06 最小防泄漏：显式内部表标记 publish=false (PG >=16 仅 publication 级别有效)
 --
 -- 注：PG 14-17 中 reloptions "publish=false" **并非堆表的合法 reloption**（publish
@@ -79,6 +140,33 @@ COMMENT ON TABLE @extschema@.pg_branch IS
   'overlay_branch internal branch catalog table (§G06: exclude from FOR ALL TABLES publication by site-local policy, see review_260926.md §2.5)';
 COMMENT ON TABLE @extschema@.pg_branch_delta IS
   'overlay_branch internal per-branch per-table delta store (§G06: exclude from FOR ALL TABLES publication by site-local policy, see review_260926.md §2.5)';
+
+
+-- ============================================================
+-- G01 MVP support-matrix create_branch scope RESTRICTED list.
+--
+--   overlay_branch_create_internal runs ob_check_branch_scope() as
+--   its FIRST executable statement after static name-length validation
+--   but BEFORE touching pg_branch / pg_branch_branch_id_seq.  If ANY
+--   user permanent relation in the database falls into one of the
+--   categories below, create_branch() raises ERRCODE_FEATURE_NOT_SUPPORTED
+--   (0A000) with a DETAIL pointing at the FIRST offending relation, and
+--   with ZERO side effects (pg_branch_branch_id_seq is never advanced,
+--   no catalog rows inserted).  Categories:
+--     (A) FKs, any side (PK side or referencing side).  FK checks fire
+--         MAIN-side only and would silently miss branch-side violations.
+--     (B) Non-internal, non-disabled user TRIGGERs.  Trigger functions
+--         run MAIN-only and miss rows queued in pg_branch_delta.
+--     (C) PARTITIONED tables (parents relkind p/I OR any relispartition
+--         leaf).  Relid-based MAIN/delta joins mix child relids wrongly
+--         during APPLY.
+--     (D) INHERITANCE relations (inhparent or inhrelid in pg_inherits).
+--     (E) UNLOGGED permanent tables; no WAL, VACUUM semantics differ.
+--     (F) GENERATED STORED columns; apply promotion skips the expression.
+--     (G) FDW tables (f), views (v), matviews (m), composite
+--         types-as-tables (c), toast (t), sequences/anything else
+--         that is NOT relkind in {r=ordinary table, S=sequence, i=index}.
+-- ============================================================
 
 -- ============================================================
 -- SQL-callable (C-language) management functions.
@@ -285,6 +373,83 @@ LANGUAGE C VOLATILE SET search_path = ''
 AS 'MODULE_PATHNAME', 'overlay_branch_force_invalidation_check';
 
 -- ============================================================
+-- §G02 ACL (S13) — double-layer defense
+--
+--   Layer 1 (this file, SQL):
+--     1. Builtin role overlay_branch_administrators — admin-level actors.
+--     2. Internal catalog tables pg_branch / pg_branch_delta live in the
+--        extension schema overlay_branch; ALL default PUBLIC privileges
+--        on them are revoked (they get none because they're freshly
+--        created, but an explicit REVOKE makes our intent permanent and
+--        audit-friendly).
+--     3. public.pg_branch view is still readable by PUBLIC (it only
+--        carries metadata: name, state, mode, counts, owner oid).
+--        public.pg_branch_delta view is revoked from PUBLIC — delta
+--        rows contain full user-visible data; only the extension's
+--        own SPI (running as extension owner / authenticated C code)
+--        should read/write it directly.
+--     4. public.* lifecycle-function synonyms grant EXECUTE only to
+--        overlay_branch_administrators (plus the extension installation
+--        owner, which keeps the default usage).  The matching C
+--        wrappers perform the SAME check again via ob_acl_check_lifecycle
+--        so that direct calls qualified with @extschema@ (which would
+--        bypass public synonyms) are still 42501.
+--
+--   Layer 2 (C code):
+--     See branch_lifecycle.c ob_acl_check_lifecycle(OB_OP_*, name).
+--     owner column from pg_branch.owner is re-checked inside C code,
+--     which means (superuser OR mgmt role OR branch owner) is the final
+--     truth-table regardless of how the function was invoked.
+--
+--   Privilege matrix (explicit because roles may be installed later at
+--   upgrade time):
+--     create_branch                         -> superuser | mgmt
+--     use_branch / use_branch(name, mode)   -> branch owner | superuser | mgmt
+--         EXCEPTION: use_branch(NULL/empty) -> always allowed (exit branch)
+--     apply_branch / discard_branch         -> branch owner | superuser | mgmt
+--
+-- NOTE: "overlay_branch_administrators" is the ONLY role recognised by
+-- both layers.  DO NOT rename it without also updating the C macro
+-- OB_MGMT_ROLE_NAME in include/overlay_branch.h and all grep hits.
+-- ============================================================
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'overlay_branch_administrators') THEN
+        CREATE ROLE overlay_branch_administrators NOLOGIN;
+        COMMENT ON ROLE overlay_branch_administrators IS
+            'Members may create overlay branches and administer any branch. Owners of a specific branch implicitly have use/apply/discard privileges on their own branch without being added to this role.';
+    END IF;
+END$$;
+
+REVOKE ALL ON TABLE @extschema@.pg_branch       FROM PUBLIC;
+REVOKE ALL ON TABLE @extschema@.pg_branch_delta FROM PUBLIC;
+REVOKE ALL ON SEQUENCE @extschema@.pg_branch_branch_id_seq FROM PUBLIC;
+-- SCHEMA @extschema@ USAGE is GRANTed to PUBLIC so that SECURITY INVOKER
+-- public.* synonym wrappers (which SET search_path TO @extschema@, pg_catalog)
+-- can resolve @extschema@.<c_fn> inside their body even when the caller is
+-- a plain non-superuser (branch owner) without any explicit privileges on the
+-- extension schema.
+GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
+-- §G02 S13 catalog-level permissions (on top of public.* synonym views):
+--   * @extschema@.pg_branch (TABLE) — branch metadata.  MGMT role needs
+--     full DML + SELECT because create_branch_internal() INSERTs here as
+--     the caller (SPI runs as GetUserId()).  OWNER of a branch needs to
+--     SELECT owner at minimum — we open SELECT to PUBLIC because
+--     public.pg_branch VIEW already exposes the same columns GRANT SELECT
+--     TO PUBLIC below; being explicit on the base table matches
+--     ob_user_is_branch_owner's use of the base table in SPI and keeps
+--     audit symmetric.
+--   * @extschema@.pg_branch_delta (TABLE) + sequence — MGMT only; OWNER
+--     read/write of delta rows flows through the C wrappers which are
+--     guarded by the owner matrix, but raw table-level access is revoked
+--     (matching R22 business-data no-leak).
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE @extschema@.pg_branch       TO overlay_branch_administrators;
+GRANT SELECT                                   ON TABLE @extschema@.pg_branch       TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE @extschema@.pg_branch_delta TO overlay_branch_administrators;
+GRANT ALL   ON SEQUENCE @extschema@.pg_branch_branch_id_seq               TO overlay_branch_administrators;
+
+-- ============================================================
 -- Public aliases (views for tables, plain functions exposed)
 -- ============================================================
 
@@ -299,7 +464,10 @@ GRANT SELECT ON public.pg_branch TO PUBLIC;
 CREATE OR REPLACE VIEW public.pg_branch_delta
     WITH (security_barrier = true)
     AS SELECT * FROM @extschema@.pg_branch_delta;
-GRANT SELECT ON public.pg_branch_delta TO PUBLIC;
+-- §G02 R22: delta rows carry business data — do not grant SELECT to
+-- PUBLIC.  Keep the wrapper view in place so site-local upgrades can
+-- selectively open it up for audit roles; default is NO ACCESS.
+REVOKE ALL ON public.pg_branch_delta FROM PUBLIC;
 
 -- ============================================================
 -- Public synonyms for convenience.
@@ -313,6 +481,23 @@ GRANT SELECT ON public.pg_branch_delta TO PUBLIC;
 --   IMPORTANT: we also add @extschema@ to the database's
 --   search_path via ALTER DATABASE below is overkill.  Just
 --   wrappers suffice.
+--
+--   §G02 S13 double-defense design (SQL-layer + C-layer):
+--   - Lifecycle wrappers (create/use/apply/discard_branch*) are
+--     declared SECURITY INVOKER (default) with the search_path
+--     fixed to (@extschema@, pg_catalog).  SCHEMA @extschema@ has
+--     USAGE granted to PUBLIC (see above), so the wrappers can
+--     resolve their body references even for plain users.
+--   - A second and non-bypassable ACL check
+--     (ob_acl_check_lifecycle) is run at the TOP of every
+--     C-exported wrapper using GetUserId() — this is the actual
+--     owner/superuser/mgmt-role gate, so even the extension
+--     installation superuser cannot bypass it.
+--   - Metadata-only helpers (current_branch/list_branches/
+--     is_active/force_invalidation_check) stay SECURITY INVOKER
+--     and PUBLIC EXECUTE; they never mutate state and only
+--     return information the caller could otherwise see via
+--     public views.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION public.create_branch(branch_name name)
@@ -369,13 +554,25 @@ AS $$SELECT * FROM @extschema@.list_branches()$$;
 -- SQL-language wrapper.  Users can always qualify with the schema, and
 -- Step 4 of the MVP will introduce a more usable signature.
 
-GRANT EXECUTE ON FUNCTION public.create_branch(name) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.use_branch(name) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.current_branch() TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.apply_branch(name) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.discard_branch(name) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.use_branch(name, text) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.list_branches() TO PUBLIC;
+-- §G02 S13: lifecycle synonyms are declared SECURITY DEFINER (see the
+-- public-synonyms block above) so callers without @extschema@ SCHEMA
+-- USAGE can still reach the C wrappers; the non-bypassable ACL check
+-- lives at the very top of each C-exported wrapper.  We keep PUBLIC
+-- EXECUTE on the synonyms here so that branch OWNERS (not members of
+-- overlay_branch_administrators) can still run use/apply/discard_branch
+-- on their own branches — the C-level check enforces owner-or-mgmt
+-- matrix for every call.
+--
+-- Metadata-only helpers stay PUBLIC EXECUTE by default (no-op).
+GRANT EXECUTE ON FUNCTION public.create_branch(name)      TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.use_branch(name)         TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.apply_branch(name)       TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.discard_branch(name)     TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.use_branch(name, text)   TO PUBLIC;
+
+-- Read-only helpers (metadata-only) remain PUBLIC-friendly.
+GRANT EXECUTE ON FUNCTION public.current_branch()         TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.list_branches()          TO PUBLIC;
 
 GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_is_active(name) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_force_invalidation_check() TO PUBLIC;

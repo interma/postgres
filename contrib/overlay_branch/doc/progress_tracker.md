@@ -1,19 +1,39 @@
 # overlay_branch 开发进度跟踪
 
 > 本文档作为开发进度与交付物清单，对应 README 里提到的 Step 拆分。
-> **V1 = 手动 SRF 模式**（读分支必须手动调 `overlay_main_plus_delta()`）；
-> **V2 = 透明 BranchScan 模式**（普通 `SELECT *` 自动做 Main⊕Delta 合并）。
 >
-> 编号说明：1/2/3/4/5/7/8 对应实际交付的里程碑；Step 6 被并入 Step 7 的
-> Hard Guard 和推迟到 V3 的多 session MVCC pin，因此留空（详见文末"关于 Step 6 留空"）。
->
-> **整体状态（2026-09-14，V3 T1+T2 完成，T3-T8 继续）**：
-> - V1/V2 P0/P1/P2 + 加固测试 **全部完成**；
-> - `make check REGRESS="overlay_branch_basic overlay_branch_user overlay_branch_advanced overlay_branch_mode_param overlay_branch_invalidation"` **5/5 ALL PASSED, 0 diffs**；
-> - **V3 (multi-session MVCC + snapshot mode)**：
->   - T1（BranchContext 扩展 + use_branch mode 参数）✅ ALL PASS；
->   - T2（Layer 1 NOTIFY + 阈值失效 + DQL/DML split）✅ ALL PASS；
->   - 架构与需求见 [multi_session_mvcc.md](./multi_session_mvcc.md)。
+> **V1** = 手动 SRF 模式（读分支必须手动调 `overlay_main_plus_delta()`）
+> **V2** = 透明 BranchScan 模式（普通 `SELECT *` 自动做 Main⊕Delta 合并）
+> **V3** = 多会话 MVCC + snapshot 模式（NOTIFY 失效广播 / 阈值节流 / DQL-DML 拆分 / use_branch('name','mode') 两参）
+> **V4** = Review 260926 修复闭环（S02–S18 Batch 1-6 × 22 R 问题台账 × G01/G02 产品化加固 × S13 双门禁）
+
+> 编号说明：1/2/3/4/5/7/8 对应 V1 实际里程碑；Step 6 被并入 Step 7 的 Hard Guard
+> 和推迟到 V3 的多 session MVCC pin；V4 为 2026-10 新增批次。
+
+---
+
+## 整体状态（2026-10-08 M3 MVP freeze — V4 全段主路径完成）
+
+| 维度 | 当前状态 | 验收证据 |
+|------|---------|---------|
+| V1/V2 手动 + 透明 BranchScan 全链路 | ✅ 完成 (2026-09) | Step 1–Step 8 全绿 |
+| V3 multi-session MVCC T1 + T2 | ✅ 完成 (2026-09-14) | BranchContext 扩展、NOTIFY、阈值失效 |
+| V4 Review 260926 Batch 1–6 S 主路径 (S02–S10, S13–S14, S16–S18) | ✅ 17/31 CONTAINED | 见本文 V4 章节 |
+| 分类一 POC correctness：R01–R24 | ✅ **24/24 FIXED** | [review_260926_tracker.md](review/review_260926_tracker.md) |
+| 分类二 MVP 加固：G01/G02 | ✅ **2/6 FIXED MVP subset** | commit `0ec90f728a9` (G02 ACL double-defense) / `629d0ba227e` (G01 scope preflight) |
+| 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；**A2 ✅ (Read/Write View Unification)**；A1/A6 ⚡ DEFER (M4+)；A4/A8/A9/A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
+| 产品 P01–P03 / G03–G06 | ⚡ OPEN（缺真实授权样本 / 发行环境 / Agent 试用流程） | [review_260926.md §9 P+G 表](review/review_260926.md#L460) |
+| 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make USE_PGXS=1 PG_CONFIG=/tmp/pg17-writable/bin/pg_config -j` |
+| L3 单会话 pg_regress （12 files） | ✅ **12/12 PASS**，`diff -r results expected` = **0 lines**（2× consecutive stable R5/R6 后） | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / **a2** (A2 self-join / rescan / cursor / NL 8 PASS assertions) |
+| L1 isolationtester 多会话（9 specs） | ✅ **9/9 PASS**（2× consecutive stable R5/R6 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / **ob_view_unify_rescan** (A2.3 SAME-CSS 3×14 deterministic ReScan proof) |
+| 标签唯一性（G01_SCOPE_* × 11 + G02_* × 10 PASS） | ✅ 每个 label grep count = 2（1 SQL CASE WHEN token + 1 output row = 完美唯一） | rentry L3 out |
+| Shared-preload + extension script 重启闭环 | ✅ 每次 PG_CONFIG=/tmp/pg17-writable make install 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
+
+### 关键代码提交链（V3 之后）
+
+1. `497ce4e9e4a` — squash 初始总 commit：3 commits + AGENTS/example_sql M 文件合并
+2. `ce9b72dfd84` — 5× squash Batch (G02/G01/A7)：G02 ACL double-defense / G01 scope preflight / A7 registry+DDL restricted / mvcc_review 3 syntax header / docs sync 11+8 baseline
+3. **TBD** — D-2 A2 Read/Write View Unification：A2.1 self-join 2 BranchScan independent (SJ1 pairs/SJ2 EXCEPT baseline) / A2.3 SAME-CSS NL LATERAL deterministic ReScan proof (3 outer × inner_cnt=14, 0-drop cursor-reset contract) / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions / A2.4 non-lateral NL no-crash count-match-baseline / + Makefile REGRESS/ISOLATION registration / 4 expected sync / 2× stable 12/12 L3 + 9/9 L1 0 diff
 
 ---
 
@@ -787,6 +807,50 @@ Section P PASS marker 之后追加 Section Q：
 | I8.9 | L1 deterministic 测试缺调试 GUC：两个独立场景缺 session-level knob，无法避免 32× counter 或长事务 sleep 性能/稳定性问题 | (1) ob_state_inval 需要 counter>threshold 后 kickout，默认 threshold=32 需要写 33 条 step 巨长 spec 维护贵；且 permutation 之间 counter 跨 step 不清零导致顺序依赖。(2) ob_applying_freeze 需要 "applying 冻结窗口 2 秒" 打开 applying 状态期间让 s2_delta 进入，简单 apply_branch 在单 step 内太快完成 CAS+apply+commit，s2 step 根本赶不上 applying 窗口。 | **新增 2 个 Debug GUC（下划线前缀，供测试 harness 使用，不是 user-facing API）**：(a) `overlay_branch._debug_apply_sleep_sec` (SUSET, default=0)：apply_internal CAS state=applied 完成后立即 `DirectFunctionCall1(pg_sleep, ...)`，s1_apply_cas 事务因此停留在 applying/applied 中间段 2 秒，期间 s2_delta 能进入并被 FR3 拦截。仅在 apply 的 debug path 生效；生产环境 default=0 零开销。(b) `overlay_branch._debug_invalidation_counter_throttle_override` (USERSET, default=-1)：throttled() L880 effective_threshold = (override >= 0) ? override : ob_invalidation_check_threshold。USERSET 允许每个 session 在 spec setup 中独立 SET override=1，实现每 throttled() 调用必跑 heavy SPI —— 保证 deterministic 测试顺序可预测。overlay_branch.c 中两 GUC 都用 DefineCustomIntVariable，默认值匹配 L3 Section Q SHOW baseline 输出（0 / -1）。 | overlay_branch.c L90 存储 / L320 DefineCustomIntVariable；branch_lifecycle.c L880 throttled effective_threshold / L1325 apply CAS 后 pg_sleep；overlay_branch_mvcc.out L3 Section Q SHOW 2 行 baseline 匹配 default 0 / -1 |
 
 ---
+
+## V4 — Review 260926 修复闭环（2026-09-26 → 2026-10-08，6 个独立 commit）
+
+> V4 目标：把 review_260926 §9 R01–R22 22 项 correctness bug + G01/G02 产品化 MVP 加固，通过双× clean rebuild (Rebuild #2) 关成零 diff 的真实证据链。
+
+### V4.0 前置准备：squash 3 historical commits + M 文件
+- commit `497ce4e9e4a`（squash 总）：3 commits (早期 V3 / T1-T2 / misc) + AGENTS/example_sql.md M 文件 → 1 msg 英文简并
+- 修复：`pg_manage_overlay_branches` 为 PG 保留前缀角色名 → 全仓 17 处 sed 替换为 `overlay_branch_administrators`
+
+### V4 S 批次完成表 (M0–M3 Batch 1–6)
+
+| 批次 (review_260926_tracker § 命名) | 核心内容 | 完成日期 | 验收证据 (Rebuild 2×) |
+|---|---|---|---|
+| Batch 1 — S02：入口硬拦截 (R03/R05/R06/R16/R19/R20 baseline) | T_CopyStmt/T_MergeStmt 0A000 + Planner hasModifyingCTE choke + WR CMD_UPDATE PK bms 命中拒 + snapshot TTL PGC_POSTMASTER 10 min + SET NULL R20 MAIN jisnull 分支 | 10-05 | rentry.sql Section R-ENTRY R03/R05/R06/R16/R19 负向；mvcc_review xmin 确定性移除（硬编码数值导致 spurious diffs 修复）；R20 baseline |
+| Batch 2 — S03：API 修正（R08/R09/R10） | 废弃静态自增假 ID (return currval real seq) + 1-arg 去 STRICT + NULL/'' 双入口一致 ob_exit + 错误模板局部缓冲 bn/saved_st/local_name DO 三 SQLSTATE 断言 | 10-05 | mvcc.sql Section R-API R08_1/R08_2/R08_3 NULL/空串；R09 a/b/c currval 双等 + 3×递增；R10 DO 块 42704/55000/0A000 三非空 |
+| Batch 3 — S07：BranchScan sort+bsearch + Pass2 latest-wins + RSS 回收（R11/R12/R13） | Pass1 O(N×M) → sort(DeltaTuple** by key)+bsearch(FIND) O(M log M + N log M)，同 key run 内 max(list pos)=latest-wins（修复 latent I→U first-match bug）；Pass2 去错误 ptr-hash fold → 双遍纯线性；return 前遍历 pfree(dt/key/tuple_data)+list_free 完全零回收 TopMCxt | 10-05 | PASS:S07_HASH_MERGE_CORRECT_COUNT_64（64 rows）+ PASS:S07_APPLY_MATCHES_OVERLAY（group EXCEPT 0）；审计无泄漏，双× clean rebuild 0 diff |
+| Batch 4 — S08：统一 Overlay 输入 + pure-delta UPDATE pass（R01/R02/R04/R20/R21 MVP subset + P1..P12） | 8-phase pure-delta UPDATE pass：B SPI SELECT op I/U → C helper enter/exit → D 深拷贝 es_query_cxt → E delta_lookup latest + seen dedup → F 取 qual_scan/qual_extra → G ExecQual 每 slot → H CMD_DEL/U set-merge（含 R03 PK bms guard + R20 jisnull=true）；MVP no-qual NOP guard；R21 INSERT preconditions：NOT NULL 23502 + PK UNIQUE 23505 MAIN & delta 双侧查 + UPSERT Phase I/II 独立 dedup 不重复；L1 pure_delta upsert/update/delete 3 specs × 3 permutations | 10-06 | P1..P12 全链路 + R_SETNULL R20_2 pure UPDATE NULL / R20_5 4×toggle / R02_PURE_UPDATE_CHAIN v=pure_c+1+2+3 / R_SETNULL R21 PK bms 0A000；L1 pure_delta_upsert 6 19ms / update 7 29ms / delete 8 28ms；双× clean rebuild L3 11/11 + L1 8/8 0 diff |
+| Batch 5 — S14/S17/S10：typed key + base_image 校验（R14/R15/R18） + PlanCache（R07） | R14：typed_pk + typed_pk_n 懒加载（build_from_slot slot_getsomeattrs + build_from_key_text + typed_pk_cmp fmgr OidFunctionCall2Coll eq/lt）；R15：_base JSON enrichment + apply_check_base_image_match FOR UPDATE jsonb_object_agg ORDER BY key 规范比较；R17：apply CAS UPDATE state='applying' WHERE active；delta_insert state guard（applying ERROR already applying / terminal no writes）；R18：delete/update_pass token compare 后立即 apply_check；R07：CacheInvalidateRelcacheAll + CommandEndInvalidationMessages 二连 5 站点 | 10-07 | R-TYPEDKEY TK_BPCHAR r-trim / TK_NUM 12.3=12.30 / TK_TSTZ +08/+00；R_VERSION CONFLICT-1 HOT prereq INFO + apply 55000 ERROR MAIN data preserved / CONFLICT-2 rewrite xmin/ctid；M M1 manual UPDATE state='applying' → INSERT ERROR state guard；R_CTX R07 5 断言（GREEN 18 / RED 21 / GREEN_101 / RED_102 / EXIT_BASELINE）全 PASS |
+| Batch 6 — S13：双门禁产品化（G02 ACL double-defense + G01 scope preflight + R22 delta view REVOKE PUBLIC） | G02：SQL L1（SCHEMA USAGE PUBLIC + catalog GRANTs + synonym PUBLIC EXECUTE SECURITY INVOKER + delta-view REVOKE R22） × C L2（ob_acl_check_lifecycle 统一 42501，is_superuser_or_mgmt SysCache AUTHNAME + is_member_of_role mgmt，5 wrapper + 1 internal 顶部调用）；角色保留名修复；G01：ob_check_branch_scope 7 UNION ALL flat subqueries（ns + pg_depend deptype='e' 扩展对象双重过滤），ord 1..7 first-hit 0A000，create_internal 最顶部调用（零副作用：无 seq 前进，无 catalog row） | 10-08 commits `0ec90f728a9`, `4a67002605e`, `629d0ba227e` | G02 10 subcases A1→E：A1/A2 42501 / B1 PASS owner-use / B2 42501 alice-use-bobs / C1/C2 42501 discard/apply / D1 mgmt-alice-create PASS / D2 mgmt-alice-discard PASS / E delta-view 42501；G01 10+1 SCOPE A→Z：clean PASS（A/Z）× 9 categories (B FK-pk / C FK-selfref / D trigger / E1 partition-parent / E2 partition-child / F inherits / G unlogged / H generated-stored / I view-unsupported-relkind) 全部 0A000 first-hit；每个 label count=2 × unique；双× Rebuild 2 L3 11/11 + L1 8/8 diff -r = 0 lines |
+| Batch 7 — S19：A7 schema epoch registry + DDL restricted MVP（R23 schema drift 55000 + R24 DDL 0A000） | **版本链路简化（最高约束）**：扩展尚未发布，删除 1.1/1.2/1.3 四脚本，control `default_version=1.0` 回退，Makefile DATA 单行仅 `overlay_branch--1.0.sql`；**Schema registry catalog**：pg_branch_registry (bid FK CASCADE + (bid, relid) PK + schema/table 名 + total/pk cols + col/pk MD5 16B) + ACL REVOKE/GRANT PUBLIC 解决 plain user SPI SECURITY INVOKER；**INCREMENTAL 生命周期模型**：create 不 populate → Stage1 first-use populate → Stage2a 5 UNION drift check → Stage2b LEFT JOIN 增量登记 NEW TABLE；apply_internal CAS EXCLUSIVE 前调；discard 级联 DELETE；**DDL 门禁**：11 reason 前缀 §A7 0A000，DropStmt OBJECT_INDEX ALLOW，AlterSchema/AlterOwner → ERROR，CommentStmt ALLOW | 10-08 commit `d1efab151f5` | rentry.sql Section 12 A7 12 subcases 全 PASS（D2 bool_or / D5 drift 55000 / D6 discard+fresh / D11 exit-before-discard / D12 UPDATE-exit+reapply）；basic/mvcc_bounds 时序 create→CREATE TABLE→use first-use INCREMENTAL 不 NEW-drift；mvcc_review 3 Section header 语法修复；mvcc_usage 版本号 1.3→1.0 + §A7 reason sync；双× rebuild L3 11/11 + L1 8/8 diff=0；VPATH + 硬链接 + stale postmaster + tmp_install 陈旧 4 类根因沉淀 |
+
+### V4 遗留 OPEN 问题（分类二 + 架构 A）
+
+| 剩余编号 | 简述 | 建议下次批次 |
+|---|---|---|
+| **D-1 = A7** | 受管表登记 catalog + schema epoch check + 活动分支 DDL RESTRICTED 0A000 | ✅ 本轮 Batch 7 S19 完成（R23/R24，双× rebuild green 11/11 + 8/8 0 diff） |
+| D-2 = A2 | 读写视图统一性：self-join / cursor rescan / parameterized nested-loop / EXPLAIN ANALYZE 独立 case 组 | M4+ |
+| D-3 = A8 | cost_branchscan() 路径成本：startup_cost / total_cost，200k rows planner join order 回归 | M4+ |
+| D-4/D-5 (本次已 ✅) | doc sync（review_260926_tracker / progress_tracker / review_260926 同步） | ✅ 本轮完成 |
+| G03/G04 | 发布门禁 FAIL→BLOCKED 流程 SOP + 时间盒 triad manifest 写入 | 纯文档，按需做 |
+| G05/G06 | CPU/IO 退化预算 S24 冻结 + PUBLICATION 白名单排除 G06 SOP + RPO/RTO 草稿恢复文档 | 运维类，需 DBA 输入 |
+| P01–P03 | 真实发行环境/样本/试用流程 | 产品化前批次，需真实授权 |
+
+### V4 关键踩坑沉淀（不再重复犯）
+
+1. **VPATH/prefix/restart triple-check 必记项**：真正 test 用 postmaster = `/tmp/pg17-writable/bin/postgres -D /tmp/ob_data -p 15433 -k /tmp`，shared_preload_libraries='overlay_branch' 加载 `/tmp/pg17-writable/lib/postgresql/overlay_branch.so`，EXTENSION script 读 `/tmp/pg17-writable/share/postgresql/extension/overlay_branch--1.0.sql`。必须 `PG_CONFIG=/tmp/.../bin/pg_config make install` + 每轮 `pg_ctl restart`（shared_preload 不能 reload，不然 .so 永远是旧版本导致 ACL/scope 行为跟代码对不上）
+2. **SECURITY DEFINER synonyms = ACL 直通大漏洞**：同义词函数一旦标 SECURITY DEFINER，GetUserId() 返回的是 superuser owner，ob_user_is_superuser_or_mgmt 恒 true → 所有 alice/bob 的 bypass 检查虚设。一律回滚为 **SECURITY INVOKER + schema USAGE GRANT PUBLIC + catalog GRANTs 显式组合**
+3. **SPI + WITH-CTE + SPI_execute read-only=true = SILENT FAIL 返回 0 rows**：FK 场景手动 psql 跑 WITH 返回 1 行，但 C 包装器里 SPI_tuptable->nrows = 0。改 flat 7 UNION ALL scalar subqueries + readonly=false 立即好
+4. **ext-owned public objects (pg_depend deptype='e')**：public.pg_branch VIEW relkind='v' 会被 UNSUPPORTED RELKIND ord=7 误拒，每个 UNION ALL 子查询必须加 NOT EXISTS pg_depend classid=pg_class + refclassid=pg_extension + refobjid=overlay_branch oid + deptype='e'。3 sys ns + ext ns 过滤是不够的
+5. **`|| c.relkind` operator 歧义**：PG 对 char(1) `||` 连接无法选 operator 候选 → 报 "operator is not unique"。必须强制 `c.relkind::text`
+6. **pg_regress SQL runner ≠ psql**：rentry.sql 绝对不能 `\gset` / `\set` / psql meta-commands（L461 残留了一个 `\gset` → 被当成 literal 字符串写进 output，DO block 语法错误）。负向断言只能用 DO block + nested BEGIN/EXCEPTION WHEN feature_not_supported THEN NULL + RAISE EXCEPTION 'FAIL not blocked' 双保险，再外层用 SELECT 'PASS:' WHERE NOT EXISTS 验证 bid 确实不存在（即使 DO block 被吞也抓 FAIL）
+7. **pg_regress temp-inst ACL mystery bug**：有时 temp instance CREATE EXTENSION 装完 synonym wrapper 的 ACL 是 MGMT only（ubuntu=X + overlay_branch_administrators=X / 无 PUBLIC =X）。 workaround：rentry.sql 的 G02 开头显式重跑一遍所有 PUBLIC GRANTs + SCHEMA USAGE（DO $$ EXECUTE format(...) 用 @extschema@ 取动态名）
+8. **SPI_finish 忘记调 → WARNING: SPI stack left non-empty**：每个函数尾都 SPI_finish，pfree(sql.data) 在 FINISH 后（SPI 自身管理的 SPI 内存不能 pfree，只 pfree 我们自己 palloc 的 appendStringInfo Data）
+
 
 ## 关于 Step 6 留空
 

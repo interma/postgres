@@ -227,6 +227,105 @@ extern bool ob_throttled_allow_kickout;  /* only ExecutorRun WR dml_split entry 
 extern BranchContext *CurrentBranchContext;
 
 /* ----------
+ * §G02 ACL unified helpers (review_260926 S13, 2026-09-28)
+ *
+ * All SQL-callable lifecycle wrappers MUST call these before dispatching
+ * to the internal implementation.  The helpers implement double-layer
+ * defense: (1) SQL layer limits EXECUTE to owner / builtin role
+ * `overlay_branch_administrators`; (2) C layer re-evaluates privileges
+ * using the branch row's stored owner Oid, so even if someone bypasses
+ * the SQL grant via direct @extschema@ qualification they still get
+ * 42501.
+ *
+ * Builtin role name (kept in one place):
+ *   #define OB_MGMT_ROLE  "overlay_branch_administrators"
+ *
+ * Privilege matrix:
+ *   create_branch()                    → superuser OR member of OB_MGMT_ROLE
+ *   use_branch(name) / use_with_mode  → owner OR superuser OR mgmt (NULL=EXIT
+ *                                       is unrestricted — session-level action)
+ *   apply_branch(name)                → owner OR superuser OR mgmt
+ *   discard_branch(name)              → owner OR superuser OR mgmt
+ * ----------
+ */
+#define OB_MGMT_ROLE_NAME		"overlay_branch_administrators"
+typedef enum ObLifecycleOp
+{
+	OB_OP_CREATE_BRANCH = 0,
+	OB_OP_USE_BRANCH,       /* branch_name may be NULL → skip owner check */
+	OB_OP_APPLY_BRANCH,
+	OB_OP_DISCARD_BRANCH
+} ObLifecycleOp;
+
+/* Raises 42501 with a uniform message when the caller is not authorised.
+ * When op == OB_OP_USE_BRANCH and branch_name is NULL/empty the caller
+ * is trying to EXIT the branch — that path is always allowed and we
+ * return without error. */
+extern void			ob_acl_check_lifecycle(ObLifecycleOp op,
+										   const char *branch_name);
+
+/* ----------
+ * G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ *
+ * Scan current database for all user permanent relations (excludes
+ * pg_catalog, information_schema and the extension schema) and
+ * raises 0A000 at the FIRST offending relation.  Supported relkinds
+ * for MVP are only permanent tables ('r') plus their plain indexes
+ * ('i') and sequences ('S'); all else plus 7 categories below are
+ * RESTRICTED.  This avoids silent data corruption when apply-time
+ * semantics do not match MAIN-side behaviour (e.g. FKs fire MAIN
+ * only, triggers are MAIN-only, partition promotion mixes relids
+ * wrong).
+ *
+ * Rejected categories:
+ *   (A) ANY foreign key reference (PK side OR FK side).
+ *   (B) User triggers (non-internal, non-disabled).
+ *   (C) Partitioning (relkind 'p'/'I' OR relispartition).
+ *   (D) Table inheritance (inhparent OR inhrelid in pg_inherits).
+ *   (E) Unlogged tables (relpersistence = 'u').
+ *   (F) GENERATED STORED columns.
+ *   (G) FDW tables / views / matviews / anything not in {'r','S','i'}.
+ * ----------
+ */
+extern void			ob_check_branch_scope(void);
+
+/* ----------
+ * §Gx / A7 (review_260926 S18) Schema epoch registry helpers.
+ *
+ * Registry catalog table (overlay_branch.pg_branch_registry) stores
+ * per-create_branch (bid, relid) fingerprints of every user table
+ * at the time create_branch succeeded.  4-tuple signature =
+ * (total_cols, pk_cols, md5 col_hash, md5 pk_hash) so we can tell
+ * the user exactly *what* drifted in the 55000 detail/hint.
+ *
+ *   ob_registry_populate_for_create(bid): called IMMEDIATELY after
+ *     create_branch gets new_branch_id (after currval() commit,
+ *     after scope preflight passed).  SPI scan current DB user
+ *     tables + INSERT rows, ZERO row = no user tables = NOP.
+ *
+ *   ob_registry_check_current_schema(bid, op_name): called from
+ *     use_with_mode_internal after bid fetched but BEFORE any
+ *     snapshot install, AND from apply_internal after bid fetched
+ *     BEFORE advisory lock / CAS.  SPI scans current DB user tables
+ *     and LEFT JOINs registry WHERE bid = given.  Raises
+ *     ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE (55000) with detail
+ *     of FIRST mismatch (missing table / new table / cols / pk /
+ *     hash drift).  bid missing from registry at all → DEFER silently
+ *     (backwards compat: old branches created before 1.3 upgrade
+ *     might have no rows; check skipped).
+ *
+ *   ob_registry_cascade_discard(bid, spi_connected_already): called
+ *     from discard_internal right BEFORE SPI_finish() so we share
+ *     the open SPI connection; DELETE FROM registry WHERE bid.
+ * ----------
+ */
+#define OBTABLE_REGISTRY  OBSCHEMA ".pg_branch_registry"
+
+extern void			ob_registry_populate_for_create(int32 bid);
+extern void			ob_registry_check_current_schema(int32 bid, const char *op_name);
+extern void			ob_registry_cascade_discard(int32 bid);
+
+/* ----------
  * Function declarations for branch management
  * ----------
  */

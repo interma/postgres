@@ -736,6 +736,7 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 | 对 VIEW / MATVIEW / FOREIGN TABLE 写 DML | 在 guard 的 G2/G3 级就拦截，不支持透明叠加读 | V2 BranchScan planner hook 直接 skip，走原路径；DML 则在 WR guard 报错 |
 | **COPY FROM / MERGE / Data-Modifying CTE** | R05/R06/R16 入口拦截（MVP 范围硬性禁止）| 0A000 feature_not_supported："COPY FROM on overlay-managed tables is not supported in MVP"（防止写穿 MAIN）|
 | **UPDATE t SET pk_col = ...**（修改主键列）| R03 拒绝：MAIN path + pure-delta path 两路都检查 targetList 是否命中 PK attnum → 0A000 | "Updating the PRIMARY KEY column of an overlay-managed table is not supported" |
+| **非分支 OWNER / 非 overlay_branch_administrators 成员 / 非 Superuser 调用 use / apply / discard / create**（§G02 ACL 硬门禁）| 所有 5 个 wrapper 在 C 层入口第一行调用 `ob_acl_check_lifecycle`，调用身份必须是 (branch owner) ∪ (mgmt role 成员) ∪ (superuser)，否则 42501 | `42501 insufficient_privilege: Must be branch owner, superuser, or member of role "overlay_branch_administrators"`（CREATE_BRANCH 不接受 OWNER 身份，必须 mgmt 或 superuser）|
 
 这些限制在后续版本逐步解除（分类二 S13 G02 ACL / 分区支持 / FK 级联等见 review_260926 §Cat2）。
 
