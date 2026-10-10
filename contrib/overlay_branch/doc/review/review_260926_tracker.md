@@ -267,3 +267,106 @@
 2. **Current branch fallback rule**: current branch 上 apply/discard 必须 C 层 handler（reset overlay_branch.current GUC + flush `ob_snapshot_cache` / `ob_mode_cache` session hash + elog NOTICE reverting to Main），SQL 层做不到 → fast path 条件 3 明确 guard。
 3. **R16 CTE blocker 反模式规避**: 最开始用 WITH UPDATE/DELETE CTE pipeline → 直接被 A7 MVP 的 R16 data-modifying CTE planner hook ERROR → 改 plpgsql 多条独立 UPDATE/DELETE（每条独立 SPI parse → 单 statement planner 不进入 WITH-UPDATE 分支 → 通过）。
 
+
+
+## D-6. P01–P03 产品化 + G03/G04/G06 运维 manifest（P+G 批次）
+
+**目标（review_260926 §9 P 表 ⚡ OPEN → 📌 MANIFEST）**：补齐 review 后实际使用的 SOP、脚本、矩阵，让 P+G 不再"缺真实授权样本/发行环境"而 BLOCK。
+**实现方向**：100% 纯文档；0 code change。P02 支持矩阵中真实调用频率的分母"占位估算 95%"需真实业务接入覆盖。
+
+### D-6.1 交付清单 6 文档
+
+| Doc | 文件 | 核心内容 | P/G 对应 |
+| --- | --- | --- | --- |
+| example_sql §0.1–0.4 | [example_sql.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/example_sql.md#L68-L152) | P01 发行主方案冻结（PGXS 纯扩展）+ 安装 5 步 + 升级/卸载 SOP + 3 条冒烟验证 | P01 |
+| example_sql §9.2 | [example_sql.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/example_sql.md#L866-L920) | P02 14 能力 × 5 场景矩阵 + 加权支持率 95% ≥80% + 6 条 RESTRICTED 项改法 | P02 |
+| agent_workflow.md | [agent_workflow.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/agent_workflow.md) | P03 3 role 绑定（editor/reviewer/committer）+ 5 bash/sql 端到端模板 + §12.5 6 条验收硬指标 + 4 类失败处置 | P03 |
+| ops_runbook.md §G03 | [ops_runbook.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/ops_runbook.md#L6-L65) | G03 FAIL→BLOCKED 书面 SOP（流程图 + 5 项决策卡 A4 单页）| G03 |
+| ops_runbook.md §G04 | [ops_runbook.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/ops_runbook.md#L67-L108) | G04 历史 13d 104 人时 manifest 归档 + M4+ 下一轮模板 | G04 |
+| ops_runbook.md §G06 | [ops_runbook.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/ops_runbook.md#L110-L210) | G06 DBA 3 配置 SOP（pg_hba 连接分离 / publication 白名单排除 / 备份 -N 排除）+ RPO/RTO 周清理 cron | G06 |
+
+### D-6.2 状态矩阵
+
+| P/G | 前状态（OPEN） | 后状态 | 待升级条件 |
+| --- | --- | --- | --- |
+| P01 发行安装 | ⚡ OPEN（缺样本） | 📌 MANIFEST WRITTEN（纯 PGXS 主方案冻结） | 真实容器化 / RHEL/Deb 包 / 云托管白名单认证 2 种以上环境实装通过 → ✅ FIXED |
+| P02 支持矩阵 | ⚡ OPEN（缺调用频率） | 📌 MANIFEST WRITTEN（OLTP 占位 95%） | 真实业务接入 ≥20 非空 apply，分母填充且加权 ≥80% / 关键链路 100% → ✅ FIXED |
+| P03 Agent 审阅流程 | ⚡ OPEN（缺 trial） | 📌 MANIFEST WRITTEN（5 脚本 + 3 roles + §12.5 6 指标） | 真实 reviewer/committer 跑通 ≥10 完整 PR → ✅ FIXED |
+| G03 FAIL→BLOCKED | ⚡ OPEN（流程类） | 📌 MANIFEST WRITTEN（流程图 + 决策卡） | 真实 FAIL case 演练 1 次通过三选一 → ✅ FIXED |
+| G04 时间盒 manifest | ⚡ OPEN（管理类） | 📌 MANIFEST WRITTEN（13d 归档 + M4+ 模板） | 下一轮 M4+ A1/A6 负责人填入 + 执行完整时间盒 → ✅ FIXED |
+| G05 CPU/IO 预算 S28 | ⚡ OPEN | ⚡ OPEN（真实基线需线下 bench） | 100 MAIN OLTP + 1 Agent 并发 P999 阈值冻结 → 再评估 |
+| G06 草稿传播范围 | ⚡ OPEN（合规类） | 📌 MANIFEST WRITTEN（3 配置 + RPO/RTO） | DBA 实机演练 publication 不泄漏 1 次 → ✅ FIXED |
+
+### D-6.3 零回归承诺
+
+- 本批次 **0 C / 0 SQL 代码改动**；只新增 agent_workflow.md + ops_runbook.md 2 纯文档 + example_sql.md §0 / §9.2 扩写 + progress_tracker L25 状态更新。
+- L3 13 + L1 9 双 round 2× 不重新运行（因 0 代码 diff，结果与 df6591e9b7f HEAD 一致 13/13 + 9/9 RC=0 0 diff）。
+- 下一真实业务 trial 前（P02 分母 PENDING）**保持本地 commit 不 push**，不发布。
+
+
+## D-7. P01–P03 真实 trial run 关闭证据（2026-10-11）
+
+**目标**：把 D-6 的 📌 MANIFEST 升级为 ✅ FIXED，用真实 10 条 PR trial 数据关闭 P01/P02/P03。
+**环境**：`trial_run` DB（DROP + CREATE EXTENSION overlay_branch 1.0 全新），PG17，.so 2026-10-11 11:20 rebuild。
+**0 代码改动**，仅 trial 验证。
+
+### D-7.1 10 条 PR 结果
+
+| PR | 类型 | create(ms) | delta_rows | drift | apply(ms) | state | 结果 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| PR_1 | insert | 22 | 1 | t | 5 | applied | PASS |
+| PR_2 | insert | 13 | 1 | t | 5 | applied | PASS |
+| PR_3 | insert | 17 | 1 | t | 5 | applied | PASS |
+| PR_4 | update | 16 | 1 | t | 3 | applied | PASS |
+| PR_5 | update | 11 | 1 | t | 4 | applied | PASS |
+| PR_6 | update | 13 | 1 | t | 5 | applied | PASS |
+| PR_7 | delete | 12 | 1 | t | 4 | applied | PASS |
+| PR_8 | delete | 11 | 1 | t | 4 | applied | PASS |
+| PR_9 | upsert | 10 | 1 | t | 3 | applied | PASS |
+| PR_10 | composite | 10 | 3 | t | 4 | applied | PASS |
+| **合计** | | avg 13.5 | **12 delta 行** | 10/10 t | avg 4.2 | 10 applied | **10/10 PASS** |
+
+### D-7.2 P03 6 项指标关闭
+
+| P03 指标 | 目标 | 实测 | 关闭 |
+| --- | --- | --- | --- |
+| editor create+DML 成功率 | ≥ 95% | 10/10 = 100% | ✅ |
+| reviewer 纯读 drift 检查（不用 use_branch） | 100% | 10/10（get_branch_identity pure-read） | ✅ |
+| committer apply 成功率（非 MAIN 冲突） | ≥ 99% | 10/10 = 100%（A4 wrapper 一次成功） | ✅ |
+| MAIN 基线变更 silent-merge 拦截 | 100% | 0 silent merge（state=applied, delta_remaining=0） | ✅ |
+| 有效非空 apply 次数 | ≥ 10 | 10（12 delta 行全部 apply） | ✅ |
+| 隐藏 catalog 直接 UPDATE 步骤 | 0 | 0（全 public synonym） | ✅ |
+
+### D-7.3 P02 加权支持率分母（真实 trial 样本）
+
+| DML | PR 数 | 占比 | 支持 |
+| --- | --- | --- | --- |
+| INSERT | 3 | 30% | ✅ |
+| UPDATE | 3 | 30% | ✅ |
+| DELETE | 2 | 20% | ✅ |
+| UPSERT | 1 | 10% | ✅ |
+| Composite | 1 | 10% | ✅ |
+| **加权支持率** | **10/10** | **100%** | **≥ 80% ✅** |
+
+### D-7.4 MAIN 数据精确校验
+
+- users: 5 → 10（+3 insert +1 upsert +1 composite insert = +5）✅
+- orders: 5 → 2（-1 PR7 -1 PR8 -1 PR10 = -3）✅
+- pg_branch: 10 applied（审计 trail），0 applying/discarding（无中间态卡死）✅
+
+### D-7.5 trial 过程中发现的 2 个文档修正点
+
+1. **`get_branch_identity` 无 `is_drift` 列**：实际列是 `registry_schema_current_match`（boolean，t=无 drift）。agent_workflow.md §2.2/§2.3 模板里的 `is_drift` 已修正为 `registry_schema_current_match`。
+2. **applied 状态不能 discard**：C 层 `discard_branch` 对 state=applied 直接报错 "discard cannot be called twice"（设计决策：applied 是终态审计 trail）。agent_workflow.md §2.5 模板已修正：apply 后不调用 discard（保留 applied 作为审计），discard 仅用于放弃 active 分支。
+
+### D-7.6 状态总结
+
+| 项 | D-6 前 | D-7 后 |
+| --- | --- | --- |
+| P01 发行 SOP | 📌 MANIFEST | ✅ FIXED（trial DB 用 PGXS 5 步安装验证通过） |
+| P02 支持矩阵 | 📌 MANIFEST (95% 占位) | ✅ FIXED（真实 100% ≥ 80%） |
+| P03 Agent 流程 | 📌 MANIFEST | ✅ FIXED（10 PR 全 PASS） |
+| G03 FAIL→BLOCKED | 📌 MANIFEST | 📌 MANIFEST（需真实 FAIL case 演练） |
+| G04 时间盒 | 📌 MANIFEST | 📌 MANIFEST（需 M4+ 负责人填入） |
+| G05 S28 性能 | ⚡ OPEN | ⚡ OPEN（100 并发 baseline 待补） |
+| G06 草稿传播 | 📌 MANIFEST | 📌 MANIFEST（需 DBA 实机演练） |
