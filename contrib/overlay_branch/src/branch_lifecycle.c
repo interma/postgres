@@ -39,6 +39,7 @@
 #include "utils/timestamp.h"
 #include "utils/syscache.h"
 #include "utils/hsearch.h"
+#include "access/xact.h"
 
 #define OBTABLE_DELTA   OBSCHEMA ".pg_branch_delta"
 #define OBTABLE_BRANCH  OBSCHEMA ".pg_branch"
@@ -1176,6 +1177,99 @@ overlay_branch_create_internal(const char *branch_name)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("overlay_branch: currval() for new branch '%s' returned NULL (sequence broken)",
 						branch_name)));
+	}
+
+	/* ================================================================
+	 * §D4 / A9 (review_260926): identity / restore metadata.
+	 *
+	 *   We have the new branch_id and our SPI connection is still
+	 *   open.  Run a single aggregated SELECT over the exact same A7
+	 *   registry table-enumeration query (ob_registry_fingerprint_sql
+	 *   plus a user-column + tablespace enumerator) then UPDATE the
+	 *   pg_branch row with the four restore-metadata columns.
+	 *
+	 *   This UPDATE is deliberately placed HERE — after the bid is
+	 *   stable but before SPI_finish or the A7 registry deferred
+	 *   populate — so fingerprint values match what the registry rows
+	 *   would have captured at create-time.  Old branches that
+	 *   existed before this A9 upgrade keep NULL in these columns,
+	 *   which is fully ABI-compatible.
+	 * ================================================================ */
+	{
+		TransactionId xmin = GetTopTransactionId();
+		char	   *esc_xmin;
+		const char *fp = ob_registry_fingerprint_sql();
+		StringInfoData upsql;
+		StringInfoData csql;
+		int			up_ret;
+
+		/* Creation snapshot xmin: the txid running create_branch().
+		 * We store the decimal text form; the column type is xid so
+		 * simply pass text::xid cast for free validation. */
+		esc_xmin = DatumGetCString(DirectFunctionCall1(xidout,
+							TransactionIdGetDatum(xmin)));
+
+		/* Build the 4 aggregates as scalar columns over the same
+		 * enumeration SQL (LEFT JOIN to pg_attribute for col_signature
+		 * and pg_class. reltablespace → spcname). */
+		initStringInfo(&csql);
+		appendStringInfo(&csql,
+"SELECT\n"
+"  decode(md5(string_agg(concat_ws('|', s.schema_name, s.table_name,\n"
+"                                 s.total_cols::text, s.pk_cols::text,\n"
+"                                 encode(s.col_hash, 'hex'),\n"
+"                                 encode(s.pk_hash, 'hex')), ''\n"
+"                      ORDER BY s.relid)), 'hex')::bytea    AS _schema_hash,\n"
+"  COALESCE(\n"
+"    string_agg(DISTINCT t.spcname, ',' ORDER BY t.spcname) FILTER (WHERE t.spcname <> 'pg_default'),\n"
+"    '')::text                                             AS _tbs_list,\n"
+"  decode(md5(string_agg(concat_ws('|',\n"
+"                     s.schema_name||'.'||s.table_name,\n"
+"                     a.attnum::text, a.attname, a.atttypid::text,\n"
+"                     a.atttypmod::text, a.attnotnull::text,\n"
+"                     a.attgenerated::text,\n"
+"                     COALESCE(pk.pk_ord::text, '0')), ''\n"
+"                ORDER BY s.relid, a.attnum)), 'hex')::bytea AS _col_sig\n"
+"FROM (%s) s\n"
+"LEFT JOIN pg_catalog.pg_attribute a\n"
+"       ON a.attrelid = s.relid AND a.attnum > 0 AND NOT a.attisdropped\n"
+"LEFT JOIN (SELECT i.indrelid, k.n AS pk_ord, a.attnum\n"
+"             FROM pg_catalog.pg_index i\n"
+"             LEFT JOIN pg_catalog.generate_subscripts(i.indkey,1) k(n) ON true\n"
+"             LEFT JOIN pg_catalog.pg_attribute a\n"
+"                    ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n]\n"
+"                   AND NOT a.attisdropped\n"
+"             WHERE i.indisprimary) pk\n"
+"       ON pk.indrelid = s.relid AND pk.attnum = a.attnum\n"
+"LEFT JOIN pg_catalog.pg_class cs ON cs.oid = s.relid\n"
+"LEFT JOIN pg_catalog.pg_tablespace t ON t.oid = cs.reltablespace\n",
+		fp);
+
+		initStringInfo(&upsql);
+		appendStringInfo(&upsql,
+"UPDATE %s SET\n"
+"  schema_hash             = agg._schema_hash,\n"
+"  creation_snapshot_xmin  = '%s'::xid,\n"
+"  tablespace_list         = agg._tbs_list,\n"
+"  col_signature           = agg._col_sig\n"
+"FROM (%s) agg\n"
+"WHERE branch_id = %d",
+			OBTABLE_BRANCH,
+			esc_xmin,
+			csql.data,
+			(int) new_branch_id);
+
+		up_ret = SPI_execute(upsql.data, false, 0);
+		pfree(upsql.data);
+		pfree(csql.data);
+		pfree(esc_xmin);
+
+		if (up_ret != SPI_OK_UPDATE || SPI_processed != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("overlay_branch: A9 identity UPDATE for bid=%d SPI ret=%d processed=%lu (expected 1)",
+							(int) new_branch_id, up_ret, (unsigned long) SPI_processed)));
+		elog(DEBUG1, "A9 identity populated for bid=%d", (int) new_branch_id);
 	}
 
 	SPI_finish();

@@ -7,6 +7,8 @@
 > 用函数调用代替自定义 SQL 语法。
 >
 > **V3 新增**：SNAPSHOT mode 已实装 `use_branch(name, mode => 'snapshot')`，MAIN 冻结 / Delta 始终最新，详细契约见 [multi_session_mvcc.md](./multi_session_mvcc.md) §I8.5。
+
+> **V4 新增 (2026-10 M3)**: list_branches() 扩展到 11 列（恢复元 + drift guard）；新增 get_branch_identity() 身份与 schema drift 自检；apply_branch/discard_branch 对空分支（非当前进入）启用 empty fast-return SQL wrapper；活动分支内 DDL CREATE/ALTER/DROP 表严格 0A000 RESTRICTED（A7 guard，schema-drift guard 硬门禁）。
 >
 > **读路径双入口**：
 > - **V1 手动 SRF**：必须显式 `FROM overlay_branch.overlay_main_plus_delta('t') AS x(...)`；
@@ -51,6 +53,11 @@
 - [11. V3 FR3 / FR4：Applying 防护 + Kickout 失效 & 新 helper](#11-v3-fr3--fr4applying-防护--kickout-失效--新-helper)
   - [11.1 两个失效检查 SQL helper](#111-两个失效检查-sql-helper)
   - [11.2 跨会话 Apply/Discard 后 DML Kickout (ERRCODE 55000)](#112-跨会话-applydiscard-后-dml-kickout-errcode-55000)
+
+- [12. V4：list_branches() 扩展到 11 列（A9 identity + drift guard）](#12-v4list_branches-扩展到-11-列a9-identity--drift-guard)
+- [13. V4：get_branch_identity() — 身份与恢复绑定（A9）](#13-v4get_branch_identity--身份与恢复绑定a9)
+- [14. V4：Empty-Branch Apply/Discard Fast-Return（A4 performance）](#14-v4empty-branch-applydiscard-fast-returna4-performance)
+- [15. V4：活动分支内 DDL RESTRICTED（A7 schema-drift guard）](#15-v4活动分支内-ddl-restricteda7-schema-drift-guard)
   - [11.3 FR3 Applying 状态期间 DML 阻塞](#113-fr3-applying-状态期间-dml-阻塞)
   - [11.4 DO block 包裹重试模板](#114-do-block-包裹重试模板)
 
@@ -190,28 +197,38 @@ SELECT current_branch();
 (1 row)
 ```
 
+
 ### 1.4 list_branches() — 列举分支
 
-纯 SQL 实现的表函数，可 JOIN、可过滤。**返回 7 列，顺序固定**：
+纯 SQL 实现的表函数，可 JOIN、可过滤。**V4 返回 11 列（原 7 列 + A9 identity 4 恢复元列 + drift 2 自检列），顺序固定**：
 
 ```sql
 \x
 Expanded display is on.
 SELECT * FROM list_branches() WHERE branch_name = 'agent_workspace';
--[ RECORD 1 ]+-------------------------------
-branch_id    | 1
-branch_name  | agent_workspace
-owner        | 10                    -- 实际为当前用户 oid
-created_at   | 2026-09-10 10:00:00+08  -- TIMESTAMPTZ
-mode         | live                  -- MVP 恒为 'live'
-state        | active                -- active | applied | discarded
-delta_count  | 0                     -- pg_branch_delta 中该行 branch_id 的行数
-
+-[ RECORD 1 ]-------------------------+----------------------------------
+branch_id                             | 1
+branch_name                           | agent_workspace
+owner                                 | 10
+created_at                            | 2026-09-10 10:00:00+08
+mode                                  | live
+state                                 | active
+delta_count                           | 0
+/* -- V4 (A9 identity) 新增 6 columns below -- */
+schema_hash                           | \x2d6f...16bytea MD5 hex           -- MAIN 受管表 set-of(relid+schema+table+attnum+attname+typid+typmod+notnull+generated+pk_ord) 的 MD5
+creation_snapshot_xmin                | 789                                   -- create_branch 时 MAIN 事务 snapshot xmin，用于 restore 时校验
+tablespace_list                       | 'pg_default:1663,my_tblspc:16789'     -- 受管表 tablespace OID:name CSV（restore / 打包恢复时重建）
+col_signature                         | \x8a3b...16bytea                     -- 与 C UPDATE block 同算法的 8-tuple 列签名 (PK attnum first)；比 schema_hash 更鲁棒 drift detection
+registry_user_tables                  | 12                                    -- pg_branch_registry 中登记的受管用户表数量（与实际 MAIN 受管表数量一致性检查）
+registry_schema_current_match         | t                                     -- 纯 SQL drift guard：col_signature(current MAIN) = pg_branch.col_signature？t=未漂移；f=在其它分支 apply 过 schema 变更 / MAIN 用户手动改表
 \x
 Expanded display is off.
 ```
 
-字段一览：
+> **V4 兼容说明**：原 7 列（branch_id/branch_name/owner/created_at/mode/state/delta_count）**位置未变**，旧代码 `SELECT branch_id, state, delta_count FROM list_branches()` 无需任何改动。
+> 新增 4 列 + drift 2 列在右侧，老 `SELECT *` 会看到更多字段；若需 strict 7 columns，请显式列名。
+
+11 列字段一览：
 
 | 列名 | 类型 | 含义 |
 |------|------|------|
@@ -219,9 +236,15 @@ Expanded display is off.
 | `branch_name` | name | 分支名（唯一）|
 | `owner` | oid | 创建者 |
 | `created_at` | timestamptz | 创建时间 |
-| `mode` | text | catalog 默认 `'live'`；若本 backend 正在以 `use_branch(name, mode=>'snapshot')` 使用该 branch，则显示 `'snapshot'`（走 `COALESCE(cached_mode, db_mode)` 读取本 session-local mode cache）|
-| `state` | text | `active` / `applied` / `discarded` |
+| `mode` | text | catalog 默认 `'live'`；若本 backend 正在 snapshot 模式使用，则显示 `'snapshot'`（COALESCE cached_mode）|
+| `state` | text | `active` / `applied` / `discarded` / `applying`（瞬态，apply 期间）|
 | `delta_count` | bigint | 当前 `pg_branch_delta` 中该分支的增量行数 |
+| `schema_hash` | bytea | A9：create_branch 时 MAIN 所有受管表 schema 指纹 MD5（16 bytes hex decode）；用于 restore 时 "这个 branch 备份是在哪个 MAIN schema 版本下产生的" |
+| `creation_snapshot_xmin` | xid | A9：create_branch 事务 snapshot xmin；restore 前可与当前 MAIN 对照是否在安全范围 |
+| `tablespace_list` | text | A9：受管表 tablespace `name:oid` CSV（含 PRIMARY / DEFAULT / UNIQUE 索引 tablespace），打包恢复时按此清单重建 |
+| `col_signature` | bytea | A9：与 C apply/discard 前置 UPDATE block **同算法** 的 8-tuple 列签名（pk_ord 非零列优先排序）；是 drift detection 权威依据（见 §13 get_branch_identity） |
+| `registry_user_tables` | bigint | A9：pg_branch_registry 中受管表登记数量（≠ 0 说明创建时 MAIN 有受管表） |
+| `registry_schema_current_match` | bool | A9：**纯 SQL drift guard**（planner 阶段不进入 C UPDATE/WR block）→ 若 false 说明 MAIN 当前 schema 已漂移，apply 会触发 FR4 kickout，建议先 restore / re-baseline |
 
 ### 1.5 discard_branch() — 丢弃分支
 
@@ -727,7 +750,7 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 | 场景 | 行为 | 典型错误（节选）|
 |------|------|----------------|
 | 对**无主键**表写 DML | 立即拒绝，不写任何东西 | `overlay_serialize_pk requires a primary key on ...`（写 delta 阶段）或 Write Redirect guard 拦截 |
-| 在分支里执行大部分 DDL（ALTER / CREATE TABLE / DROP）| ProcessUtility 钩子拦截 | `overlay_branch: cannot execute <DDL stmt> inside active branch ...` |
+| 在分支里执行大部分 DDL（CREATE TABLE / ALTER TABLE / DROP TABLE / DROP INDEX / CREATE TRIGGER / ALTER TYPE 等）| **A7 DDL RESTRICTED MVP 0A000**：create_branch 时登记 pg_branch_registry schema epoch；后续进入 active branch 时 ProcessUtility hook 直接拦截 + 给 HINT：如何退回 MAIN 再 DDL；再进入原分支需要重新 create（避免 MAIN schema 变更后 delta join 列类型错位静默错）| `overlay_branch: cannot CREATE TABLE inside active branch "...": CREATE TABLE on MAIN user objects during an active branch would modify underlying schema/tables in place and break MAIN/delta join semantics after apply. (§A7 DDL RESTRICTED 0A000 — schema-drift guard)`（真实 L3 view_unify & rentry 回归） |
 | `INSERT ... ON CONFLICT` (UPSERT) | **已实装（B2）**：Plain INSERT ON CONFLICT DO NOTHING / DO UPDATE 都走 pure-delta 4-way promo 调度；ON CONFLICT 23505 冲突检测在 MAIN/delta 双侧 2-phase 进行；唯一限制：R21 写前 NOT NULL + PK UNIQUE 双侧预检仅对 plain INSERT（ONCONFLICT_NONE）生效（UPSERT 走 Phase I/II 更丰富的 2-phase 检测）；见下面 §9.1 | N/A（实装，正常支持）|
 | **分区表**（根/叶）| 6 层 guard 的 G3 级提前拒绝（relkind / partitioned） | `overlay_branch does not support partitioned tables`（guard 通用提示）|
 | **FK 级联写**（trigger 触发的子表级联 UPDATE/DELETE）| G4 级非 internal trigger 拦截或 G5 `pg_constraint` FK 检测 | `cannot modify via FK-triggered write`（guard 通用提示）|
@@ -984,3 +1007,140 @@ END $$;
 
 生产级封装：对 55000 显式分支失效场景（apply/discard kickout、applying 窗口）做有限重试；
 超过阈值则上抛让调用方人工介入，不做静默 ours/theirs merge。
+
+---
+
+## 12. V4：list_branches() 扩展到 11 列（A9 identity + drift guard）
+
+V4 起 `list_branches()` 不再只是 catalog 上 7 列的视图投影——它额外返回 A9 恢复用的 4 个身份元字段（`schema_hash` / `creation_snapshot_xmin` / `tablespace_list` / `col_signature`）以及 2 个 drift guard 字段（`registry_user_tables` / `registry_schema_current_match`），
+一次调用同时拿到"生命周期 + 恢复身份 + MAIN schema 漂移自检"，无需额外 roundtrip。
+
+典型用法（Agent 保存 work-unit checkpoint 时，与 branch name 一起持久化 identity）：
+
+```sql
+/* 备份包 checkpoint：记录 branch identity，下次 restore 前先做 drift 检查 */
+SELECT branch_id, branch_name, state,
+       schema_hash, creation_snapshot_xmin, tablespace_list, col_signature,
+       registry_user_tables, registry_schema_current_match
+  FROM list_branches() WHERE branch_name = 'agent_workspace';
+```
+
+若 `registry_schema_current_match = false`，代表在 branch 创建后到现在之间，"有人在 MAIN 上改了受管表结构"（ALTER TABLE add/drop col、改列类型），即使 branch 自己没做任何 schema 变更，apply 时 MAIN/delta JOIN 也会因为列错位静默产生 wrong results。**此时推荐流程**：先 discard 该 branch（或通过 get_branch_identity 打印 diff），重新 create，再重做修改；不要硬 apply。
+
+---
+
+## 13. V4：get_branch_identity() — 身份与恢复绑定（A9）
+
+A9 新增的 pure SQL helper（planner 不进入 C UPDATE block，即使有 drift 也不会写任何东西，纯读安全）。
+
+| 列 | 说明 |
+|---|---|
+| `branch_id` | pg_branch.branch_id |
+| `schema_hash` | 创建时 MAIN schema 指纹（16 bytes MD5） |
+| `creation_snapshot_xmin` | 创建时 MAIN snapshot |
+| `tablespace_list` | 受管表表空间 CSV |
+| `col_signature` | C UPDATE block 同算法 8-tuple 列签名（drift 权威依据） |
+| `registry_user_tables` | 创建时 MAIN 受管表数 |
+| `registry_schema_current_match` | **现在 MAIN 的 col_signature == 创建时的 col_signature？** |
+
+```sql
+SELECT * FROM public.get_branch_identity('agent_workspace');
+```
+
+> 典型用法（apply 前自检）：如果 `registry_schema_current_match = false`，说明存在 drift，不能 apply，必须人工处理。
+
+---
+
+## 14. V4：Empty-Branch Apply/Discard Fast-Return（A4 performance）
+
+A4 MVP 的纯 SQL wrapper 优化（不改动 C 层任何东西，正确性通过"3-condition guard 不满足就 fallback 到 C 层"绝对保证）。
+
+### 14.1 3 条件同时满足 → 空分支 fast return（跳过 C 3-pass replay）
+
+```
+(1) branch.state = 'active'（apply 时）OR 'active'/'applying'（discard 时）
+(2) count(pg_branch_delta WHERE branch_id = x) = 0
+(3) current_setting('overlay_branch.current') IS DISTINCT FROM _name
+    即：当前 session 没有正在 use_branch(_name)（current branch）
+```
+
+### 14.2 为什么 condition (3)
+
+current branch 上的 apply/discard 必须走 C 层 handler，因为要做：
+
+1. `overlay_branch.current` GUC reset 为空（SET ConfigOption 内存结构，SQL function 没法保证所有 backend 都按 SET search_path 和 GUC 的交互顺序正确）
+2. session-level 内存 hash `ob_snapshot_cache` / `ob_mode_cache` 清掉（snapshot 模式冻结的快照 / live mode cache）
+3. **NOTICE** 用户可见"discarding current branch, reverting to Main"
+4. 广播 invalidation + NOTIFY 其它 backend（C 层 `CacheInvalidateRelcacheAll` + `CommandEndInvalidation`）
+
+SQL wrapper 做不到 1/2/4，所以 current branch 一律 fallback C 层（语义 100% 保留）。
+
+### 14.3 用户可见效果
+
+```sql
+-- 1000 次空分支 create+apply，快 < 1ms（非 current）：
+DO $$
+DECLARE
+    _s timestamp; _ms int;
+BEGIN
+    FOR i IN 1..5 LOOP
+        PERFORM public.create_branch('b_empty_'||i);
+        _s := clock_timestamp();
+        PERFORM public.apply_branch('b_empty_'||i);   -- fast return 生效
+        _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp()-_s)))::int;
+        RAISE NOTICE 'empty apply #% elapsed=% ms', i, _ms;
+    END LOOP;
+END $$;
+```
+
+不会产生 `NOTICE: overlay_branch: APPLY BRANCH ...` / `NOTICE: overlay_branch: DISCARD BRANCH ...` 这两条 C 层 elog（因为没进入 C 3-pass）。
+fallback 场景（非空分支 / current 分支空）仍然完整走 C 层 handler，所有 NOTICE 不变。
+
+---
+
+## 15. V4：活动分支内 DDL RESTRICTED（A7 schema-drift guard）
+
+A7 MVP 的硬门禁（之前只是"MVP 暂不支持"级别的 generic ProcessUtility 拦截），现在升级为**精确的 schema-drift guard**。
+
+典型报错（已进入 active branch，再 CREATE TABLE）：
+
+```
+ERROR:  overlay_branch: cannot CREATE TABLE inside active branch "b_live":
+        CREATE TABLE on MAIN user objects during an active branch would modify
+        underlying schema/tables in place and break MAIN/delta join semantics
+        after apply.  (§A7 DDL RESTRICTED 0A000 — schema-drift guard)
+HINT:  Switch back to the MAIN database before running this statement:
+           SELECT overlay_branch.discard_branch('b_live');
+         or
+           RESET overlay_branch.current;
+```
+
+### 15.1 受保护的 DDL 动作（全部 0A000 feature_not_supported）
+
+| 类型 | 行为 |
+|------|------|
+| CREATE TABLE / AS SELECT / UNLOGGED / TEMP* | **TEMP 表除外**（TEMP 属于 session-local，不写 MAIN）；普通表 / UNLOGGED 拦截 |
+| ALTER TABLE / ADD COLUMN / DROP COLUMN / ALTER TYPE / SET SCHEMA | 全部拦截（会直接改 MAIN 物理列 → delta join 错位） |
+| DROP TABLE / DROP INDEX / TRUNCATE | 全部拦截；TRUNCATE MAIN 会导致 base_image old_version 全部失效 |
+| CREATE INDEX / DROP INDEX / REINDEX / CLUSTER | 全部拦截（会影响 MAIN 执行计划缓存 / 表空间） |
+| ALTER TYPE / CREATE TYPE / DROP TYPE | 全部拦截（列类型变了 → col_signature 失效 → drift） |
+| ALTER TABLE ADD / DROP / ENABLE / DISABLE TRIGGER | 全部拦截（FK trigger cascade write 等后续子问题） |
+| CREATE SEQUENCE / ALTER SEQUENCE / DROP SEQUENCE | 拦截（sequence 是 shared object，nextval 会直接改 MAIN） |
+
+> **TEMP 表白名单**：`CREATE TEMP TABLE` / `CREATE TEMPORARY TABLE` 不受限（属于当前 session 私有，commit 自动 drop，不写 MAIN catalog、不会导致 drift）。
+
+### 15.2 正确 workflow 推荐
+
+```sql
+/* 推荐模式：MAIN 上把所有 CREATE TABLE / ALTER 先做完 → 再开 branch 写数据 */
+-- step 1: 在 MAIN 上建表 / 改表
+CREATE TABLE orders (id int PRIMARY KEY, amount numeric(12,2));   -- OK（MAIN）
+ALTER TABLE products ADD COLUMN stock int DEFAULT 0;             -- OK（MAIN）
+
+-- step 2: 开 branch 改数据
+SELECT create_branch('b_order_work');
+SELECT use_branch('b_order_work');
+INSERT INTO orders VALUES (1, 99.0);            -- OK（WR delta）
+UPDATE products SET stock = 10 WHERE id = 1;    -- OK
+-- CREATE TABLE foo(id int);                     -- ERROR 0A000 §A7 schema-drift guard（必须先回 MAIN）
+```

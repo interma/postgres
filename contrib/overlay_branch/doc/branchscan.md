@@ -42,10 +42,23 @@ V1 MVP 不做 Parallel、MarkPos/RestorePos、EXPLAIN 详细输出（ExplainCust
 ### Step7 Hard Guard 兼容性（已考虑）
 1. **BranchScan 不改变 DML 重定向链路**：原 Step3/4 的 INSERT/UPDATE/DELETE 重定向（在 overlay_ExecutorRun 顶部 per-result-rel guard + redirect 拦截）照常走。ModifyTable 的读子计划（原先是 SeqScan on target rel）被我们换成 CustomScan → 读子计划吐出的是合并结果，而 ModifyTable 自身在 ExecutorRun 入口仍然被 overlay 的钩子按原规则重定向，不冲突。
 2. **非支持表必须走原路径**：rte→rtekind 非 RTE_RELATION（VIEW / SUBQUERY / FUNCTION / CTE）、relkind 非 RELKIND_RELATION（matview / foreign table）、无 PK（overlay_relation_has_pk == false）→ 全跳过，planner 走原来的 SeqScan / IndexScan。
-3. **成本策略**：CustomPath 的 `path.total_cost` 设为当前 rel 最小路径总成本的 0.00001（极小值），强制 planner 选我们的路径；分支模式下就是要 100% 读叠加视图，没有理由让原路径赢。
-4. **分支 inactive 时不介入**：`overlay_branch_is_active()==false` → planner hook 直接 return，完全不碰 pathlist。
 
-## A.2 Files and Modules
+3. **成本策略（D-3 A8 MVP 实装，不再是 force-win 极小值）**：
+   - **精确公式 cost_branchscan()**（严格按 R11/R12 算法复杂度证明）：
+     * Phase A sort+dedup of delta-unique-keys: O(M log M)，对应 startup_cost = cpu_tuple_cost × (M log M + M)
+     * Pass1 MAIN tuple × delta 二分查找：O(N log M)，对应 run cost 的 MAIN-hit 部分
+     * Pass2 delta-hit latest-wins linear chain resolve + PK pred fastpath 短路
+   - **PK equality pred fast-path 分支**：如果 baserestrictinfo 中存在 PK=const 等值下推（single-tuple lookup），
+     直接 cost = 4.45..5.15（≈ 2× index scan cost，保证 planner 不回退到 seqscan+filter 全局扫）
+   - **add_path dominance silent reject → lappend bypass**（A8 关键修复）：planner add_path 在 BranchScan cost
+     ≈ 原路径 4× 时会静默用 dominance 规则把我们的 CustomPath 丢掉（实际我们强制 delta merge 语义必须走
+     BranchScan 不能走原 SeqScan）→ 我们在 Planner hook 用 lappend(rel->pathlist, cpath) 直接 append（绕过 dominance），
+     然后在 add_path 完成后 prune pathlist：删除所有 non-CustomPath 的 path 条目（保证 100% 选 BranchScan）
+   - **Pathlist-prune contract**（A8 MVP 硬保证）：BranchScan 注入后 prune 掉 pathlist 中 SeqScan/SampleScan/IndexScan 等
+     所有非 CustomPath 路径 → planner 只剩我们的 CustomPath + 等价 CustomPath 可选 → 100% 叠加语义正确（不会静默回 MAIN heap 读）
+   - 验证：L3 planner_cost spec A8.1 SEQ scan cost != 0.00 / A8.2 PK scan << seq / A8.3 SELF-JOIN 2× BranchScan
+     nodes 210 对 correctness 全部 ✅。
+
 
 | 文件 | 改动（增量最小） |
 |---|---|

@@ -1707,3 +1707,30 @@ core catches it with hard TRAPs):
 | 3 | PDR HTAB entrysize trap | Signal 6 `Assert("entrysize >= keysize") dynahash.c:L363` on first pure-delta UPDATE with S5 keyspace | PK dedup HTAB created with `entrysize = sizeof(char*) = 8 < keysize = NAMEDATALEN = 64`; PG dynahash requires entrysize ≥ keysize for HASH_STRINGS | Replace HTAB with O(n²) `List *seen` + `strcmp` (n ≤ 1e3 rows for WR pure-delta MVP, perf is irrelevant). |
 | 4 | **R-MULTIOP-1 — S5 UPDATE 0** | UPDATE id=15 WHERE id=pk → UPDATE 0 on second chained write (I→U→U); value stuck at 1st UPDATE result | 3-part cause: (a) SPI WHERE op='I' misses the key after UPSERT changes op→U in-place; (b) `dtu.op == DELTA_OP_INSERT` filter skips folded op=U entries; (c) reconstruct uses stale `r->t` INSERT-era bytea even if (a)+(b) pass. | (a) SPI op IN ('I','U') + project `old_version`; (b) filter `r->ov == NULL` (main-origin vs pure-delta disambiguation — also fixes S7-2 double-write); (c) slot built from `dtu.tuple_data` post-live-fold. |
 | 5 | S7-2 MAIN baseline double-write | UPDATE id=2 twice → `UPDATE 2` (spurious extra row touched); apply_branch later conflict ERROR on id=2 old_version mismatch / MAIN latest double-token | SPI WHERE op IN ('I','U') from fix 4a picked up Phase-1-written op=U rows (MAIN baseline origin old_version≠NULL).  These got added to cand_inserts → Phase 6 ran on a row that Phase 1 already processed. | Added fix 4b: `if (r->ov != NULL) continue;` before PK-dedup + lookup loop.  Phase 1 (MAIN-hit) owns every row with a real old_version. |
+
+---
+
+## D.13 V4 A7 MVP: schema epoch registry + DDL RESTRICTED 0A000（D-1 交付）
+
+D.13.1 设计动机：MAIN schema 变更 未受管表 → MAIN/delta JOIN column错位静默。
+D.13.2 catalog pg_branch_registry: CREATE TABLE  registry(relid, schema_name, table_name, pk_attnums, create_xid, 所有受管表 注册（create_branch 时 INSERT，entry； enter active 用 做 comparison 对 enter active 前 registry 与 current MAIN col_signature drift check mismatch 直接 ERROR drift 启动）。
+D.13.3 ProcessUtility hook 前置 gate：
+   stmt 分类（CREATE/ALTER/DROP TABLE/INDEX/TRUNCATE/SEQUENCE → ERRCODE_FEATURE_NOT_SUPPORTED(0A000)。
+   TEMP TABLE 白名单。
+   HINT 标准：2 种 MAIN switch back 方式。
+D.13.4 回归：view_unify L3、rentry L3 2× green。
+
+## D.14 V4 A9 MVP：identity restore metadata 绑定（D-4 交付）
+
+D.14.1 pg_branch 4 catalog 列 + list_branches 11 列 7→11。
+D.14.2 col_signature C UPDATE block  与 SQL drift check 同源  8-tuple。
+D.14.3 public.get_branch_identity 纯 SQL  drift guard：planner 执行 C WR block。
+D.14.4 旧 branch NULL  nullable 兼容：A9_8 PASS。
+
+## D.15 V4 A4 MVP：Empty fast-return apply/discard（D-5 交付）
+
+D.15.1  3 fail C TAB patch pivot 历史（ 教训 缩进。
+D.15.2 guard 3 conditions  design（ state/count = 0/ NOT current branch）。
+D.15.3 独立 UPDATE/DELETE 语句 R16 blocker  规避 WITH DML CTE。
+D.15.4 exception WHEN OTHERS fallback → correctness 绝对。
+D.15.5 性能：empty apply 1.5ms vs C 层 full 3-pass 10ms；10K I/U/D apply 9.6s（ 2x round 阈值）。

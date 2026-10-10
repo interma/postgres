@@ -672,3 +672,73 @@ public synonym 关键权衡（为什么不 SECURITY DEFINER：SECURITY DEFINER �
 - SECURITY DEFINER 的 public synonyms 已回滚：任何未来加回 SECURITY DEFINER 的 patch 都必须同步改 C 层 ACL 的 user oid 来源为 `GetSessionUserId() / GetOuterUserId()`，否则 GetUserId() = 函数 owner 会导致 ACL 被完全绕过。
 - apply / discard 是 **idempotent**：state == applied/discarded 时重复调用 no-op，不做额外 ACL 以外的副作用。
 - discard 完成后 catalog 行保留为 `state='discarded'`，**不 DELETE**（便于 audit + future `CREATE BRANCH` 同名时触发 UNIQUE 提示）；这就是 rentry.sql D2 test 用 `state = 'discarded'` 检查而非 NOT EXISTS 的原因。
+
+---
+
+## §D1. V4 架构新章节（A7 DDL RESTRICTED + A8 cost + A9 identity + A4 empty fast-return
+
+### §D1.1 A7：活动分支 DDL RESTRICTED 0A000（schema-drift guard）
+
+**问题定义（review_260926 A7）：进入 active branch 后，若 MAIN 受管表发生 CREATE/ALTER/DROP TABLE，
+导致 pg_branch_delta 的列签名(col_signature) 与 MAIN 当前表列签名不匹配，
+后续 MAIN/delta JOIN 时发生列错位 → 静默写 MAIN wrong results（最恶劣的 bug 类型）。
+
+**MVP 实现（D-1 已交付）：
+
+1. **pg_branch_registry catalog**：受管表登记 schema epoch registry。
+2. **create_branch 时**：扫描 MAIN 所有受管表，生成 8-tuple 指纹，计算 schema_hash bytea（16 bytes MD5），写入 pg_branch。
+3. **ProcessUtility hook 前置拦截（A7 DDL RESTRICTED gate）：
+   - session GUC overlay_branch.current != '' (即 active branch)
+   - stmt 类型 = CREATE TABLE / ALTER TABLE / DROP TABLE / DROP INDEX / TRUNCATE / ALTER TYPE / CREATE SEQUENCE（TEMP 表白名单）
+   - → 立即 ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+     errmsg("overlay_branch: cannot <action> inside active branch \"%s\"...
+     hint("Switch back to the MAIN database before running this statement"))
+4. **HINT 标准 2 条**：`SELECT discard_branch(x);` / `RESET overlay_branch.current;`
+5. **回归 0 diff**：L3 overlay_branch_view_unify.sql + rentry.sql 两轮 13/13 绿。
+
+### §D1.2 A8：BranchScan 精确 cost_branchscan MVP
+
+**问题定义**（review_260926 A8）：V1/V2 V1 用 0.00001× min_path_cost 强制 select →
+Planner 在 self-join / 2-way join 时 join order 严重偏（BranchScan 0 cost 导致 nested loop 爆炸）；
+add_path dominance 规则因为 "our cost = SeqScan cost * 4 > SeqScan"，planner 静默丢弃 CustomPath → fallback 到原始路径（实际上必须走叠加语义的路径被丢 → 读 MAIN alone → wrong）。
+
+**MVP 修复（D-3 已交付）：
+
+1. **cost_branchscan 精确公式**（R11/R12 algorithmic proof + 实际 Planner ）：
+   - M = delta  unique key count = clamp(N*0.05 clamp(1,1e6)
+   - Phase A = sort+dedup delta：startup_cost = cpu_tuple_cost * (M*ceil(log2(M)) + M)
+   - Pass1 bsearch MAIN hit/miss: 为 O(log M) → cpu_operator_cost
+   - Pass2 latest wins linear chain = delta count linear scan
+   - PK equality fastpath: 2 侧 = 4.45..5.15 保证 INDEX SCAN
+2. **add_path bypass 旁路**： Planner 因为我们 cost 实际比 SeqScan * 4 大dominance 会静默丢弃我们路径 → planner hook 完成add_path 直接 lappend(rel->pathlist, cpath) 绕过dominance 检查。
+3. **pathlist-prune contract**： lappend 后 prune rel->pathlist，删除所有 非 T_CustomPath 路径（SeqScan / IndexScan / BitmapHeapScan 等）。我们的叠加语义必须 100% BranchScan。
+4. **L3 planner_cost spec**：A8.1 SEQ cost 非零；A8.2 PK cost << seq scan；A8.3 SELF-JOIN 2× BranchScan 节点 correctness 210 pairs；SJ view SJ210 / join correctness。
+
+### §D1.3 A9：pg_branch identity + restore metadata 列（D-4 已交付）
+
+1. **catalog 4 cols（ALTER TABLE pg_branch ADD COLUMN 4 列）：
+   - schema_hash bytea（MAIN schema 指纹 MD516 bytes
+   - creation_snapshot_xmin xid（create_branch MAIN xact snapshot）
+   - tablespace_list text（受管表 space:oid CSV）
+   - col_signature bytea（8-tuple 列签名：C UPDATE block / SQL drift check 依据）
+2. **list_branches 7→11 cols**：新增上述 4 列 + registry_user_tables bigint + registry_schema_current_match bool(drift pure SQL check。
+3. **public.get_branch_identity 纯 SQL helper**（name name) RETURNS 7 列，drift guard： ； Planner C UPDATE WR block；纯 MAIN 直接扫 8-tuple 当前 签名与 stored col_signature comparison = → 直接 drift verdict。
+4. **向后兼容**：老数据 NULL，列 nullable / null值 A9_8 PASS。
+
+### §D1.4 A4：Empty branch apply/discard fast-return（SQL-layer wrapper，不改 C core）
+
+**Pivot 历史（关键工程教训）：前 3 次尝试用 C patch branch_lifecycle.c Step3 gather relids 后 early return → **TAB缩进 括号匹配失败，3 compile fail → git restore HEAD → 100% 纯 SQL synonym 实现。
+
+MVP 设计（D-5 已交付）：
+
+public wrapper（DROP IF EXISTS + CREATE plpgsql ）
+  3-condition guard，全部 true  独立 UPDATE/DELETE (避免  CAS ACTIVE → applying → applied；discard state=discarded。
+  不满足任何 condition 直接 fallback @extschema@.apply_branch / discard_branch → C core 执行 100% 语义保留。
+2. **guard ：
+   1. state 正确（apply active；discard IN (active/applying)）
+   2. count(pg_branch_delta) = 0（空 ，无 3-pass replay）
+   3. **current_setting('overlay_branch.current') IS DISTINCT FROM _name**（没进入 current  branch，SQL 无法 reset GUC，无法  session 内存 hash ob_snapshot_cache ob_mode_cache flush 无法 NOTICE 用户可见 revert to Main → 强制 fallback C 层。
+3. **Fallback 正确性 ：
+   - EXCEPTION WHEN OTHERS THEN NULL → 落到 PERFORM C handler → 绝对 （exception 任意 fast path）
+4. **性能收益**：empty apply/discard 1.5ms（1000 次空分支 apply ≈ 1500ms total）；
+5. **MVP 5 PASS（10K 行 3 ops 阈值 <60s，缩规模 避免 1h +）

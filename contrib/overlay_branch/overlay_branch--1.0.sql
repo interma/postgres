@@ -141,6 +141,56 @@ COMMENT ON TABLE @extschema@.pg_branch IS
 COMMENT ON TABLE @extschema@.pg_branch_delta IS
   'overlay_branch internal per-branch per-table delta store (§G06: exclude from FOR ALL TABLES publication by site-local policy, see review_260926.md §2.5)';
 
+-- ============================================================
+-- §D4 / A9 (review_260926): identity / restore metadata on pg_branch.
+--
+--   4 restore-oriented metadata columns appended to pg_branch (default NULL
+--   so existing branches before this upgrade are fully ABI-compatible, no
+--   migration path required).  Filled at create_branch time by
+--   overlay_branch_create_internal via a single SELECT over the same A7
+--   registry fingerprint enumeration, then exposed by list_branches().
+--
+--   (1) schema_hash bytea:
+--       MD5 of sorted (<schema_name>|<table_name>|<total_cols>|<pk_cols>
+--       |hex(col_hash)|hex(pk_hash)) over every current user table at
+--       create-branch entry-time.  This is a cheap global hash that a
+--       backup-restore pipeline can compare to re-prove "we restored the
+--       exact same schema shape the branch was created against".
+--
+--   (2) creation_snapshot_xmin xid:
+--       GetTopTransactionId() / GetCurrentTransactionId() at
+--       create_branch time.  Used together with schema_hash as the
+--       authoritative "this is exactly the MAIN baseline the branch was
+--       forked from" id.
+--
+--   (3) tablespace_list text:
+--       Sorted distinct spcname list (comma-separated) of all tablespaces
+--       used by user tables at create-branch entry-time.  Empty string if
+--       all tables are in pg_default.  Backup/restore can re-create the
+--       same tablespace layout before restore.
+--
+--   (4) col_signature bytea:
+--       MD5 of sorted (<schema.table>|attnum|attname|typid|typmod|
+--       attnotnull|attgenerated|pk_ordinality) over every user-column in
+--       every user relation.  This is a finer-grained version of
+--       per-table col_hash in the registry, aggregated to a single branch
+--       value so package restore utilities can do one bytea compare.
+-- ============================================================
+ALTER TABLE @extschema@.pg_branch
+  ADD COLUMN schema_hash bytea,
+  ADD COLUMN creation_snapshot_xmin xid,
+  ADD COLUMN tablespace_list text,
+  ADD COLUMN col_signature bytea;
+
+COMMENT ON COLUMN @extschema@.pg_branch.schema_hash
+  IS '§D4/A9 global schema fingerprint at create-branch (MD5 of per-table registry 6-tuples)';
+COMMENT ON COLUMN @extschema@.pg_branch.creation_snapshot_xmin
+  IS '§D4/A9 txid of the transaction that ran create_branch(); used as baseline fork identity';
+COMMENT ON COLUMN @extschema@.pg_branch.tablespace_list
+  IS '§D4/A9 sorted comma-separated list of tablespace names used by user tables (empty = pg_default only)';
+COMMENT ON COLUMN @extschema@.pg_branch.col_signature
+  IS '§D4/A9 aggregate column signature (MD5 of every (schema.table,attnum,name,type) tuple)';
+
 
 -- ============================================================
 -- G01 MVP support-matrix create_branch scope RESTRICTED list.
@@ -236,6 +286,13 @@ SET search_path = @extschema@, pg_catalog;
 -- the extension's catalog tables live in @extschema@ and we run with
 -- the fixed search_path, this SQL version is also read-only and
 -- needs no upgrade to V2 to be composable with later Step code.
+CREATE FUNCTION @extschema@.overlay_branch_cached_mode(bid integer)
+RETURNS text
+AS 'MODULE_PATHNAME', 'overlay_branch_cached_mode'
+LANGUAGE C STABLE STRICT
+SET search_path = @extschema@, pg_catalog;
+
+DROP FUNCTION IF EXISTS @extschema@.list_branches();
 CREATE FUNCTION @extschema@.list_branches()
 RETURNS TABLE(
     branch_id integer,
@@ -244,41 +301,11 @@ RETURNS TABLE(
     created_at timestamp with time zone,
     mode text,
     state text,
-    delta_count bigint
-)
-LANGUAGE sql STABLE STRICT
-SET search_path = @extschema@, pg_catalog
-AS $$
-    SELECT b.branch_id,
-           b.branch_name,
-           b.owner,
-           b.created_at,
-           b.mode,
-           b.state,
-           COALESCE(d.cnt, 0)::bigint AS delta_count
-    FROM pg_branch b
-    LEFT JOIN (SELECT branch_id, count(*) AS cnt
-               FROM pg_branch_delta
-               GROUP BY branch_id) d
-      ON d.branch_id = b.branch_id
-    ORDER BY b.branch_id;
-$$;
-
-CREATE FUNCTION @extschema@.overlay_branch_cached_mode(bid integer)
-RETURNS text
-AS 'MODULE_PATHNAME', 'overlay_branch_cached_mode'
-LANGUAGE C STABLE STRICT
-SET search_path = @extschema@, pg_catalog;
-
-CREATE OR REPLACE FUNCTION @extschema@.list_branches()
-RETURNS TABLE(
-    branch_id integer,
-    branch_name name,
-    owner oid,
-    created_at timestamp with time zone,
-    mode text,
-    state text,
-    delta_count bigint
+    delta_count bigint,
+    schema_hash bytea,
+    creation_snapshot_xmin xid,
+    tablespace_list text,
+    col_signature bytea
 )
 LANGUAGE sql STABLE STRICT
 SET search_path = @extschema@, pg_catalog
@@ -289,7 +316,11 @@ AS $$
            b.created_at,
            COALESCE(@extschema@.overlay_branch_cached_mode(b.branch_id), b.mode) AS mode,
            b.state,
-           COALESCE(d.cnt, 0)::bigint AS delta_count
+           COALESCE(d.cnt, 0)::bigint AS delta_count,
+           b.schema_hash,
+           b.creation_snapshot_xmin,
+           b.tablespace_list,
+           b.col_signature
     FROM pg_branch b
     LEFT JOIN (SELECT branch_id, count(*) AS cnt
                FROM pg_branch_delta
@@ -297,6 +328,113 @@ AS $$
       ON d.branch_id = b.branch_id
     ORDER BY b.branch_id;
 $$;
+
+-- ============================================================
+-- §D4 / A9: get_branch_identity(branch_name) — convenient helper
+-- that returns a ROW of restore-metadata for a named branch, plus
+-- the global A7 schema drift check to confirm the branch can still
+-- be entered in this database.
+--
+-- MVP return columns (no C SRF overhead; pure SQL so ABI-stable):
+--   branch_id, schema_hash, creation_snapshot_xmin, tablespace_list,
+--   col_signature, registry_user_tables, registry_schema_current_match
+-- ============================================================
+CREATE FUNCTION @extschema@.get_branch_identity(b_name name)
+RETURNS TABLE(
+    branch_id integer,
+    schema_hash bytea,
+    creation_snapshot_xmin xid,
+    tablespace_list text,
+    col_signature bytea,
+    registry_user_tables bigint,
+    registry_schema_current_match boolean
+)
+LANGUAGE sql STABLE STRICT
+SET search_path = @extschema@, pg_catalog
+AS $$
+    WITH br AS (
+        SELECT b.branch_id AS bid,
+               b.schema_hash,
+               b.creation_snapshot_xmin,
+               b.tablespace_list,
+               b.col_signature
+        FROM @extschema@.pg_branch b
+        WHERE b.branch_name = b_name
+    ),
+    cur_fp AS (
+        SELECT count(*)                                             AS _n,
+               decode(md5(string_agg(concat_ws('|',
+                   s.schema_name||'.'||s.table_name,
+                   a.attnum::text, a.attname, a.atttypid::text,
+                   a.atttypmod::text, a.attnotnull::text,
+                   a.attgenerated::text,
+                   COALESCE(pk.pk_ord::text, '0')), ''
+                   ORDER BY s.relid, a.attnum)), 'hex')::bytea       AS _col_sig
+        FROM (
+            SELECT c.oid AS relid,
+                   n.nspname::name AS schema_name,
+                   c.relname::name AS table_name
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'r'
+              AND c.relpersistence = 'p'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              AND n.nspname <> '@extschema@'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_depend d
+                   WHERE d.classid = 'pg_catalog.pg_class'::regclass
+                     AND d.objid = c.oid
+                     AND d.deptype = 'e'
+                     AND d.refobjid = (SELECT oid FROM pg_catalog.pg_extension
+                                        WHERE extname = 'overlay_branch'))
+        ) s
+        LEFT JOIN pg_catalog.pg_attribute a
+               ON a.attrelid = s.relid AND a.attnum > 0 AND NOT a.attisdropped
+        LEFT JOIN (
+            SELECT i.indrelid, k.n AS pk_ord, a.attnum
+              FROM pg_catalog.pg_index i
+              LEFT JOIN pg_catalog.generate_subscripts(i.indkey, 1) k(n) ON true
+              LEFT JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid = i.indrelid
+                    AND a.attnum = i.indkey[k.n]
+                    AND NOT a.attisdropped
+             WHERE i.indisprimary
+        ) pk ON pk.indrelid = s.relid AND pk.attnum = a.attnum
+    )
+    SELECT br.bid,
+           br.schema_hash,
+           br.creation_snapshot_xmin,
+           br.tablespace_list,
+           br.col_signature,
+           COALESCE(cur_fp._n, 0)::bigint,
+           CASE
+             WHEN br.col_signature IS NULL THEN NULL
+             ELSE COALESCE(br.col_signature = cur_fp._col_sig, false)
+           END
+    FROM br
+    LEFT JOIN cur_fp ON true;
+$$;
+REVOKE ALL ON FUNCTION @extschema@.get_branch_identity(name) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION @extschema@.get_branch_identity(name) TO PUBLIC;
+
+-- public synonym for UX (match example_sql.md public prefix-less UX)
+DROP FUNCTION IF EXISTS public.get_branch_identity(name);
+CREATE FUNCTION public.get_branch_identity(b_name name)
+RETURNS TABLE(
+    branch_id integer,
+    schema_hash bytea,
+    creation_snapshot_xmin xid,
+    tablespace_list text,
+    col_signature bytea,
+    registry_user_tables bigint,
+    registry_schema_current_match boolean
+)
+LANGUAGE sql STABLE STRICT
+SET search_path = @extschema@, pg_catalog, pg_temp
+AS $$SELECT @extschema@.get_branch_identity(b_name)$$;
+REVOKE ALL ON FUNCTION public.get_branch_identity(name) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_branch_identity(name) TO PUBLIC;
+
 
 CREATE FUNCTION @extschema@.overlay_main_plus_delta(regclass)
 RETURNS SETOF record
@@ -512,13 +650,114 @@ CREATE OR REPLACE FUNCTION public.current_branch()
 RETURNS name LANGUAGE sql STABLE SET search_path = @extschema@, pg_catalog
 AS $$SELECT @extschema@.current_branch()$$;
 
-CREATE OR REPLACE FUNCTION public.apply_branch(branch_name name)
-RETURNS void LANGUAGE sql VOLATILE SET search_path = @extschema@, pg_catalog
-AS $$SELECT @extschema@.apply_branch(branch_name)$$;
 
-CREATE OR REPLACE FUNCTION public.discard_branch(branch_name name)
-RETURNS void LANGUAGE sql VOLATILE SET search_path = @extschema@, pg_catalog
-AS $$SELECT @extschema@.discard_branch(branch_name)$$;
+
+
+
+DROP FUNCTION IF EXISTS public.apply_branch(name);
+CREATE FUNCTION public.apply_branch(_name name)
+RETURNS void LANGUAGE plpgsql VOLATILE
+SET search_path = @extschema@, pg_catalog
+AS $$
+/* A4 MVP F1 PL/pgSQL empty-branch fast apply return.
+ *
+ * FAST-PATH CONDITIONS (all must be true):
+ *   1. branch state = 'active'
+ *   2. count(pg_branch_delta) = 0
+ *   3. the branch is NOT the currently-entered branch (else C code needs
+ *      to reset overlay_branch.current GUC and flush session-level
+ *      snapshot/mode caches — a SQL function cannot touch those).
+ * Otherwise we fall through to the canonical C implementation.
+ * Any exception on the fast path also falls through (absolute correctness).
+ */
+DECLARE
+    _bid      integer;
+    _state    text;
+    _cnt      bigint;
+    _current  text;
+BEGIN
+    SELECT branch_id, state INTO STRICT _bid, _state
+      FROM @extschema@.pg_branch WHERE branch_name = _name;
+
+    _current := current_setting('overlay_branch.current', true);
+
+    IF _state = 'active'
+       AND _current IS DISTINCT FROM _name THEN
+
+        SELECT count(*)::bigint INTO STRICT _cnt
+          FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
+
+        IF _cnt = 0 THEN
+            BEGIN
+                UPDATE @extschema@.pg_branch
+                   SET state = 'applying'
+                 WHERE branch_id = _bid AND state = 'active';
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'fast apply lost race to applying';
+                END IF;
+
+                UPDATE @extschema@.pg_branch
+                   SET state = 'applied'
+                 WHERE branch_id = _bid AND state = 'applying';
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'fast apply corrupted state jump';
+                END IF;
+
+                DELETE FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
+                RETURN;
+            EXCEPTION WHEN OTHERS THEN
+                NULL;
+            END;
+        END IF;
+    END IF;
+
+    PERFORM @extschema@.apply_branch(_name);
+END;
+$$;
+
+DROP FUNCTION IF EXISTS public.discard_branch(name);
+CREATE FUNCTION public.discard_branch(_name name)
+RETURNS void LANGUAGE plpgsql VOLATILE
+SET search_path = @extschema@, pg_catalog
+AS $$
+/* Same 3-condition fast path guard as apply_branch. */
+DECLARE
+    _bid      integer;
+    _state    text;
+    _cnt      bigint;
+    _current  text;
+BEGIN
+    SELECT branch_id, state INTO STRICT _bid, _state
+      FROM @extschema@.pg_branch WHERE branch_name = _name;
+
+    _current := current_setting('overlay_branch.current', true);
+
+    IF _state IN ('active','applying')
+       AND _current IS DISTINCT FROM _name THEN
+
+        SELECT count(*)::bigint INTO STRICT _cnt
+          FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
+
+        IF _cnt = 0 THEN
+            BEGIN
+                UPDATE @extschema@.pg_branch
+                   SET state = 'discarded'
+                 WHERE branch_id = _bid AND state IN ('active','applying');
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'fast discard lost race on state';
+                END IF;
+                DELETE FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
+                RETURN;
+            EXCEPTION WHEN OTHERS THEN
+                NULL;
+            END;
+        END IF;
+    END IF;
+
+    PERFORM @extschema@.discard_branch(_name);
+END;
+$$;
+
 
 CREATE OR REPLACE FUNCTION public.use_branch(branch_name name, mode text)
 RETURNS void LANGUAGE sql VOLATILE SET search_path = @extschema@, pg_catalog
@@ -540,10 +779,13 @@ AS $$
     SELECT @extschema@.overlay_branch_force_invalidation_check();
 $$;
 
-CREATE OR REPLACE FUNCTION public.list_branches()
+DROP FUNCTION IF EXISTS public.list_branches();
+CREATE FUNCTION public.list_branches()
 RETURNS TABLE(branch_id integer, branch_name name, owner oid,
               created_at timestamp with time zone, mode text,
-              state text, delta_count bigint)
+              state text, delta_count bigint,
+              schema_hash bytea, creation_snapshot_xmin xid,
+              tablespace_list text, col_signature bytea)
 LANGUAGE sql STABLE SET search_path = @extschema@, pg_catalog
 AS $$SELECT * FROM @extschema@.list_branches()$$;
 

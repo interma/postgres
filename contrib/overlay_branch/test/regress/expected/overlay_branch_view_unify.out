@@ -50,7 +50,7 @@ INSERT INTO nl_drv VALUES (1),(2),(3);
 SELECT public.create_branch('br_a2_main');
  create_branch 
 ---------------
-            16
+            18
 (1 row)
 
 SELECT public.use_branch('br_a2_main');
@@ -131,16 +131,16 @@ SELECT CASE WHEN count(*) = 0
 -- instances to produce valid output).
 EXPLAIN (FORMAT TEXT)
   SELECT a.id, b.id FROM a2_self a JOIN a2_self b USING (grp);
-                                              QUERY PLAN                                               
--------------------------------------------------------------------------------------------------------
- Merge Join  (cost=166.68..359.39 rows=12324 width=8)
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Merge Join  (cost=432.01..624.72 rows=12324 width=8)
    Merge Cond: (a.grp = b.grp)
-   ->  Sort  (cost=83.34..87.26 rows=1570 width=8)
+   ->  Sort  (cost=216.00..219.93 rows=1570 width=8)
          Sort Key: a.grp
-         ->  Custom Scan (overlay_branch_branchscan) on a2_self a  (cost=0.00..0.00 rows=1570 width=8)
-   ->  Sort  (cost=83.34..87.26 rows=1570 width=8)
+         ->  Custom Scan (overlay_branch_branchscan) on a2_self a  (cost=6.28..132.66 rows=1570 width=8)
+   ->  Sort  (cost=216.00..219.93 rows=1570 width=8)
          Sort Key: b.grp
-         ->  Custom Scan (overlay_branch_branchscan) on a2_self b  (cost=0.00..0.00 rows=1570 width=8)
+         ->  Custom Scan (overlay_branch_branchscan) on a2_self b  (cost=6.28..132.66 rows=1570 width=8)
 (8 rows)
 
 -- =================================================================

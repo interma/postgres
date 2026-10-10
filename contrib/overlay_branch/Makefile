@@ -35,7 +35,8 @@ REGRESS = \
   overlay_branch_mvcc_bounds \
   overlay_branch_mvcc_review \
   overlay_branch_rentry \
-  overlay_branch_view_unify
+  overlay_branch_view_unify \
+  overlay_branch_planner_cost
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \

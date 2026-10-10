@@ -1,6 +1,6 @@
-# Overlay Branch 测试覆盖索引 (21 entries: 12 L3 + 9 L1)
+# Overlay Branch 测试覆盖索引 (22 entries: 13 L3 + 9 L1)
 
-> L3 = pg_regress 单会话 SQL 文件 (12 个)；L1 = isolationtester 多会话隔离测试 (9 个 specs)。
+> L3 = pg_regress 单会话 SQL 文件 (13 个)；L1 = isolationtester 多会话隔离测试 (9 个 specs)。
 
 | 文件名 (去掉前缀/后缀) | 中文覆盖范围 (30-60 字) | 对应 Rxx / Gxx / Bxx 编号 |
 |----------|-------------------------|------------------------|
@@ -8,14 +8,15 @@
 | user (L3)  | 角色切换：SET ROLE 普通用户在分支写数据 / 跨 role 可见性 / pg_branch owner 语义比对 | R08 (multi-role visibility) + §G02 OWNER 矩阵 |
 | scan_pk (L3) | BranchScan 走 PK 索引/UNIQUE 约束命中：等值查询 / 范围 / 纯 PK 场景，含 junk attnum 验证 | R02 (BranchScan PK align) + G07 |
 | scan_type (L3) | 多列类型覆盖：int/bigint/text/numeric/timestamptz/date 的 PK 序列化 + BranchScan 类型 dispatch | R07 (PK serialize 多类型) |
-| mvcc_bounds (L3) | Live Mode 下 MAIN 已提交写入的可见性边界；分支内对 MAIN 新版本 RC 级可见性 | R10 (MAIN write → Branch visible) + S05 MVCC |
+| mvcc_bounds (L3) | Live Mode 下 MAIN 已提交写入的可见性边界；分支内对 MAIN 新版本 RC 级可见性；**§D-5 A4 5 subcases (empty apply/discard <500ms + 10K I/U/D apply <60s)** | R10 (MAIN write → Branch visible) + S05 MVCC + **A4 5 PASS markers / R26** |
 | mvcc_usage (L3) | 典型 Live Mode 使用流：并发 MAIN 写入 → Branch 叠加读一致；含未提交 vs 已提交分界 | S05 Live MVCC § |
 | mvcc_review (L3) | MVCC 历史 bug 回归；多 session 并发 apply/discard + state 机 correctness | S05 MVCC review § + S12 |
 | puredelta (L3) | Pure-delta (主表空) + 仅 INSERT 路径；UPSERT 纯 delta 两阶段 (无 MAIN) | B1 (pure-delta path) + R04 INSERT |
 | puredelta_mix (L3) | 混合 Pure-delta (主表有行) + INSERT promotion 4-phase + MAIN key 冲突预检 | B1 promotion rules + R21 INSERT pre-check |
-| rentry (L3) | R03/R05/R06/R16/R19 入口漂移写负向 + R21 INSERT 约束 5 子用例 + §G02 ACL 10 子用例 (A1..E) + §G01 SCOPE 10+1 负向/基线 (A..Z) + Section 12 **A7 schema epoch registry × 12 subcases (D1-D12)**: D2 bool_or 存在性 / D5 CREATE→增量→DROP→55000 drift / D6 DROP+recreate→discard→fresh / D11 exit-before-discard / D12 UPDATE-exit+re-apply + **R23** schema drift 55000 / **R24** DDL restricted §A7 0A000 | R03/R05/R06/R16/R19/R21 + §G02 S13 全矩阵 + §G01 MVP RESTRICTED 7 categories + **R23 (A7 schema epoch registry drift)** + **R24 (A7 DDL restricted 0A000)** |
+| rentry (L3) | R03/R05/R06/R16/R19 入口漂移写负向 + R21 INSERT 约束 5 子用例 + §G02 ACL 10 子用例 (A1..E) + §G01 SCOPE 10+1 负向/基线 (A..Z) + Section 12 **A7 schema epoch registry × 12 subcases (D1-D12)**: D2 bool_or 存在性 / D5 CREATE→增量→DROP→55000 drift / D6 DROP+recreate→discard→fresh / D11 exit-before-discard / D12 UPDATE-exit+re-apply + **R23** schema drift 55000 / **R24** DDL restricted §A7 0A000 + **§D4 A9 pg_branch identity & restore metadata × 8 subcases**: A9_1 4 cols NOT NULL / A9_2 list_branches 暴露 11 col / A9_3 MD5 宽 16B / A9_4 creation xmin 同 tx / A9_5 get_branch_identity() 7-tuple match / A9_6 registry_current_match TRUE / A9_7 count≥3 / A9_8 old ABI NULL compat | R03/R05/R06/R16/R19/R21 + §G02 S13 全矩阵 + §G01 MVP RESTRICTED 7 categories + **R23 (A7 schema epoch registry drift)** + **R24 (A7 DDL restricted 0A000)** + **R25 (A9 identity & restore metadata drift-guard)** |
 | upsert (L3) | 完整 B2 UPSERT：INSERT ON CONFLICT DO NOTHING / DO UPDATE 针对 PK 的 2-phase 23505 双侧冲突检测 | B2 (upsert impl) |
 | **a2 (L3)** | D-2 review_260926 A2 Read/Write View Unification：A2.1 self-join (SJ1 12-pair / SJ2 baseline-EXCEPT-0 / SJ3 visual) / A2.3 SAME-CSS ReScan 3×14 deterministic proof / A2.4 non-lateral NL no-crash / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions (CUR1 14rows / CUR2 id=3 NOT EXISTS / CUR3 amt=111,112) | §A2 architecture (OPEN → ✅) |
+| **planner_cost (L3)** | D-3 review_260926 A8 MVP cost_branchscan cost model：A8.1 SEQ scan cost != 0.00 / A8.2 PK scan cost << seq / A8.3 SELF-JOIN 2× BranchScan 节点 + SJ correctness 210 pairs；standalone 验证 add_path→lappend 关键根因修复（real cost 静默 reject 旁路 delta merge） | §A8 architecture (OPEN → ✅) + R11/R12 complexity estimate proof |
 | ob_apply_mutex (L1) | isolationtester: 2 session 并发 apply 同一 branch → CAS loser 55000, winner 成功; delta 写入期间状态 guard | S16 FR3 CAS + R17 write-set freeze |
 | ob_state_inval (L1) | isolationtester: apply/discard 后 LISTEN ob_branch_state payload `<bid>:<new_state>` 广播; 相邻 session is_active() 立即失效节流重查 | S13 FR1 NOTIFY + FR4 throttled catalog recheck |
 | ob_applying_freeze (L1) | isolationtester: APPLY 过程 MAIN 并发读/写 freeze 边界; discarded/applied 终态禁止二次 apply/discard | S04 Apply freeze § + FR1/FR5 boundary + R17 applying state guard |

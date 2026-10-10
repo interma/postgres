@@ -21,11 +21,11 @@
 | V4 Review 260926 Batch 1–6 S 主路径 (S02–S10, S13–S14, S16–S18) | ✅ 17/31 CONTAINED | 见本文 V4 章节 |
 | 分类一 POC correctness：R01–R24 | ✅ **24/24 FIXED** | [review_260926_tracker.md](review/review_260926_tracker.md) |
 | 分类二 MVP 加固：G01/G02 | ✅ **2/6 FIXED MVP subset** | commit `0ec90f728a9` (G02 ACL double-defense) / `629d0ba227e` (G01 scope preflight) |
-| 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；**A2 ✅ (Read/Write View Unification)**；A1/A6 ⚡ DEFER (M4+)；A4/A8/A9/A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
+| 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；A2 ✅ (Read/Write View Unification)；**A8 ✅ (MVP cost_branchscan cost model + planner correctness)**；**A9 ✅ (pg_branch identity & restore metadata: schema_hash/creation_snapshot_xmin/tablespace_list/col_signature, new get_branch_identity helper, 13+9 2x green)**；**A4 ✅ (SQL-layer empty-branch apply/discard fast-return wrapper, 10K-row 3-op 5 PASS markers, 13+9 2x green)**；A1/A6 ⚡ DEFER (M4+)；A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
 | 产品 P01–P03 / G03–G06 | ⚡ OPEN（缺真实授权样本 / 发行环境 / Agent 试用流程） | [review_260926.md §9 P+G 表](review/review_260926.md#L460) |
 | 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make USE_PGXS=1 PG_CONFIG=/tmp/pg17-writable/bin/pg_config -j` |
-| L3 单会话 pg_regress （12 files） | ✅ **12/12 PASS**，`diff -r results expected` = **0 lines**（2× consecutive stable R5/R6 后） | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / **a2** (A2 self-join / rescan / cursor / NL 8 PASS assertions) |
-| L1 isolationtester 多会话（9 specs） | ✅ **9/9 PASS**（2× consecutive stable R5/R6 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / **ob_view_unify_rescan** (A2.3 SAME-CSS 3×14 deterministic ReScan proof) |
+| L3 单会话 pg_regress （13 files） | ✅ **13/13 PASS**，`diff -r results expected` = **0 lines**（2× consecutive stable R4/R5 后） | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) |
+| L1 isolationtester 多会话（9 specs） | ✅ **9/9 PASS**（2× consecutive stable 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / ob_view_unify_rescan |
 | 标签唯一性（G01_SCOPE_* × 11 + G02_* × 10 PASS） | ✅ 每个 label grep count = 2（1 SQL CASE WHEN token + 1 output row = 完美唯一） | rentry L3 out |
 | Shared-preload + extension script 重启闭环 | ✅ 每次 PG_CONFIG=/tmp/pg17-writable make install 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
 
@@ -34,6 +34,7 @@
 1. `497ce4e9e4a` — squash 初始总 commit：3 commits + AGENTS/example_sql M 文件合并
 2. `ce9b72dfd84` — 5× squash Batch (G02/G01/A7)：G02 ACL double-defense / G01 scope preflight / A7 registry+DDL restricted / mvcc_review 3 syntax header / docs sync 11+8 baseline
 3. **TBD** — D-2 A2 Read/Write View Unification：A2.1 self-join 2 BranchScan independent (SJ1 pairs/SJ2 EXCEPT baseline) / A2.3 SAME-CSS NL LATERAL deterministic ReScan proof (3 outer × inner_cnt=14, 0-drop cursor-reset contract) / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions / A2.4 non-lateral NL no-crash count-match-baseline / + Makefile REGRESS/ISOLATION registration / 4 expected sync / 2× stable 12/12 L3 + 9/9 L1 0 diff
+4. **TBD** — D-3 A8 MVP cost model：cost_branchscan() O(M log M + N log M) 严格按 R11/R12（Phase A sort+dedup / Pass1 bsearch merge / Pass2 latest-wins linear chain）/ startup+total+rows != 0；PK fast-path 分支；critical add_path cost reject → lappend bypass 修复；13th L3 planner_cost（A8.1 SEQ cost≠0 / A8.2 PK cost << seq / A8.3 SJ 2× CustomScan + correctness 210 pairs）/ view_unify SJ expected 成本数值重同步；2× consecutive 13/13 L3 + 9/9 L1 0 diff
 
 ---
 

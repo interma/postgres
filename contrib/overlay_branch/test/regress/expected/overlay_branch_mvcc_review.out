@@ -113,7 +113,7 @@ SELECT CASE WHEN count(*) = 0 THEN 'PASS:R09_ALL_DISCARDED'
 SELECT create_branch('br_r08_null_exit');
  create_branch 
 ---------------
-            36
+            41
 (1 row)
 
 SELECT use_branch('br_r08_null_exit');
@@ -169,7 +169,7 @@ SELECT discard_branch('br_r08_null_exit');
 SELECT create_branch('br_r08_null_exit_2arg');
  create_branch 
 ---------------
-            37
+            42
 (1 row)
 
 SELECT use_branch('br_r08_null_exit_2arg', 'snapshot');
@@ -219,7 +219,7 @@ SELECT discard_branch('br_r08_null_exit_2arg');
 SELECT create_branch('br_r08_emp_vs_null');
  create_branch 
 ---------------
-            38
+            43
 (1 row)
 
 SELECT use_branch('br_r08_emp_vs_null');
@@ -392,7 +392,7 @@ EXECUTE r_ctx_q_green(60);
 SELECT create_branch('b_r_ctx');
  create_branch 
 ---------------
-            40
+            45
 (1 row)
 
 SELECT use_branch('b_r_ctx');
@@ -494,7 +494,7 @@ SELECT CASE WHEN (a.count = b.count) AND (a.sum::numeric = b.sum::numeric) AND (
 SELECT create_branch('b_r_ctx_s07');
  create_branch 
 ---------------
-            41
+            46
 (1 row)
 
 SELECT use_branch('b_r_ctx_s07');
@@ -648,7 +648,7 @@ ANALYZE public.rv_t;
 SELECT create_branch('br_hot_conflict') AS id_br_hot;
  id_br_hot 
 -----------
-        42
+        47
 (1 row)
 
 SELECT use_branch('br_hot_conflict');
@@ -747,7 +747,7 @@ ANALYZE public.rv_t;
 SELECT create_branch('br_token_conflict') AS id_br_token;
  id_br_token 
 -------------
-          43
+          48
 (1 row)
 
 SELECT use_branch('br_token_conflict');

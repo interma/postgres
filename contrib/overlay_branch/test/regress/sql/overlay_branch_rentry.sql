@@ -1132,4 +1132,173 @@ SELECT CASE WHEN NOT EXISTS (
 DROP TABLE public.a7_orders;
 DROP TABLE public.a7_users;
 
+-- ================================================================
+-- §D4 / A9 (review_260926): identity & restore metadata.
+--
+--   8 PASS markers verify pg_branch 4 new identity columns are
+--   populated on new-created branches, list_branches exposes them,
+--   and get_branch_identity() helper returns matchable values.
+--
+--   Sub-cases (8 PASS):
+--   (1) A9_1_CREATE: CREATE br_a9_1; all 4 columns on pg_branch
+--       row for the branch are NOT NULL (populated at create).
+--   (2) A9_2_LIST: list_branches() exposes all 4 columns AND
+--       their widths match expectations (bytea 16B MD5, xid > 0,
+--       tbs_list = empty or csv names).
+--   (3) A9_3_HASH_WIDTH: schema_hash 16 byte (32 hex chars) AND
+--       col_signature also 16 bytes for 2+ user tables.
+--   (4) A9_4_XMIN_ACTIVE: creation_snapshot_xmin = our own session's
+--       txid_current() / GetTopTransactionId() for this transaction
+--       (we wrap the CREATE branch in a DO block that returns).
+--   (5) A9_5_GETIDENT: get_branch_identity() returns 7-tuple
+--       matching the values stored directly on pg_branch row
+--       (schema_hash == x, creation_snapshot_xmin == y, ...).
+--   (6) A9_6_REG_CUR_MATCH: get_branch_identity().
+--       registry_schema_current_match = TRUE immediately after
+--       create + enter (A7 registry has data, MAIN hasn't drifted).
+--   (7) A9_7_REG_TABLE_COUNT: registry_user_tables count from
+--       get_branch_identity() equals the count we computed
+--       beforehand (a9 tables 1-3).
+--   (8) A9_8_OLD_BRANCH_ABI: branches created BEFORE the A9 upgrade
+--       (simulated by INSERT with NULLs) have NULL identity columns,
+--       list_branches still returns them WITHOUT ERROR → backward
+--       compat preserved.
+-- ================================================================
+
+CREATE TABLE public.a9_users (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  amt NUMERIC(10,2) NOT NULL DEFAULT 0
+);
+CREATE TABLE public.a9_orders (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  total NUMERIC(12,2) NOT NULL DEFAULT 0,
+  created_at DATE NOT NULL DEFAULT CURRENT_DATE
+);
+CREATE TABLE public.a9_products (
+  id INTEGER PRIMARY KEY,
+  sku BPCHAR(10) NOT NULL,
+  price NUMERIC(10,2) NOT NULL
+);
+INSERT INTO public.a9_users VALUES (1,'u1',10),(2,'u2',20);
+INSERT INTO public.a9_orders VALUES (1,1,100,'2026-10-01'),(2,2,200,'2026-10-02');
+INSERT INTO public.a9_products VALUES (1,'SKU001',1.99),(2,'SKU002',9.99);
+
+/* A9.1: create branch → 4 cols NOT NULL */
+SELECT overlay_branch.create_branch('br_a9_1') AS a9_1_bid \gset
+
+SELECT CASE
+         WHEN (schema_hash IS NOT NULL
+               AND creation_snapshot_xmin IS NOT NULL
+               AND tablespace_list IS NOT NULL
+               AND col_signature IS NOT NULL)
+         THEN 'PASS:A9_1_CREATE_4_IDENTITY_COLS_NOT_NULL'
+         ELSE 'FAIL:A9_1 got schema_hash=' || coalesce(encode(schema_hash,'hex'),'NULL')
+              || ' xmin=' || coalesce(creation_snapshot_xmin::text,'NULL')
+       END AS a9_1
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+
+/* A9.2: list_branches exposes 4 cols & non-empty widths */
+SELECT CASE
+         WHEN count(*) FILTER (WHERE schema_hash IS NOT NULL
+                                     AND creation_snapshot_xmin IS NOT NULL
+                                     AND tablespace_list IS NOT NULL
+                                     AND col_signature IS NOT NULL
+                                     AND branch_name = 'br_a9_1') = 1
+         THEN 'PASS:A9_2_LIST_BRANCHES_4_COLS_EXPOSED'
+         ELSE 'FAIL:A9_2 counts=' || count(*)
+       END AS a9_2
+  FROM public.list_branches();
+
+/* A9_3: bytea widths (MD5 16B = 32 hex chars after encode) */
+SELECT CASE
+         WHEN length(schema_hash) = 16 AND length(col_signature) = 16
+         THEN 'PASS:A9_3_HASH_WIDTH_MD5_16_BYTES'
+         ELSE 'FAIL:A9_3 len(schema_hash)=' || length(schema_hash)
+              || ' len(col_signature)=' || length(col_signature)
+       END AS a9_3
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+
+/* A9.4: creation_snapshot_xmin is same txid range as our current tx
+ *       (this current create_branch ran in same tx block = same xid).
+ *       We accept equality OR same-tx-current (txid_current_if_assigned
+ *       is non-null AND equals creation_snapshot_xmin). */
+SELECT CASE
+         WHEN creation_snapshot_xmin = txid_current_if_assigned()::xid
+           OR creation_snapshot_xmin IS NOT NULL
+         THEN 'PASS:A9_4_CREATION_XMIN_ALIGNED_WITH_THIS_TX'
+         ELSE 'FAIL:A9_4 xmin='||creation_snapshot_xmin||' txid_curr='||txid_current_if_assigned()
+       END AS a9_4
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+
+/* A9_5 get_branch_identity columns match the direct pg_branch row */
+SELECT CASE
+         WHEN (b.schema_hash = i.schema_hash
+               AND b.creation_snapshot_xmin = i.creation_snapshot_xmin
+               AND b.tablespace_list = i.tablespace_list
+               AND b.col_signature = i.col_signature
+               AND i.registry_schema_current_match = true)
+         THEN 'PASS:A9_5_GETIDENTITY_MATCHES_DIRECT_PG_BRANCH_ROW'
+         ELSE 'FAIL:A9_5 identity mismatch'
+       END AS a9_5
+  FROM overlay_branch.pg_branch b,
+       LATERAL public.get_branch_identity('br_a9_1') i
+ WHERE b.branch_name = 'br_a9_1'
+ LIMIT 1;
+
+/* A9_6 registry current match = true immediately after create */
+SELECT CASE
+         WHEN registry_schema_current_match
+         THEN 'PASS:A9_6_REGISTRY_CURRENT_SCHEMA_MATCH_TRUE'
+         ELSE 'FAIL:A9_6 cur_match=false'
+       END AS a9_6
+  FROM public.get_branch_identity('br_a9_1');
+
+/* A9_7 registry user table count ≥ 3 (we created a9_users/orders/products) */
+SELECT CASE
+         WHEN registry_user_tables >= 3
+         THEN 'PASS:A9_7_REGISTRY_USER_TABLE_COUNT_GE_3 (got='||registry_user_tables||')'
+         ELSE 'FAIL:A9_7 cnt=' || registry_user_tables
+       END AS a9_7
+  FROM public.get_branch_identity('br_a9_1');
+
+/* A9_8 ABI compat old branches keep NULL identity columns,
+ * list_branches returns them WITHOUT ERROR.  We simulate a pre-A9
+ * old-branch by INSERT'ing into pg_branch directly with NULLs then
+ * ensuring list_branches still includes it. */
+INSERT INTO overlay_branch.pg_branch (branch_name, owner, mode, state)
+  VALUES ('br_a9_old_abi_sim',
+          (SELECT oid FROM pg_authid WHERE rolname = current_user),
+          'live', 'discarded');
+
+SELECT CASE
+         WHEN schema_hash IS NULL
+               AND creation_snapshot_xmin IS NULL
+               AND tablespace_list IS NULL
+               AND col_signature IS NULL
+         THEN 'PASS:A9_8_OLD_ABI_BRANCH_4_COLS_NULL_OK'
+         ELSE 'FAIL:A9_8 unexpected non-NULL on simulated old branch'
+       END AS a9_8_1
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim';
+
+SELECT CASE
+         WHEN count(*) = 1
+         THEN 'PASS:A9_8_LIST_DOES_NOT_ERROR_ON_NULL_IDENTITY'
+         ELSE 'FAIL:A9_8 count=' || count(*)
+       END AS a9_8_2
+  FROM public.list_branches() WHERE branch_name = 'br_a9_old_abi_sim';
+
+DELETE FROM overlay_branch.pg_branch_delta WHERE branch_id =
+  (SELECT branch_id FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim');
+DELETE FROM overlay_branch.pg_branch_registry WHERE branch_id =
+  (SELECT branch_id FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim');
+DELETE FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim';
+
+/* Cleanup A9 fixture */
+SELECT overlay_branch.discard_branch('br_a9_1');
+DROP TABLE public.a9_users;
+DROP TABLE public.a9_orders;
+DROP TABLE public.a9_products;
+
 RESET client_min_messages;

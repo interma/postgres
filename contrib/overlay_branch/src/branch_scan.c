@@ -29,6 +29,7 @@
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
+#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -1252,14 +1253,94 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         cpath->path.parallel_aware = false;
         cpath->path.parallel_safe  = false;
         cpath->path.parallel_workers = 0;
-        /* PK-predicate 快速路径：进一步压低 cost 显式鼓励 Planner（即使
-         * 我们后面强删 pathlist，成本标记也能保留给 EXPLAIN 看）。 */
-        if (has_pk_pred)
-            cpath->path.rows = 1.0;
-        else
-            cpath->path.rows       = rel->rows;
-        cpath->path.startup_cost = 0.0;
-        cpath->path.total_cost = min_cost * 1.0e-5;
+
+        /* =====================================================================
+         * REVIEW-260926 / A8 — cost_branchscan() MVP-level cost model
+         * ---------------------------------------------------------------
+         * Background (R11/R12 review):
+         *   Pass1 MAIN merge loop used to be O(N×M) naive double-scan.
+         *   After R11 fix: Phase A = copy + qsort → O(M log M)
+         *                   Phase B = unique latest-wins → O(M) in practice
+         *                   Pass1 = MAIN merge × bsearch → O(N log M_unique)
+         *                   Pass2 = delta_list 2 linear walks → O(M) in practice
+         *   Total complexity = O(M log M + N log M).
+         *
+         * Planner stage constraint (MVP):
+         *   M (#delta rows for current_bid + relid) is NOT trivially known
+         *   here (planner has no direct SPI access to pg_branch_delta w/o
+         *   a heavy call).  We therefore estimate M using a realistic
+         *   "editing branch" ratio: typical in-branch rewrite ratio for a
+         *   100% acceptance MVP ∈ [1%, 10%] of MAIN rows.  We use a middle
+         *   estimate of 5% (= 0.05), clamped to a sane interval to avoid
+         *   pathological estimates for very small/large tables.
+         *
+         *   M = clamp( rel->tuples × 0.05 , 1, 1000000 )
+         *
+         * Cost decomposition (follows PG cost.c conventions):
+         *   startup_cost = Phase A + Phase B
+         *                = cpu_tuple_cost × (M × log2(M+1))        [sort]
+         *                + cpu_tuple_cost × M                       [dedup]
+         *   run_cost     = Pass1 + Pass2
+         *                = cpu_tuple_cost × (N × log2(M+1))        [bsearch]
+         *                + cpu_tuple_cost × N                       [MAIN emit]
+         *                + cpu_tuple_cost × M                       [Pass2 linear]
+         *   total_cost   = startup_cost + run_cost
+         *
+         *   PK-pred fast path (override):
+         *     If has_pk_pred=true, Pass1 bsearch lookup is 1× not N×, so
+         *     we squash N→1 in run_cost.  Rows = 1.
+         *
+         * Safety / fallback:
+         *   If the resulting total_cost would be LARGER than the cheapest
+         *   native path (unlikely, given our 5% M ratio is conservative),
+         *   we still keep our computed cost (truthful, EXPLAIN output is
+         *   correct for DBA inspection) — MVP correctness does NOT depend
+         *   on planner choosing us, because the L1350-1360 block below
+         *   forcibly deletes all non-CustomPath paths from rel->pathlist
+         *   in active-branch mode (BranchScan becomes the ONLY candidate).
+         *
+         * Historical note (was):
+         *   cpath->path.startup_cost = 0.0;
+         *   cpath->path.total_cost   = min_cost * 1.0e-5; (artificially zero)
+         * =================================================================== */
+        {
+            double      N = (rel->tuples > 0) ? rel->tuples : 100.0;
+            double      M_est_raw = N * 0.05;
+            double      M = (M_est_raw < 1.0) ? 1.0 :
+                            (M_est_raw > 1000000.0) ? 1000000.0 : M_est_raw;
+            double      log_M = 1.0;
+            double      startup, run, total;
+
+            if (M > 1.0)
+            {
+                double  ln_M = 0.0;
+                double  m_tmp = M;
+                while (m_tmp > 1.0) { ln_M += 1.0; m_tmp /= 2.0; }
+                log_M = ln_M;
+            }
+
+            startup = cpu_tuple_cost * (M * log_M + M);
+
+            if (has_pk_pred)
+            {
+                run = cpu_tuple_cost * (1.0 * log_M + 1.0)       /* Pass1: 1 bsearch */
+                    + cpu_tuple_cost * M;                        /* Pass2 linear */
+            }
+            else
+            {
+                run = cpu_tuple_cost * (N * log_M + N)           /* Pass1: N bsearch */
+                    + cpu_tuple_cost * M;                        /* Pass2 linear */
+            }
+            total = startup + run;
+
+            cpath->path.startup_cost = startup;
+            cpath->path.total_cost   = total;
+
+            if (has_pk_pred)
+                cpath->path.rows = 1.0;
+            else
+                cpath->path.rows = rel->rows;
+        }
         cpath->path.pathkeys   = NIL;
         cpath->flags           = 0;
         cpath->custom_paths    = NIL;
@@ -1327,7 +1408,30 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
             pfree(general_where_sql);
 
         cpath->methods         = &ob_branchscan_path_methods;
-        add_path(rel, (Path *) cpath);
+        /* =================================================================
+         * CRITICAL FIX (A8 regression): do NOT use add_path() here!
+         * ---------------------------------------------------------------
+         * Standard add_path() performs dominance/cheaper checks: if our
+         * CustomPath's total_cost is HIGHER than an existing SeqScan/
+         * IndexScan (which becomes true the moment we report a realistic
+         * non-zero cost model instead of the old 0.00 1e-5 artificial
+         * floor), add_path() SILENTLY REJECTS our cpath and returns NULL
+         * without appending it to rel->pathlist.
+         *
+         * Then the MVP pathlist-prune block below finds newlist=NIL
+         * (no CustomPath exists) and falls back to keeping the
+         * original SeqScan/IndexScan-only pathlist → the entire overlay
+         * delta merge is BYPASSED (silent correctness bug: UPDATEs/
+         * DELETEs/INSERTs of the branch silently don't show up in reads).
+         *
+         * MVP contract = in active branch, BranchScan is the ONLY
+         * correct scan (MAIN heap's bare rows are just the baseline).
+         * We must therefore FORCE our cpath into the pathlist regardless
+         * of Planner cost comparisons, then delete all native competitors.
+         * Direct lappend bypasses add_path() entirely; the prune step
+         * ensures only ours survives.
+         * ================================================================= */
+        rel->pathlist = lappend(rel->pathlist, cpath);
 
         /* MVP override: in an active branch, our overlay merge result
          * MUST be used — the MAIN heap rows are only the baseline and

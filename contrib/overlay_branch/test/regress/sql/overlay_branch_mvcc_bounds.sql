@@ -787,3 +787,154 @@ DROP TABLE public.q2_t;
 /* Final L3 PASS marker for the zero-regression gate baseline. */
 SELECT 'PASS:Q2_FR7_CANCELLED_CORRECTNESS_OK' AS q2_fr7_cancelled_status;
 
+
+/* ================================================================
+ * ======  Section: A4 performance MVP (review_260926 §D-5)  ======
+ * 5 PASS markers:
+ *   A4_1  empty apply    < 500 ms
+ *   A4_2  empty discard < 500 ms
+ *   A4_3  10K INSERT apply  < 60 s
+ *   A4_4  10K UPDATE apply  < 60 s
+ *   A4_5  10K DELETE apply  < 60 s
+ * Scaled to 10K rows × 3 ops (not 100K) to stay inside CI ceilings.
+ * =================================================================
+ */
+
+/* --- Fixture: 10K-row wide main table (3 cols) --- */
+CREATE TABLE public.a4_t10k (
+    id   INTEGER PRIMARY KEY,
+    v1   TEXT NOT NULL DEFAULT md5(random()::text),
+    amt  NUMERIC(12,2) NOT NULL DEFAULT 0
+);
+
+INSERT INTO public.a4_t10k (id, amt)
+SELECT g, round((random()*100000)::numeric, 2)
+  FROM generate_series(1, 10000) g;
+
+ANALYZE public.a4_t10k;
+
+/* -----------------------------
+ * Case 1: EMPTY branch (create → apply no edits)
+ * ----------------------------- */
+DO $$
+DECLARE
+    _s  timestamp;
+    _ms integer;
+BEGIN
+    PERFORM overlay_branch.create_branch('br_a4_1_empty');
+    _s := clock_timestamp();
+    PERFORM public.apply_branch('br_a4_1_empty');
+    _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp() - _s)))::integer;
+    IF _ms < 500 THEN
+        RAISE NOTICE 'PASS:A4_1_EMPTY_APPLY_UNDER_500MS elapsed_ms=%', _ms;
+    ELSE
+        RAISE EXCEPTION 'FAIL:A4_1_EMPTY_APPLY_UNDER_500MS elapsed_ms=% (>=500)', _ms;
+    END IF;
+END $$;
+
+/* -----------------------------
+ * Case 2: EMPTY discard (create → discard no edits)
+ * ----------------------------- */
+DO $$
+DECLARE
+    _s  timestamp;
+    _ms integer;
+BEGIN
+    PERFORM overlay_branch.create_branch('br_a4_2_empty_dc');
+    _s := clock_timestamp();
+    PERFORM public.discard_branch('br_a4_2_empty_dc');
+    _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp() - _s)))::integer;
+    IF _ms < 500 THEN
+        RAISE NOTICE 'PASS:A4_2_EMPTY_DISCARD_UNDER_500MS elapsed_ms=%', _ms;
+    ELSE
+        RAISE EXCEPTION 'FAIL:A4_2_EMPTY_DISCARD_UNDER_500MS elapsed_ms=% (>=500)', _ms;
+    END IF;
+END $$;
+
+/* -----------------------------
+ * Case 3: 10K INSERT inside branch → apply
+ * ----------------------------- */
+SELECT overlay_branch.create_branch('br_a4_3_insert10k');
+SELECT overlay_branch.use_branch('br_a4_3_insert10k');
+
+INSERT INTO public.a4_t10k (id, amt)
+SELECT 10000 + g, round((random()*100000)::numeric, 2)
+  FROM generate_series(1, 10000) g;
+
+SELECT overlay_branch.exit_branch();
+
+DO $$
+DECLARE
+    _s   timestamp;
+    _ms  integer;
+    _row int;
+BEGIN
+    _s := clock_timestamp();
+    PERFORM public.apply_branch('br_a4_3_insert10k');
+    _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp() - _s)))::integer;
+    SELECT count(*) INTO STRICT _row FROM public.a4_t10k WHERE id > 10000;
+    IF _row = 10000 AND _ms < 60000 THEN
+        RAISE NOTICE 'PASS:A4_3_10K_INSERT_APPLY_UNDER_60S elapsed_ms=% rows_inserted=%', _ms, _row;
+    ELSE
+        RAISE EXCEPTION 'FAIL:A4_3_10K_INSERT_APPLY_UNDER_60S elapsed_ms=% rows=% (need 10000 rows and <60s)', _ms, COALESCE(_row,-1);
+    END IF;
+END $$;
+
+/* -----------------------------
+ * Case 4: 10K UPDATE inside branch → apply
+ * ----------------------------- */
+SELECT overlay_branch.create_branch('br_a4_4_update10k');
+SELECT overlay_branch.use_branch('br_a4_4_update10k');
+
+UPDATE public.a4_t10k
+   SET amt = amt + 1.00,
+       v1  = md5(v1 || id::text)
+ WHERE id <= 10000;
+
+SELECT overlay_branch.exit_branch();
+
+DO $$
+DECLARE
+    _s   timestamp;
+    _ms  integer;
+BEGIN
+    _s := clock_timestamp();
+    PERFORM public.apply_branch('br_a4_4_update10k');
+    _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp() - _s)))::integer;
+    IF _ms < 60000 THEN
+        RAISE NOTICE 'PASS:A4_4_10K_UPDATE_APPLY_UNDER_60S elapsed_ms=%', _ms;
+    ELSE
+        RAISE EXCEPTION 'FAIL:A4_4_10K_UPDATE_APPLY_UNDER_60S elapsed_ms=% (>=60s)', _ms;
+    END IF;
+END $$;
+
+/* -----------------------------
+ * Case 5: 10K DELETE inside branch → apply
+ *   (target rows 10001..20000 — added by Case 3 & already applied to MAIN)
+ * ----------------------------- */
+SELECT overlay_branch.create_branch('br_a4_5_delete10k');
+SELECT overlay_branch.use_branch('br_a4_5_delete10k');
+
+DELETE FROM public.a4_t10k WHERE id BETWEEN 10001 AND 20000;
+
+SELECT overlay_branch.exit_branch();
+
+DO $$
+DECLARE
+    _s   timestamp;
+    _ms  integer;
+    _row int;
+BEGIN
+    _s := clock_timestamp();
+    PERFORM public.apply_branch('br_a4_5_delete10k');
+    _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp() - _s)))::integer;
+    SELECT count(*) INTO STRICT _row FROM public.a4_t10k WHERE id BETWEEN 10001 AND 20000;
+    IF _row = 0 AND _ms < 60000 THEN
+        RAISE NOTICE 'PASS:A4_5_10K_DELETE_APPLY_UNDER_60S elapsed_ms=% rows_remaining=%', _ms, _row;
+    ELSE
+        RAISE EXCEPTION 'FAIL:A4_5_10K_DELETE_APPLY_UNDER_60S elapsed_ms=% rows_remaining=% (need 0 rows and <60s)', _ms, COALESCE(_row,-1);
+    END IF;
+END $$;
+
+/* --- A4 fixture cleanup: 5 branches already terminal; drop table --- */
+DROP TABLE public.a4_t10k;
