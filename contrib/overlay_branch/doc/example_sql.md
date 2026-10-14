@@ -16,41 +16,33 @@
   - [1.3 current_branch() — 查询当前分支](#13-current_branch--查询当前分支)
   - [1.4 list_branches() — 列举分支](#14-list_branches--列举分支)
   - [1.5 discard_branch() — 丢弃分支](#15-discard_branch--丢弃分支)
-- [2. 在分支里写数据](#2-在分支里写数据)
+- [2. 在分支内读写数据](#2-在分支内读写数据)
   - [2.1 INSERT](#21-insert)
   - [2.2 UPDATE](#22-update)
   - [2.3 DELETE](#23-delete)
-- [3. 在分支里读数据](#3-在分支里读数据)
-  - [3.1 叠加语义总览](#31-叠加语义总览)
-  - [3.2 完整叠加示例](#32-完整叠加示例)
-  - [3.3 分支读不到其它分支的改动](#33-分支读不到其它分支的改动)
+  - [2.4 叠加语义总览](#24-叠加语义总览)
+  - [2.5 完整叠加示例](#25-完整叠加示例)
+  - [2.6 分支读不到其它分支的改动](#26-分支读不到其它分支的改动)
+- [3. Snapshot vs Live 两种分支语义对比](#3-snapshot-vs-live-两种分支语义对比)
+  - [3.1 典型场景对比](#31-典型场景对比)
+  - [3.2 Live 语义：感知 Main 变化](#32-live-语义感知-main-变化)
+  - [3.3 同一 MAIN 变化下的感知差异](#33-同一-main-变化下的感知差异)
+  - [3.4 分支内自写 delta 均可见（两种语义一致）](#34-分支内自写-delta-均可见两种语义一致)
 - [4. apply_branch() — 把分支增量合入 Main](#4-apply_branch--把分支增量合入-main)
   - [4.1 APPLY 成功路径](#41-apply-成功路径)
   - [4.2 APPLY 冲突路径](#42-apply-冲突路径)
-- [5. Live Branch 语义：感知 Main 变化](#5-live-branch-语义感知-main-变化)
-- [6. Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE](#6-pure-delta-场景分支里先-insert-再-updatedelete)
-  - [6.1 Pure Delta INSERT 再 DELETE](#61-pure-delta-insert-再-delete)
-  - [6.2 Pure Delta UPDATE](#62-pure-delta-update)
-  - [6.3 Pure Delta × typmod PK：NUMERIC / BPCHAR](#63-pure-delta--typmod-pknumeric--bpchar)
-  - [6.4 Pure Delta × 空 MAIN heap 全链路](#64-pure-delta--空-main-heap-全链路)
-- [7. RETURNING 子句](#7-returning-子句)
-- [8. Data-Modifying CTE：明确 ERROR](#8-data-modifying-cte明确-error)
-- [9. 暂不支持的场景（明确报错）+ 已实装 UPSERT](#9-暂不支持的场景明确报错--已实装-upsert)
-  - [9.1 UPSERT 实装示例](#91-upsert-实装示例)
-  - [9.2 支持矩阵](#92-支持矩阵)
-- [10. Snapshot vs Live 两种分支语义对比](#10-snapshot-vs-live-两种分支语义对比)
-  - [10.1 典型场景对比](#101-典型场景对比)
-  - [10.2 同一 MAIN 变化下的感知差异](#102-同一-main-变化下的感知差异)
-  - [10.3 分支内自写 delta 均可见（两种语义一致）](#103-分支内自写-delta-均可见两种语义一致)
-- [11. Applying 防护 + Kickout 失效 & 新 helper](#11-applying-防护--kickout-失效--新-helper)
-  - [11.1 两个失效检查 SQL helper](#111-两个失效检查-sql-helper)
-  - [11.2 跨会话 Apply/Discard 后 DML Kickout](#112-跨会话-applydiscard-后-dml-kickout)
-  - [11.3 Applying 状态期间 DML 阻塞](#113-applying-状态期间-dml-阻塞)
-  - [11.4 DO block 包裹重试模板](#114-do-block-包裹重试模板)
-- [12. list_branches() 身份与 drift guard 字段](#12-list_branches-身份与-drift-guard-字段)
-- [13. get_branch_identity() — 身份与恢复绑定](#13-get_branch_identity--身份与恢复绑定)
-- [14. 空分支 Apply/Discard 快速返回](#14-空分支-applydiscard-快速返回)
-- [15. 活动分支内 DDL RESTRICTED](#15-活动分支内-ddl-restricted)
+- [5. 暂不支持的场景（明确报错）+ 已实装 UPSERT](#5-暂不支持的场景明确报错--已实装-upsert)
+  - [5.1 UPSERT 实装示例](#51-upsert-实装示例)
+  - [5.2 Data-Modifying CTE：明确 ERROR](#52-data-modifying-cte明确-error)
+  - [5.3 支持矩阵](#53-支持矩阵)
+- [6. 特殊情况](#6-特殊情况)
+  - [6.1 Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE](#61-pure-delta-场景分支里先-insert-再-updatedelete)
+  - [6.2 RETURNING 子句](#62-returning-子句)
+  - [6.3 Applying 防护 + Kickout 失效 & 新 helper](#63-applying-防护--kickout-失效--新-helper)
+  - [6.4 list_branches() 身份与 drift guard 字段](#64-list_branches-身份与-drift-guard-字段)
+  - [6.5 get_branch_identity() — 身份与恢复绑定](#65-get_branch_identity--身份与恢复绑定)
+  - [6.6 空分支 Apply/Discard 快速返回](#66-空分支-applydiscard-快速返回)
+  - [6.7 活动分支内 DDL RESTRICTED](#67-活动分支内-ddl-restricted)
 
 ---
 
@@ -283,7 +275,7 @@ ERROR:  overlay_branch: discard_branch: branch "agent_workspace" is not active
 
 ---
 
-## 2. 在分支里写数据
+## 2. 在分支内读写数据
 
 **进入分支后，所有普通的 INSERT / UPDATE / DELETE 不会写主表，只会写入分支增量。**
 用户不需要改 DML 语法。
@@ -315,9 +307,7 @@ DELETE 1
 
 ---
 
-## 3. 在分支里读数据
-
-### 3.1 叠加语义总览
+### 2.4 叠加语义总览
 
 | 分支操作 | Main 有 | Main 无 | 输出 |
 |-----------|---------|---------|------|
@@ -339,7 +329,7 @@ SELECT * FROM overlay_branch.overlay_main_plus_delta('products')
  ORDER BY id;
 ```
 
-### 3.2 完整叠加示例
+### 2.5 完整叠加示例
 
 沿用 §2 写过的 3 条 DML：id=1 UPDATE、id=2 DELETE、id=4 INSERT。
 
@@ -369,7 +359,7 @@ SELECT * FROM products ORDER BY id;
 (3 rows)
 ```
 
-### 3.3 分支读不到其它分支的改动
+### 2.6 分支读不到其它分支的改动
 
 ```sql
 SELECT create_branch('branch_B');
@@ -391,6 +381,93 @@ SELECT * FROM products WHERE id = 1;
 ----+-------+-------
   1 | Apple |   100
 (1 row)
+```
+
+---
+
+## 3. Snapshot vs Live 两种分支语义对比
+
+同一 branch 可以在不同 session 里分别以 snapshot 或 live 方式进入。
+
+### 3.1 典型场景对比
+
+| 维度 | mode='live'（默认） | mode='snapshot' |
+|------|---|---|
+| **MAIN 表的旧行**（没被自己写过） | 始终跟随 Main 最新提交 | **冻结**在进入那一刻的快照 |
+| **分支自己写的行** | 始终可见 | 始终可见 |
+| **同一 branch 其他 session 新写的行** | 始终可见 | 始终可见 |
+| **典型场景** | Agent 协作工作区；保留自己改的同时看别人的新提交 | 报表 / 离线分析；MAIN 数据在查询期间不漂移 |
+| **怎么进入** | `use_branch('b')` 或 `use_branch('b','live')` | `use_branch('b','snapshot')` |
+
+### 3.2 Live 语义：感知 Main 变化
+
+默认的 `mode='live'` 语义是 **Latest Main + Branch Delta 的叠加**：
+没被分支改过的行，永远跟随 Main 最新提交的版本；分支改过的行，看到分支自己覆盖后的版本。
+
+```sql
+SELECT use_branch(NULL);
+UPDATE products SET price = 9999 WHERE id = 3;
+UPDATE 1
+
+SELECT use_branch('branch_B');
+SELECT * FROM products WHERE id = 3;
+ id |  name  | price
+----+--------+------
+  3 | Cherry | 9999
+(1 row)
+```
+
+### 3.3 同一 MAIN 变化下的感知差异
+
+```sql
+-- 准备
+SELECT use_branch(NULL);
+TRUNCATE products;
+INSERT INTO products VALUES (1,'A',10),(2,'B',5),(3,'C',20);
+SELECT create_branch('b_snap');
+
+-- s1: snapshot 会话
+SELECT use_branch('b_snap', 'snapshot');
+SELECT * FROM products ORDER BY id;
+-- 看到 MAIN baseline: A(10), B(5), C(20)
+
+-- s2: live 会话在 MAIN 写入（另一个 psql 连接）
+SELECT use_branch(NULL);
+INSERT INTO products VALUES (4,'D',30);
+UPDATE products SET price=9999 WHERE id=3;
+COMMIT;
+
+-- 回到 s1: snapshot 会话
+SELECT * FROM products ORDER BY id;
+-- id | name | price      （MAIN 冻结！）
+--  1 |  A   | 10
+--  2 |  B   |  5         看不到 MAIN id=4/D；id=3 仍为 20
+--  3 |  C   | 20
+-- (3 rows)
+
+-- s3: 同一 branch live 方式进入
+SELECT use_branch(NULL);
+SELECT use_branch('b_snap', 'live');
+SELECT * FROM products ORDER BY id;
+-- id | name | price
+--  1 |  A   |   10
+--  2 |  B   |    5         LIVE：id=4 看到了！id=3 涨价到 9999 了！
+--  3 |  C   | 9999
+--  4 |  D   |   30
+-- (4 rows)
+```
+
+### 3.4 分支内自写 delta 均可见（两种语义一致）
+
+```sql
+SELECT use_branch('b_snap', 'snapshot');
+UPDATE products SET price=7 WHERE id=2;
+INSERT INTO products VALUES (99, 'Mine', 1);
+SELECT * FROM products ORDER BY id;
+-- 1|A|10       (MAIN frozen)
+-- 2|B|7        (自己的 delta)
+-- 3|C|20       (MAIN frozen)
+-- 99|Mine|1    (自己的 delta)
 ```
 
 ---
@@ -433,7 +510,7 @@ SELECT branch_name, state, delta_count FROM list_branches()
 
 **自 apply**：如果当前 session 正在 `use_branch(X)`，自己执行 `apply_branch(X)` 后，本 session 会自动回到 Main，无需再 `use_branch(NULL)`。
 
-**跨会话 apply/discard**：如果 session A 正在 `use_branch(X)`，session B 执行了 `apply_branch(X)` 或 `discard_branch(X)`，则 session A 下一次 DML 会报错 `ERRCODE 55000` 并被踢出分支（见 §11.2）。
+**跨会话 apply/discard**：如果 session A 正在 `use_branch(X)`，session B 执行了 `apply_branch(X)` 或 `discard_branch(X)`，则 session A 下一次 DML 会报错 `ERRCODE 55000` 并被踢出分支（见 §6.3）。
 
 ### 4.2 APPLY 冲突路径
 
@@ -463,31 +540,109 @@ HINT:  Row was modified in Main after branch wrote it.
 
 ---
 
-## 5. Live Branch 语义：感知 Main 变化
+## 5. 暂不支持的场景（明确报错）+ 已实装 UPSERT
 
-默认的 `mode='live'` 语义是 **Latest Main + Branch Delta 的叠加**：
-没被分支改过的行，永远跟随 Main 最新提交的版本；分支改过的行，看到分支自己覆盖后的版本。
+以下场景会**明确拒绝**（不会静默穿透到 Main）：
+
+| 场景 | 行为 | 典型错误 |
+|------|------|----------|
+| 对**无主键**表写 DML | 立即拒绝 | `overlay_serialize_pk requires a primary key on ...` |
+| 分支内 DDL（CREATE/ALTER/DROP TABLE 等）| 拒绝，提示退回 Main | `§A7 DDL RESTRICTED 0A000`（见 §6.7）|
+| `INSERT ... ON CONFLICT` (UPSERT) | **已支持**（见 §5.1）| N/A |
+| **分区表** | 拒绝 | `overlay_branch does not support partitioned tables` |
+| **FK 级联写** | 拒绝 | `cannot modify via FK-triggered write` |
+| 直接写 `pg_branch` / `pg_branch_delta` | 拒绝 | PG 原生视图错误 |
+| 对 VIEW / MATVIEW / FOREIGN TABLE 写 DML | 拒绝 | guard 拦截 |
+| **COPY FROM / MERGE / Data-Modifying CTE** | 拒绝 | `0A000 feature_not_supported` |
+| **UPDATE SET pk_col = ...**（改主键）| 拒绝 | `Updating the PRIMARY KEY column ... is not supported` |
+| 权限不足调用 use/apply/discard/create | 拒绝 | `42501 insufficient_privilege` |
+
+### 5.1 UPSERT 实装示例
+
+`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`（针对 PK 冲突）在分支内正常工作：
 
 ```sql
-SELECT use_branch(NULL);
-UPDATE products SET price = 9999 WHERE id = 3;
-UPDATE 1
+SELECT create_branch('br_upsert_demo');
+SELECT use_branch('br_upsert_demo');
 
-SELECT use_branch('branch_B');
+-- ON CONFLICT DO NOTHING：撞 PK → NOP
+INSERT INTO products VALUES (1, 'NewApple', 999) ON CONFLICT (id) DO NOTHING;
+INSERT 0 0
+SELECT * FROM products WHERE id = 1;
+ id | name  | price
+----+-------+-------
+  1 | Apple |    10
+
+-- ON CONFLICT DO UPDATE：撞 PK → 以 EXCLUDED 新值更新
+INSERT INTO products VALUES (3, 'Cherry_v2', 222)
+  ON CONFLICT (id) DO UPDATE SET name  = EXCLUDED.name,
+                                  price = EXCLUDED.price;
+INSERT 0 1
 SELECT * FROM products WHERE id = 3;
- id |  name  | price
-----+--------+------
-  3 | Cherry | 9999
-(1 row)
+ id |   name    | price
+----+-----------+-------
+  3 | Cherry_v2 |   222
+
+-- 撞分支自己的 pure-origin INSERT
+INSERT INTO products VALUES (100, 'First', 1) ON CONFLICT (id) DO NOTHING;
+INSERT INTO products VALUES (100, 'Dupe',  2) ON CONFLICT (id) DO NOTHING;
+INSERT 0 0
+SELECT * FROM products WHERE id = 100;
+ id  | name  | price
+-----+-------+-------
+ 100 | First |     1
 ```
+
+### 5.2 Data-Modifying CTE：明确 ERROR
+
+CTE 里嵌入 DML 再外层 SELECT 不允许：
+
+```sql
+WITH u AS (UPDATE products SET price=price+1 RETURNING id, price)
+SELECT * FROM u;
+ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RETURNING)
+        is not supported inside an active branch. Use top-level DML with RETURNING instead.
+```
+
+替代方案：直接 top-level DML 加 `RETURNING`（见 §6.2）。
+
+### 5.3 支持矩阵
+
+| 能力项 | 状态 |
+| --- | --- |
+| plain INSERT/UPDATE/DELETE | ✅ 支持 |
+| INSERT … ON CONFLICT（PK） | ✅ 支持 |
+| UPDATE/DELETE … RETURNING | ✅ 支持 |
+| WHERE pk = CONST | ✅ 推荐路径 |
+| Seq scan / range pred | ✅ 支持 |
+| 分支内 TEMP 表操作 | ✅ 支持（白名单）|
+| CREATE TABLE / ALTER / DROP / CREATE INDEX / DROP TRIGGER | ❌ 0A000（退回 Main 执行）|
+| 分区表 | ❌ 拒绝 |
+| FK 级联写 | ❌ 拒绝 |
+| COPY FROM / MERGE / Data-Modifying CTE | ❌ 拒绝 |
+| UPDATE SET pk_col | ❌ 拒绝（用 DELETE + INSERT 替代）|
+| 无 PK 表写 DML | ❌ 拒绝 |
+
+RESTRICTED 项处理建议：
+
+| 受限项 | 用户替代方案 |
+| --- | --- |
+| DDL | 先在 Main 执行 DDL → 重新 create_branch |
+| COPY FROM | 改写为多行 `INSERT INTO t VALUES (...), (...)` |
+| MERGE | 拆成独立 INSERT ON CONFLICT / UPDATE / DELETE |
+| Data-Modifying CTE | 改 top-level DML + RETURNING |
+| UPDATE pk | 改 `DELETE WHERE pk=old` + `INSERT VALUES (new_pk, ...)` |
+| FK 级联写 | 应用层显式先写子表再写父表 |
 
 ---
 
-## 6. Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE
+## 6. 特殊情况
+
+### 6.1 Pure Delta 场景：分支里先 INSERT 再 UPDATE/DELETE
 
 分支里 INSERT 出来的、Main 上没有的行，后续 UPDATE/DELETE 同样正常工作。
 
-### 6.1 Pure Delta INSERT 再 DELETE
+#### 6.1.1 Pure Delta INSERT 再 DELETE
 
 ```sql
 SELECT use_branch('agent_workspace');
@@ -530,7 +685,7 @@ SELECT id, grp, score FROM bs_pd_multi WHERE grp = 'C' ORDER BY id;
 (1 row)
 ```
 
-### 6.2 Pure Delta UPDATE
+#### 6.1.2 Pure Delta UPDATE
 
 ```sql
 INSERT INTO products VALUES (999, 'WillBeUpdated', 1);
@@ -547,7 +702,7 @@ SELECT id, name, price FROM products WHERE id = 999;
  999 | UpdatedOK   | 999999
 ```
 
-### 6.3 Pure Delta × typmod PK：NUMERIC / BPCHAR
+#### 6.1.3 Pure Delta × typmod PK：NUMERIC / BPCHAR
 
 ```sql
 CREATE TABLE bs_pd_numeric(price NUMERIC(10,2) PRIMARY KEY, tag TEXT);
@@ -571,7 +726,7 @@ SELECT code::text, tag FROM bs_pd_bpchar ORDER BY code;
  PD003 | C
 ```
 
-### 6.4 Pure Delta × 空 MAIN heap 全链路
+#### 6.1.4 Pure Delta × 空 MAIN heap 全链路
 
 ```sql
 CREATE TABLE bs_empty_pk(id INT4 PRIMARY KEY, tag TEXT);
@@ -601,9 +756,7 @@ SELECT * FROM bs_empty_pk ORDER BY id;
   1 | one
 ```
 
----
-
-## 7. RETURNING 子句
+### 6.2 RETURNING 子句
 
 `INSERT/UPDATE/DELETE RETURNING` 全支持：
 
@@ -639,176 +792,9 @@ DELETE FROM bs_pd_multi WHERE id = 32 RETURNING id, grp, score;
 (1 row)
 ```
 
-## 8. Data-Modifying CTE：明确 ERROR
+### 6.3 Applying 防护 + Kickout 失效 & 新 helper
 
-CTE 里嵌入 DML 再外层 SELECT 不允许：
-
-```sql
-WITH u AS (UPDATE products SET price=price+1 RETURNING id, price)
-SELECT * FROM u;
-ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RETURNING)
-        is not supported inside an active branch. Use top-level DML with RETURNING instead.
-```
-
-替代方案：直接 top-level DML 加 `RETURNING`（见 §7）。
-
----
-
-## 9. 暂不支持的场景（明确报错）+ 已实装 UPSERT
-
-以下场景会**明确拒绝**（不会静默穿透到 Main）：
-
-| 场景 | 行为 | 典型错误 |
-|------|------|----------|
-| 对**无主键**表写 DML | 立即拒绝 | `overlay_serialize_pk requires a primary key on ...` |
-| 分支内 DDL（CREATE/ALTER/DROP TABLE 等）| 拒绝，提示退回 Main | `§A7 DDL RESTRICTED 0A000`（见 §15）|
-| `INSERT ... ON CONFLICT` (UPSERT) | **已支持**（见 §9.1）| N/A |
-| **分区表** | 拒绝 | `overlay_branch does not support partitioned tables` |
-| **FK 级联写** | 拒绝 | `cannot modify via FK-triggered write` |
-| 直接写 `pg_branch` / `pg_branch_delta` | 拒绝 | PG 原生视图错误 |
-| 对 VIEW / MATVIEW / FOREIGN TABLE 写 DML | 拒绝 | guard 拦截 |
-| **COPY FROM / MERGE / Data-Modifying CTE** | 拒绝 | `0A000 feature_not_supported` |
-| **UPDATE SET pk_col = ...**（改主键）| 拒绝 | `Updating the PRIMARY KEY column ... is not supported` |
-| 权限不足调用 use/apply/discard/create | 拒绝 | `42501 insufficient_privilege` |
-
-### 9.1 UPSERT 实装示例
-
-`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`（针对 PK 冲突）在分支内正常工作：
-
-```sql
-SELECT create_branch('br_upsert_demo');
-SELECT use_branch('br_upsert_demo');
-
--- ON CONFLICT DO NOTHING：撞 PK → NOP
-INSERT INTO products VALUES (1, 'NewApple', 999) ON CONFLICT (id) DO NOTHING;
-INSERT 0 0
-SELECT * FROM products WHERE id = 1;
- id | name  | price
-----+-------+-------
-  1 | Apple |    10
-
--- ON CONFLICT DO UPDATE：撞 PK → 以 EXCLUDED 新值更新
-INSERT INTO products VALUES (3, 'Cherry_v2', 222)
-  ON CONFLICT (id) DO UPDATE SET name  = EXCLUDED.name,
-                                  price = EXCLUDED.price;
-INSERT 0 1
-SELECT * FROM products WHERE id = 3;
- id |   name    | price
-----+-----------+-------
-  3 | Cherry_v2 |   222
-
--- 撞分支自己的 pure-origin INSERT
-INSERT INTO products VALUES (100, 'First', 1) ON CONFLICT (id) DO NOTHING;
-INSERT INTO products VALUES (100, 'Dupe',  2) ON CONFLICT (id) DO NOTHING;
-INSERT 0 0
-SELECT * FROM products WHERE id = 100;
- id  | name  | price
------+-------+-------
- 100 | First |     1
-```
-
-### 9.2 支持矩阵
-
-| 能力项 | 状态 |
-| --- | --- |
-| plain INSERT/UPDATE/DELETE | ✅ 支持 |
-| INSERT … ON CONFLICT（PK） | ✅ 支持 |
-| UPDATE/DELETE … RETURNING | ✅ 支持 |
-| WHERE pk = CONST | ✅ 推荐路径 |
-| Seq scan / range pred | ✅ 支持 |
-| 分支内 TEMP 表操作 | ✅ 支持（白名单）|
-| CREATE TABLE / ALTER / DROP / CREATE INDEX / DROP TRIGGER | ❌ 0A000（退回 Main 执行）|
-| 分区表 | ❌ 拒绝 |
-| FK 级联写 | ❌ 拒绝 |
-| COPY FROM / MERGE / Data-Modifying CTE | ❌ 拒绝 |
-| UPDATE SET pk_col | ❌ 拒绝（用 DELETE + INSERT 替代）|
-| 无 PK 表写 DML | ❌ 拒绝 |
-
-RESTRICTED 项处理建议：
-
-| 受限项 | 用户替代方案 |
-| --- | --- |
-| DDL | 先在 Main 执行 DDL → 重新 create_branch |
-| COPY FROM | 改写为多行 `INSERT INTO t VALUES (...), (...)` |
-| MERGE | 拆成独立 INSERT ON CONFLICT / UPDATE / DELETE |
-| Data-Modifying CTE | 改 top-level DML + RETURNING |
-| UPDATE pk | 改 `DELETE WHERE pk=old` + `INSERT VALUES (new_pk, ...)` |
-| FK 级联写 | 应用层显式先写子表再写父表 |
-
----
-
-## 10. Snapshot vs Live 两种分支语义对比
-
-同一 branch 可以在不同 session 里分别以 snapshot 或 live 方式进入。
-
-### 10.1 典型场景对比
-
-| 维度 | mode='live'（默认） | mode='snapshot' |
-|------|---|---|
-| **MAIN 表的旧行**（没被自己写过） | 始终跟随 Main 最新提交 | **冻结**在进入那一刻的快照 |
-| **分支自己写的行** | 始终可见 | 始终可见 |
-| **同一 branch 其他 session 新写的行** | 始终可见 | 始终可见 |
-| **典型场景** | Agent 协作工作区；保留自己改的同时看别人的新提交 | 报表 / 离线分析；MAIN 数据在查询期间不漂移 |
-| **怎么进入** | `use_branch('b')` 或 `use_branch('b','live')` | `use_branch('b','snapshot')` |
-
-### 10.2 同一 MAIN 变化下的感知差异
-
-```sql
--- 准备
-SELECT use_branch(NULL);
-TRUNCATE products;
-INSERT INTO products VALUES (1,'A',10),(2,'B',5),(3,'C',20);
-SELECT create_branch('b_snap');
-
--- s1: snapshot 会话
-SELECT use_branch('b_snap', 'snapshot');
-SELECT * FROM products ORDER BY id;
--- 看到 MAIN baseline: A(10), B(5), C(20)
-
--- s2: live 会话在 MAIN 写入（另一个 psql 连接）
-SELECT use_branch(NULL);
-INSERT INTO products VALUES (4,'D',30);
-UPDATE products SET price=9999 WHERE id=3;
-COMMIT;
-
--- 回到 s1: snapshot 会话
-SELECT * FROM products ORDER BY id;
--- id | name | price      （MAIN 冻结！）
---  1 |  A   | 10
---  2 |  B   |  5         看不到 MAIN id=4/D；id=3 仍为 20
---  3 |  C   | 20
--- (3 rows)
-
--- s3: 同一 branch live 方式进入
-SELECT use_branch(NULL);
-SELECT use_branch('b_snap', 'live');
-SELECT * FROM products ORDER BY id;
--- id | name | price
---  1 |  A   |   10
---  2 |  B   |    5         LIVE：id=4 看到了！id=3 涨价到 9999 了！
---  3 |  C   | 9999
---  4 |  D   |   30
--- (4 rows)
-```
-
-### 10.3 分支内自写 delta 均可见（两种语义一致）
-
-```sql
-SELECT use_branch('b_snap', 'snapshot');
-UPDATE products SET price=7 WHERE id=2;
-INSERT INTO products VALUES (99, 'Mine', 1);
-SELECT * FROM products ORDER BY id;
--- 1|A|10       (MAIN frozen)
--- 2|B|7        (自己的 delta)
--- 3|C|20       (MAIN frozen)
--- 99|Mine|1    (自己的 delta)
-```
-
----
-
-## 11. Applying 防护 + Kickout 失效 & 新 helper
-
-### 11.1 两个失效检查 SQL helper
+#### 6.3.1 两个失效检查 SQL helper
 
 | 函数 | 返回值 | 用途 |
 |---|---|---|
@@ -837,7 +823,7 @@ SELECT current_branch();
                 (空 — 已回 Main)
 ```
 
-### 11.2 跨会话 Apply/Discard 后 DML Kickout
+#### 6.3.2 跨会话 Apply/Discard 后 DML Kickout
 
 分支一旦被别的会话 apply/discard，当前 session 下一条 **DML** 会被 `ERRCODE 55000` 拦截并踢出分支。
 DQL（纯 SELECT）则只给 NOTICE + fallback，不会报错。
@@ -865,7 +851,7 @@ SELECT current_branch() = '';
  t
 ```
 
-### 11.3 Applying 状态期间 DML 阻塞
+#### 6.3.3 Applying 状态期间 DML 阻塞
 
 apply_branch() 执行期间，状态先变为 `applying`，直到合并成功后变为 `applied`。
 此窗口内其他 session 在该分支里的 DML 会被阻塞：
@@ -877,7 +863,7 @@ ERROR:  overlay_branch: state of branch "b_large" is 'applying'; write to delta
 HINT:  ERRCODE 55000.
 ```
 
-### 11.4 DO block 包裹重试模板
+#### 6.3.4 DO block 包裹重试模板
 
 ```sql
 DO $$
@@ -900,9 +886,7 @@ BEGIN
 END $$;
 ```
 
----
-
-## 12. list_branches() 身份与 drift guard 字段
+### 6.4 list_branches() 身份与 drift guard 字段
 
 `list_branches()` 一次调用返回生命周期 + 恢复身份 + MAIN schema 漂移自检：
 
@@ -915,9 +899,7 @@ SELECT branch_id, branch_name, state,
 
 若 `registry_schema_current_match = false`，说明 MAIN schema 已漂移（有人在 Main 上改了受管表结构），apply 时可能产生错误结果。**推荐流程**：先 discard 该分支，重新 create，再重做修改；不要硬 apply。
 
----
-
-## 13. get_branch_identity() — 身份与恢复绑定
+### 6.5 get_branch_identity() — 身份与恢复绑定
 
 纯读 helper，用于 apply 前自检 drift：
 
@@ -937,9 +919,7 @@ SELECT * FROM public.get_branch_identity('agent_workspace');
 
 若 `registry_schema_current_match = false`，说明存在 drift，不能 apply，必须人工处理。
 
----
-
-## 14. 空分支 Apply/Discard 快速返回
+### 6.6 空分支 Apply/Discard 快速返回
 
 对于**非当前激活**的空分支（delta 为 0），apply/discard 会快速返回，不产生 `NOTICE: overlay_branch: APPLY BRANCH ...` 提示：
 
@@ -960,9 +940,7 @@ END $$;
 
 非空分支或当前激活分支的 apply/discard 仍走完整路径，所有 NOTICE 不变。
 
----
-
-## 15. 活动分支内 DDL RESTRICTED
+### 6.7 活动分支内 DDL RESTRICTED
 
 进入 active branch 后，对 Main 用户对象的 DDL 会被拒绝，报错 `0A000`：
 
