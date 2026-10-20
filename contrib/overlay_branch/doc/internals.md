@@ -37,7 +37,9 @@ PK 是分支内**行的唯一身份标识**，贯穿整个实现：
 | UPSERT 冲突判定 | INSERT 时用 PK 分别查 delta 和 MAIN，决定 4-way promotion |
 | apply 冲突检测 | `old_version = ctid:xmin` token，apply 时比对 MAIN 当前行的 ctid+xmin |
 
-**无 PK 表直接拒绝**（Step7 G5 guard），不做任何 fallback。
+**无 PK 表默认拒绝**（Step7 G5 guard）。例外：GUC `overlay_branch.keyless_tables=on` 时改走
+**ctid 物理锚点身份**（`A:<blk>:<off>` / `S:<seq>`，见 [keyless_ctid_design.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/keyless_ctid_design.md)），
+仅在无 PK 表中生效；有 PK 表仍走 PK 身份（PK 优先，不受该 GUC 影响）。
 
 ### 1.2 增量写的实现方式
 
@@ -228,7 +230,7 @@ overlay_write_redirect_enter()       // 恢复
 | G2 | `relispartition`（分区子表）|
 | G3 | 用户触发器（非 internal）|
 | G4 | FK（出向 + 被引用，SPI 查 pg_constraint）|
-| G5 | 无 PK |
+| G5 | 无 PK（例外：`overlay_branch.keyless_tables=on` 时放行，改走 ctid 锚点身份并输出一行 WARNING）|
 
 DDL guard（`overlay_guard_ddl_ok_for_branch`）拦截 CREATE/ALTER/DROP/TRUNCATE/INDEX/REINDEX/CLUSTER/VACUUM 等，**TEMP 表白名单**（session 私有，不写 Main）。
 
@@ -311,7 +313,7 @@ create_branch 时 throttled 检测是否有 FOR ALL TABLES / 含 overlay_branch 
 ## 5. 关键不变量汇总
 
 1. **MAIN heap 在分支内永不被写入** — 所有变更进 `pg_branch_delta`
-2. **无 PK 表直接拒绝** — 不做 fallback
+2. **无 PK 表默认拒绝** — 例外：`overlay_branch.keyless_tables=on` 时走 ctid 锚点身份（实验特性，best-effort）
 3. **planner hook 预检查顺序不可颠倒** — B0 → B1 → R16 → B2 → is_active
 4. **GUC check hook 无副作用** — assign hook 才做真实操作
 5. **递归 guard 必须 PG_TRY 保护** — 异常路径也要清

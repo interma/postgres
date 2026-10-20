@@ -147,6 +147,7 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
     Relation    rel;
     TupleDesc   reldesc;
     int         natts;
+    bool        rel_has_pk_;
     List       *delta_list;
     List       *result_slots = NIL;
     const char *q_nspname;
@@ -159,6 +160,7 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
     rel = table_open(relid, AccessShareLock);
     reldesc = RelationGetDescr(rel);
     natts = reldesc->natts;
+    rel_has_pk_ = overlay_relation_has_pk(rel);
 
     /* P0 PK-IndexScan MVP: 选 delta 加载策略 */
     if (has_pk_pred && pk_serialized_key != NULL && pk_serialized_key[0] != '\0')
@@ -557,9 +559,28 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
             ExecStoreVirtualTuple(main_slot);
             main_slot->tts_nvalid = natts;
 
-            pk_key = overlay_serialize_pk(rel, main_slot);
-            main_typed_pk = overlay_build_typed_pk_from_slot(rel, main_slot,
-                                                              &main_typed_n);
+            if (rel_has_pk_)
+            {
+                pk_key = overlay_serialize_pk(rel, main_slot);
+                main_typed_pk = overlay_build_typed_pk_from_slot(rel, main_slot,
+                                                                  &main_typed_n);
+            }
+            else
+            {
+                /* Keyless: anchor key from the MAIN row's physical ctid;
+                 * SPI preserves t_self for plain seqscan result rows. */
+                ItemPointerData ip_ = htups[i]->t_self;
+
+                pk_key = NULL;
+                main_typed_pk = NULL;
+                main_typed_n = 0;
+                if (ItemPointerIsValid(&ip_) &&
+                    ItemPointerGetBlockNumber(&ip_) != InvalidBlockNumber &&
+                    ItemPointerGetOffsetNumber(&ip_) != 0)
+                    pk_key = psprintf("A:%u:%u",
+                                      ItemPointerGetBlockNumber(&ip_),
+                                      ItemPointerGetOffsetNumber(&ip_));
+            }
 
             match = NULL;
             if (pk_key != NULL && arr != NULL && M_total > 0)
@@ -721,6 +742,17 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
                 if (emit_flags[i])
                 {
                     TupleTableSlot  *new_slot;
+
+                    /* keyless: an un-matched anchored delta ("A:...") is
+                     * an orphan whose MAIN row was concurrently changed or
+                     * removed; emitting it would resurrect/duplicate a row,
+                     * so drop it (doc/keyless_ctid_design.md 3.6). */
+                    if (!rel_has_pk_ && dt->key != NULL &&
+                        dt->key[0] == 'A' && dt->key[1] == ':')
+                    {
+                        i++;
+                        continue;
+                    }
                     if (dt->tuple_data == NULL)
                     {
                         i++;
@@ -1019,7 +1051,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         bool        has_general_where = false;
         char       *general_where_sql = NULL;
 
-        if (!overlay_relation_has_pk(reln))
+        if (!overlay_relation_has_pk(reln) && !overlay_keyless_tables)
         {
             table_close(reln, NoLock);
             return;

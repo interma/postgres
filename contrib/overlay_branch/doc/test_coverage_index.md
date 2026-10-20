@@ -1,6 +1,6 @@
-# Overlay Branch 测试覆盖索引 (22 entries: 13 L3 + 9 L1)
+# Overlay Branch 测试覆盖索引 (26 entries: 14 L3 + 12 L1)
 
-> L3 = pg_regress 单会话 SQL 文件 (13 个)；L1 = isolationtester 多会话隔离测试 (9 个 specs)。
+> L3 = pg_regress 单会话 SQL 文件 (14 个)；L1 = isolationtester 多会话隔离测试 (12 个 specs)。
 
 | 文件名 (去掉前缀/后缀) | 中文覆盖范围 (30-60 字) | 对应 Rxx / Gxx / Bxx 编号 |
 |----------|-------------------------|------------------------|
@@ -15,8 +15,9 @@
 | puredelta_mix (L3) | 混合 Pure-delta (主表有行) + INSERT promotion 4-phase + MAIN key 冲突预检 | B1 promotion rules + R21 INSERT pre-check |
 | rentry (L3) | R03/R05/R06/R16/R19 入口漂移写负向 + R21 INSERT 约束 5 子用例 + §G02 ACL 10 子用例 (A1..E) + §G01 SCOPE 10+1 负向/基线 (A..Z) + Section 12 **A7 schema epoch registry × 12 subcases (D1-D12)**: D2 bool_or 存在性 / D5 CREATE→增量→DROP→55000 drift / D6 DROP+recreate→discard→fresh / D11 exit-before-discard / D12 UPDATE-exit+re-apply + **R23** schema drift 55000 / **R24** DDL restricted §A7 0A000 + **§D4 A9 pg_branch identity & restore metadata × 8 subcases**: A9_1 4 cols NOT NULL / A9_2 list_branches 暴露 11 col / A9_3 MD5 宽 16B / A9_4 creation xmin 同 tx / A9_5 get_branch_identity() 7-tuple match / A9_6 registry_current_match TRUE / A9_7 count≥3 / A9_8 old ABI NULL compat | R03/R05/R06/R16/R19/R21 + §G02 S13 全矩阵 + §G01 MVP RESTRICTED 7 categories + **R23 (A7 schema epoch registry drift)** + **R24 (A7 DDL restricted 0A000)** + **R25 (A9 identity & restore metadata drift-guard)** |
 | upsert (L3) | 完整 B2 UPSERT：INSERT ON CONFLICT DO NOTHING / DO UPDATE 针对 PK 的 2-phase 23505 双侧冲突检测 | B2 (upsert impl) |
-| **a2 (L3)** | D-2 review_260926 A2 Read/Write View Unification：A2.1 self-join (SJ1 12-pair / SJ2 baseline-EXCEPT-0 / SJ3 visual) / A2.3 SAME-CSS ReScan 3×14 deterministic proof / A2.4 non-lateral NL no-crash / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions (CUR1 14rows / CUR2 id=3 NOT EXISTS / CUR3 amt=111,112) | §A2 architecture (OPEN → ✅) |
+| **view_unify (L3)** | D-2 review_260926 A2 Read/Write View Unification：A2.1 self-join (SJ1 12-pair / SJ2 baseline-EXCEPT-0 / SJ3 visual) / A2.3 SAME-CSS ReScan 3×14 deterministic proof / A2.4 non-lateral NL no-crash / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions (CUR1 14rows / CUR2 id=3 NOT EXISTS / CUR3 amt=111,112) | §A2 architecture (OPEN → ✅) |
 | **planner_cost (L3)** | D-3 review_260926 A8 MVP cost_branchscan cost model：A8.1 SEQ scan cost != 0.00 / A8.2 PK scan cost << seq / A8.3 SELF-JOIN 2× BranchScan 节点 + SJ correctness 210 pairs；standalone 验证 add_path→lappend 关键根因修复（real cost 静默 reject 旁路 delta merge） | §A8 architecture (OPEN → ✅) + R11/R12 complexity estimate proof |
+| **keyless (L3)** | B6 无 PK 表 ctid 实验特性：GUC off 拒绝 0A000 / on 一行 WARNING + 正确叠加读写 / apply 落地 + 二次 apply 阻止 / 并发 MAIN 改写锚点行 → apply 冲突且保留 MAIN / PK 表路径不受 GUC 影响 / keyless UPSERT 0A000 | B6 (keyless ctid identity) + §R8 G5 例外 |
 | ob_apply_mutex (L1) | isolationtester: 2 session 并发 apply 同一 branch → CAS loser 55000, winner 成功; delta 写入期间状态 guard | S16 FR3 CAS + R17 write-set freeze |
 | ob_state_inval (L1) | isolationtester: apply/discard 后 LISTEN ob_branch_state payload `<bid>:<new_state>` 广播; 相邻 session is_active() 立即失效节流重查 | S13 FR1 NOTIFY + FR4 throttled catalog recheck |
 | ob_applying_freeze (L1) | isolationtester: APPLY 过程 MAIN 并发读/写 freeze 边界; discarded/applied 终态禁止二次 apply/discard | S04 Apply freeze § + FR1/FR5 boundary + R17 applying state guard |
@@ -26,3 +27,6 @@
 | pure_delta_update (L1) | isolationtester: pure-delta table 并发 UPDATE SET v=v+1 同键 2-way 冲突 latest-wins 无写穿 MAIN | S08 pure-delta update pass + R02 chain |
 | pure_delta_delete (L1) | isolationtester: pure-delta table 并发 DELETE + INSERT reborn 同键互斥，MAIN 始终零污染 | S08 pure-delta delete pass + R04 state transitions |
 | **ob_view_unify_rescan (L1)** | D-2 A2.3 SAME-CSS deterministic ReScan proof: ctrl 写 14 overlay → s1 NL LATERAL 3 outer → g=1/2/3 inner_cnt 恒 = 14（若 rescan 4-step 合约漏掉 cursor-reset → 2/3 次 inner_cnt=0 → FAIL） | §A2 architecture A2.3 (OPEN → ✅) + S07 ob_branchscan_rescan 4-step contract verification
+| **keyless_basic (L1)** | B6 keyless（GUC on）多会话：首次 DML 各 session 一行 WARNING + 读写叠加一致（'a,b2,x'） + 并发双分支互不可见 + MAIN 纯净 + apply 落地 + PK 表路径不受 GUC 影响 | B6 (keyless ctid identity) + §R8 G5 例外 |
+| **keyless_pure_delta_repeat (L1)** | B6 pure-delta 合成键 `S:<seq>` 稳定：分支内 INSERT 行连续 3 次 UPDATE 不产生重复行（count=3 且 'm1,m2,p1c'）+ DELETE 合成行 + 并发分支 `S:` 命名空间隔离 + MAIN 零污染 | B6 (synthetic key propagation) + §3.5 key 传播 |
+| **keyless_apply_conflict (L1)** | B6 跨会话 apply 冲突：s1 分支锚定 MAIN 行 → s2 并发改写该行致 ctid 变化 → s1 apply 报 0A000、分支保持 active、MAIN 保留并发写；随后非冲突分支正常 apply（正反对照） | B6 (apply-time conflict) + §3.6 静默丢 delta 兜底 |

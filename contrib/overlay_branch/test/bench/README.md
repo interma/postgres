@@ -1,9 +1,9 @@
 # T8 L2 pgbench 并发压测 Fixture（非门禁，手动调试用）
 
-> R7 约束重申：正确性第一，性能第二。**本 L2 fixture 不是 `make check` 门禁**（门禁 = L1 5/5 isolation specs + L3 4/4 pg_regress = 9/9 全绿），仅在下列场景才需要手动跑：
+> R7 约束重申：正确性第一，性能第二。**本 L2 fixture 不是 `make check` 门禁**（门禁 = L1 12/12 isolation specs + L3 14/14 pg_regress），仅在下列场景才需要手动跑：
 > - 想对 FR2 V1 锁协议做高并发压力测试（CAS winner/loser 高频）
 > - 想概率性触发 NOTIFY 路径（长连接 LISTEN 稳定）
-> - 想复现 edge-case race 但 L1 9 permutations 无法覆盖时
+> - 想复现 edge-case race 但 L1 12 specs 无法覆盖时
 
 ---
 
@@ -131,11 +131,11 @@ SELECT count(*) AS sessions_in_branch FROM pg_stat_activity
 ## 与 L1 / L3 门禁的关系图
 
 ```
-[L1 pg_isolation 5 specs 9 permutations] —— "所有并发关键拓扑精确调度"
+[L1 pg_isolation 12 specs] —— "所有并发关键拓扑精确调度"
          │  (FR2/FR3/FR4/FR5/FR6 逐条语义 verify)
          ▼
-[L3 pg_regress 4 suites (basic/user/advanced/mvcc)] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
-         │  (本扩展 make check 默认门禁 = L1 + L3 合计 9/9 zero-diff 2×)
+[L3 pg_regress 14 suites] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
+         │  (本扩展 make check 默认门禁 = L1 + L3 合计 26/26 zero-diff 2×)
          ▼
 [L2 pgbench (本目录, 手动)] —— "高并发真实负载下的正确性兜底 sanity check"
          │  (NOT 门禁。用于性能探索 / 触发 L1/L3 没测到的边缘 race)

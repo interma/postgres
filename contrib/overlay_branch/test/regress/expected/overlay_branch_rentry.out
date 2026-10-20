@@ -75,15 +75,9 @@ SELECT overlay_branch.use_branch('br_r_entry');
 COPY public.r_entry_t (pk_id, v, note) FROM STDIN;
 ERROR:  overlay_branch MVP does not support COPY FROM inside a branch (R05 drift-write blocked)
 HINT:  Use INSERT ... VALUES / INSERT ... SELECT instead.  COPY FROM bypasses WriteRedirect and would silently write MAIN.
-100	1000	should_be_blocked
-\.
-invalid command \.
 -- After the COPY error the transaction is in aborted state; we COMMIT
 -- to reset then check MAIN baseline.
 COMMIT;
-ERROR:  syntax error at or near "100"
-LINE 1: 100 1000 should_be_blocked
-        ^
 BEGIN;
 SELECT CASE WHEN count(*) = 2 THEN 'PASS:R05_COPY_NO_ROWS_ADDED'
             ELSE 'FAIL:R05 count=' || count(*) END AS r05_cnt

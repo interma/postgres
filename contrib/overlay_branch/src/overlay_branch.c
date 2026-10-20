@@ -75,6 +75,13 @@ PG_MODULE_MAGIC;
 char	   *overlay_branch_current_name = NULL;
 bool		overlay_branch_enabled = true;
 
+/* Experimental keyless-table support (see doc/keyless_ctid_design.md).
+ * When false (default) a table without a PRIMARY KEY is rejected by the
+ * G5 guard exactly as before.  When true the extension falls back to a
+ * best-effort physical (ctid, xmin) row identity, emitting a one-shot
+ * WARNING the first time such a table is touched in a session. */
+bool		overlay_keyless_tables = false;
+
 /* ================================================================
  * V3 multi-session tuning GUCs
  * ================================================================ */
@@ -276,6 +283,21 @@ _PG_init(void)
 							 NULL,
 							 &overlay_branch_enabled,
 							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/* Experimental: allow branch-mode DML on tables WITHOUT a PRIMARY
+	 * KEY by falling back to a best-effort physical (ctid, xmin) row
+	 * identity.  Off by default: a no-PK table is rejected by the G5
+	 * guard exactly as before.  See doc/keyless_ctid_design.md. */
+	DefineCustomBoolVariable("overlay_branch.keyless_tables",
+							 "Allow branch-mode DML on tables without a PRIMARY KEY using an experimental ctid-based row identity.",
+							 "Off (default): a table without a PRIMARY KEY is rejected (0A000).  On: a one-shot WARNING is emitted and rows are tracked by physical ctid (unsafe under concurrent MAIN writes; conflict detected only at apply time).",
+							 &overlay_keyless_tables,
+							 false,
 							 PGC_SUSET,
 							 0,
 							 NULL,
@@ -801,9 +823,9 @@ overlay_guard_rel_ok(Relation rel, char **reason)
 		}
 	}
 
-	if (!overlay_relation_has_pk(rel))
+	if (!overlay_relation_has_pk(rel) && !overlay_keyless_tables)
 	{
-		if (reason) *reason = psprintf("table must have a PRIMARY KEY for branch-mode DML (V1 constraint)");
+		if (reason) *reason = psprintf("table must have a PRIMARY KEY for branch-mode DML (V1 constraint; enable overlay_branch.keyless_tables for the experimental ctid fallback)");
 		return false;
 	}
 
@@ -1749,7 +1771,7 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("overlay_main_plus_delta: no active branch"),
 					 errhint("Call use_branch('name') first.")));
-		if (!overlay_relation_has_pk(rel))
+		if (!overlay_relation_has_pk(rel) && !overlay_keyless_tables)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("overlay_main_plus_delta requires a primary key on %s",

@@ -3,7 +3,7 @@
 > 本文档从**用户视角**描述 Overlay Branch 扩展的 SQL 接口和行为。
 > 文中所有示例均可直接在 psql 里复现。
 >
-> **范围**：仅支持**有主键的普通 heap 表**；用函数调用代替自定义 SQL 语法。
+> **范围**：仅支持普通 heap 表；默认须有主键，无 PK 表见 §6.8 实验特性。用函数调用代替自定义 SQL 语法。
 
 ---
 
@@ -43,6 +43,7 @@
   - [6.5 get_branch_identity() — 身份与恢复绑定](#65-get_branch_identity--身份与恢复绑定)
   - [6.6 空分支 Apply/Discard 快速返回](#66-空分支-applydiscard-快速返回)
   - [6.7 活动分支内 DDL RESTRICTED](#67-活动分支内-ddl-restricted)
+  - [6.8 无 PK 表（实验特性）](#68-无-pk-表实验特性)
 
 ---
 
@@ -546,7 +547,7 @@ HINT:  Row was modified in Main after branch wrote it.
 
 | 场景 | 行为 | 典型错误 |
 |------|------|----------|
-| 对**无主键**表写 DML | 立即拒绝 | `overlay_serialize_pk requires a primary key on ...` |
+| 对**无主键**表写 DML | 默认拒绝（见 §6.8）| `table must have a PRIMARY KEY for branch-mode DML ...` |
 | 分支内 DDL（CREATE/ALTER/DROP TABLE 等）| 拒绝，提示退回 Main | `§A7 DDL RESTRICTED 0A000`（见 §6.7）|
 | `INSERT ... ON CONFLICT` (UPSERT) | **已支持**（见 §5.1）| N/A |
 | **分区表** | 拒绝 | `overlay_branch does not support partitioned tables` |
@@ -621,7 +622,7 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 | FK 级联写 | ❌ 拒绝 |
 | COPY FROM / MERGE / Data-Modifying CTE | ❌ 拒绝 |
 | UPDATE SET pk_col | ❌ 拒绝（用 DELETE + INSERT 替代）|
-| 无 PK 表写 DML | ❌ 拒绝 |
+| 无 PK 表写 DML | ❌ 默认拒绝；`overlay_branch.keyless_tables=on` 时 ✅（实验，见 §6.8）|
 
 RESTRICTED 项处理建议：
 
@@ -982,3 +983,50 @@ SELECT use_branch('b_order_work');
 INSERT INTO orders VALUES (1, 99.0);
 UPDATE products SET stock = 10 WHERE id = 1;
 ```
+
+### 6.8 无 PK 表（实验特性）
+
+无 PK 表的 DML **默认被拒绝**（见 §5.3）。设置 `overlay_branch.keyless_tables = on` 后，扩展会给出一行 WARNING，并改用行的物理位置作为身份标识，使无 PK 表也能像 PK 表一样进入分支。
+
+```sql
+-- 默认（off）：无 PK 表写 DML 被拒绝
+CREATE TABLE logs (msg text);
+INSERT INTO logs VALUES ('boot');
+SELECT create_branch('b_logs');
+SELECT use_branch('b_logs');
+INSERT INTO logs VALUES ('x');
+ERROR:  overlay_branch: cannot INSERT relation  inside active branch "b_logs":
+        table must have a PRIMARY KEY for branch-mode DML (V1 constraint;
+        enable overlay_branch.keyless_tables for the experimental ctid fallback)
+DETAIL:  Target relation: logs.
+```
+
+```sql
+-- 开启实验开关后：一行 WARNING + 正常读写叠加
+SET overlay_branch.keyless_tables = on;
+INSERT INTO logs VALUES ('x');
+WARNING:  overlay_branch: table "public.logs" has no PRIMARY KEY; using
+          experimental ctid-based row identity (overlay_branch.keyless_tables=on)
+INSERT 0 1
+
+SELECT * FROM logs;   -- Main('boot') ⊕ 分支('x')
+  msg
+-------
+ boot
+ x
+
+-- apply / discard 行为与 PK 表一致
+SELECT apply_branch('b_logs');
+```
+
+行为要点：
+
+| 项 | 行为 |
+|----|------|
+| 开关 | `overlay_branch.keyless_tables`（bool，默认 `off`，session 级 SET，需超级用户）|
+| WARNING | 每会话首次命中无 PK 表时输出一次 |
+| 读写叠加 | INSERT/UPDATE/DELETE/SELECT/apply/discard 与 PK 表一致 |
+| 行身份 | 基于行的**物理位置**（best-effort）：分支存活期间若其它会话改动了分支锚定的 Main 行，则 apply 会报冲突 |
+| UPSERT | `INSERT ... ON CONFLICT` 仍不支持，报 `0A000` |
+
+> 该特性不追求与 PK 表完全对等，仅建议用于实验 / 短期草稿场景；长期使用请为表补主键。设计与限制详见 [keyless_ctid_design.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/keyless_ctid_design.md)。

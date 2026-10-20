@@ -196,6 +196,7 @@ typedef struct DeltaTuple
  */
 extern char *overlay_branch_current_name;
 extern bool overlay_branch_enabled;
+extern bool overlay_keyless_tables;	/* experimental: ctid identity for no-PK tables */
 
 /* ----------
  * V3 multi-session tuning GUCs
@@ -406,6 +407,10 @@ extern char    *overlay_serialize_pk(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_serialize_tuple(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_tuple_version(Relation rel, TupleTableSlot *slot);
 extern bool		overlay_relation_has_pk(Relation rel);
+extern char    *overlay_serialize_identity(Relation rel, TupleTableSlot *slot, char op);
+extern char    *overlay_anchor_key_from_ctid(const char *ctid_cstr);
+extern char    *overlay_synthetic_key(int32 branch_id, Oid relid);
+extern void		overlay_keyless_warn_once(Relation rel);
 
 extern bool		overlay_get_pk_single_attno(Relation rel,
 											 AttrNumber *out_pk_attno,

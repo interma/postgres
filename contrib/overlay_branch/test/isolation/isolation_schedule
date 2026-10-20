@@ -9,3 +9,7 @@ test: ob_branchscan_rescan
 test: pure_delta_upsert
 test: pure_delta_update
 test: pure_delta_delete
+test: ob_view_unify_rescan
+test: keyless_basic
+test: keyless_pure_delta_repeat
+test: keyless_apply_conflict

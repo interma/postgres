@@ -819,6 +819,160 @@ overlay_relation_has_pk(Relation rel)
 	return found;
 }
 
+
+/* ================================================================
+ * Keyless (experimental) ctid row-identity helpers
+ * ----------------------------------------------------------------
+ * Only used when overlay_branch.keyless_tables = on AND the target
+ * relation has no PRIMARY KEY.  Row identity is either the physical
+ * MAIN anchor "A:<blk>:<off>" (for rows that exist in MAIN) or a
+ * synthetic per-(branch,rel) sequence "S:<seq>" (rows born inside the
+ * branch).  The tag prefix keeps these keys disjoint from the PK JSON
+ * keys (which always start with '[').  See doc/keyless_ctid_design.md.
+ * ================================================================ */
+
+/* Convert a ctid cstring "(blk,off)" to an anchor key "A:<blk>:<off>".
+ * Returns NULL when the input is NULL or not a parseable ctid. */
+char *
+overlay_anchor_key_from_ctid(const char *ctid_cstr)
+{
+	unsigned int blk;
+	unsigned int off;
+
+	if (ctid_cstr == NULL)
+		return NULL;
+	if (sscanf(ctid_cstr, "(%u,%u)", &blk, &off) != 2)
+		return NULL;
+	return psprintf("A:%u:%u", blk, off);
+}
+
+/* Allocate the next synthetic key "S:<seq>" for a keyless row born
+ * inside the branch.  seq = 1 + max(existing S: seq for this
+ * (branch,rel)).  Because delta rows are never physically removed until
+ * discard, this is monotonic within the branch lifetime. */
+char *
+overlay_synthetic_key(int32 branch_id, Oid relid)
+{
+	StringInfoData sql;
+	int			ret;
+	int64		next = 1;
+	char	   *sqlstr;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT COALESCE(MAX(substring(d.key from 3)::bigint), 0) + 1 "
+					 "FROM %s d WHERE d.branch_id = %d AND d.relid = %u "
+					 "AND d.key LIKE 'S:%%'",
+					 OBTABLE_DELTA, branch_id, (unsigned int) relid);
+	sqlstr = sql.data;
+
+	overlay_overlay_helper_enter();
+	ret = ob_spi_one_shot(sqlstr, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed == 1 &&
+		SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
+	{
+		bool		isnull;
+		Datum		v = SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			next = DatumGetInt64(v);
+	}
+	SPI_finish();
+	overlay_overlay_helper_exit();
+	pfree(sqlstr);
+
+	return psprintf("S:" INT64_FORMAT, (int64) next);
+}
+
+/* Emit the keyless-identity WARNING once per (session, relid). */
+void
+overlay_keyless_warn_once(Relation rel)
+{
+	static List *warned = NIL;
+	ListCell   *lc;
+	Oid			relid;
+	char	   *nspname;
+	MemoryContext oldcxt;
+
+	if (rel == NULL)
+		return;
+	relid = RelationGetRelid(rel);
+	foreach(lc, warned)
+	{
+		if (lfirst_oid(lc) == relid)
+			return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	warned = lappend_oid(warned, relid);
+	MemoryContextSwitchTo(oldcxt);
+
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+	ereport(WARNING,
+			(errmsg("overlay_branch: table \"%s.%s\" has no PRIMARY KEY; using experimental ctid-based row identity (overlay_branch.keyless_tables=on)",
+					nspname ? nspname : "?", RelationGetRelationName(rel)),
+			 errdetail("Row identity is the physical tuple location (ctid, xmin).  Concurrent UPDATE/DELETE on this table by other sessions may change a row's ctid and cause the branch to silently miss that row's delta (detected only at apply time as a conflict error)."),
+			 errhint("Add a PRIMARY KEY (or ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS IDENTITY PRIMARY KEY) to get durable row identity.")));
+}
+
+/* Unified write-side identity resolver.  Dispatches to the PK serializer
+ * when the relation has a PRIMARY KEY, otherwise falls back to the
+ * experimental ctid anchor / synthetic sequence (keyless mode). */
+char *
+overlay_serialize_identity(Relation rel, TupleTableSlot *slot, char op)
+{
+	char	   *ctid_cstr;
+	char	   *key;
+
+	Assert(rel != NULL && slot != NULL);
+
+	if (overlay_relation_has_pk(rel))
+		return overlay_serialize_pk(rel, slot);
+
+	if (!overlay_keyless_tables)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_serialize_identity: table %s has no PRIMARY KEY and overlay_branch.keyless_tables is off",
+						RelationGetRelationName(rel))));
+
+	/* Physical anchor first: UPDATE/DELETE and any MAIN-anchored row
+	 * carry a ctid either as a junk column or in tts_tid. */
+	ctid_cstr = slot_get_ctid_cstr(slot);
+	if (ctid_cstr == NULL)
+	{
+		ItemPointer ip = &(slot->tts_tid);
+
+		if (ItemPointerIsValid(ip) &&
+			ItemPointerGetBlockNumber(ip) != InvalidBlockNumber &&
+			ItemPointerGetOffsetNumber(ip) != 0)
+			ctid_cstr = psprintf("(%u,%u)",
+								 ItemPointerGetBlockNumber(ip),
+								 ItemPointerGetOffsetNumber(ip));
+	}
+
+	if (ctid_cstr != NULL)
+	{
+		key = overlay_anchor_key_from_ctid(ctid_cstr);
+
+		pfree(ctid_cstr);
+		if (key != NULL)
+			return key;
+	}
+
+	/* No physical origin: a brand-new row born inside the branch. */
+	if (op == DELTA_OP_INSERT)
+		return overlay_synthetic_key(overlay_branch_get_current_id(),
+									 RelationGetRelid(rel));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("overlay_serialize_identity: keyless %s on %s has no ctid anchor",
+					op == DELTA_OP_UPDATE ? "UPDATE" : "DELETE",
+					RelationGetRelationName(rel))));
+	return NULL;				/* unreachable */
+}
+
 /* ================================================================
  * PK / row 序列化 (JSON)
  * ================================================================ */
@@ -1206,9 +1360,14 @@ overlay_should_redirect(Relation rel)
 	if (rel->rd_rel->relkind != RELKIND_RELATION)
 		return false;
 
-	/* 第四层：无 PK 直接拒绝（Guard G6 在 ExecutorRun 入口已经 ERROR 了，这里保守 belt-and-braces） */
+	/* 第四层：无 PK 时默认拒绝（Guard G5 在 ExecutorRun 入口已经 ERROR 了，这里保守 belt-and-braces）。
+	 * keyless 实验模式下放行，并首次发出 §2.3 的一次性 WARNING。 */
 	if (!overlay_relation_has_pk(rel))
-		return false;
+	{
+		if (!overlay_keyless_tables)
+			return false;
+		overlay_keyless_warn_once(rel);
+	}
 
 	return true;
 }
@@ -1879,10 +2038,14 @@ overlay_build_typed_pk_from_key_text(Relation rel,
 	}
 	list_free(indexoids);
 	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("overlay_build_typed_pk_from_key_text requires PK on %s",
-						RelationGetRelationName(rel))));
+	{
+		/* Keyless (experimental ctid identity) relation: there is no
+		 * typed PK representation to build.  Return NULL (n=0) so
+		 * callers fall back to the text-key (strcmp) comparator,
+		 * which is the correct order for the "A:"/"S:" anchor keys. */
+		*out_n_pk = 0;
+		return NULL;
+	}
 	n_pk = pk_rel->rd_index->indnatts;
 	if (n_pk <= 0)
 	{

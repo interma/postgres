@@ -19,7 +19,7 @@
 -- 0) 前提：已 CREATE EXTENSION，且 postgresql.conf 设置了 shared_preload_libraries='overlay_branch'
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
 
--- 1) 建一张有主键的普通表（硬性要求：DML 表必须有 PK）
+-- 1) 建一张有主键的普通表（DML 表默认须有 PK；无 PK 表需开启实验 GUC，见「当前状态」）
 CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL);
 INSERT INTO products VALUES (1,'Apple',10), (2,'Banana',5), (3,'Cherry',20);
 
@@ -72,6 +72,7 @@ SELECT apply_branch('my_draft');
 | [doc/design.md](doc/design.md) | 整体架构与设计决策 |
 | [doc/internals.md](doc/internals.md) | 内部实现细节、corner case、关键不变量 |
 | [doc/branchscan.md](doc/branchscan.md) | BranchScan 节点内部实现 |
+| [doc/keyless_ctid_design.md](doc/keyless_ctid_design.md) | 无 PK 表 ctid 实验特性设计与限制 |
 | [doc/multi_session_mvcc.md](doc/multi_session_mvcc.md) | 跨会话并发：锁协议、失效机制、snapshot 语义 |
 | [doc/ops_runbook.md](doc/ops_runbook.md) | 运维手册：安装、故障排查、监控 |
 | [doc/test_coverage_index.md](doc/test_coverage_index.md) | 测试覆盖索引 |
@@ -84,8 +85,8 @@ overlay_branch/
 ├── include/          # C 头文件
 ├── src/              # C 源代码（5 个文件）
 ├── test/
-│   ├── regress/      # L3 pg_regress（11 套）
-│   ├── isolation/    # L1 pg_isolation_regress（8 套）
+│   ├── regress/      # L3 pg_regress（14 套）
+│   ├── isolation/    # L1 pg_isolation_regress（12 套）
 │   └── bench/        # L2 pgbench 压测
 ├── doc/              # 设计与示例文档
 ├── overlay_branch--1.0.sql
@@ -122,8 +123,9 @@ make check
 ## 当前状态
 
 - ✅ 核心功能全部交付：分支生命周期、透明读写叠加、apply/discard、snapshot/live 双模式
-- ✅ 测试绿标：L3 11/11 + L1 8/8 全 PASS（2× clean rebuild）
-- ⚠️ MVP 限制：仅支持有 PK 的普通 heap 表；不支持分区表、外键、MERGE、COPY FROM、Data-Modifying CTE 等（见 example_sql.md §5）
+- ✅ 测试绿标：L3 14/14 + L1 12/12 全 PASS（2× clean rebuild）
+- ⚠️ MVP 限制：默认仅支持有 PK 的普通 heap 表；不支持分区表、外键、MERGE、COPY FROM、Data-Modifying CTE 等（见 example_sql.md §5）
+- 🧪 实验特性：无 PK 表可通过 GUC `overlay_branch.keyless_tables=on` 开启 ctid 物理锚点身份（best-effort，默认关闭；见 [doc/keyless_ctid_design.md](doc/keyless_ctid_design.md)）
 
 ## 许可证
 

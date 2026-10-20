@@ -604,6 +604,7 @@ ob_mode_cache_remove(int32 bid)
 /* ============ Internal apply helpers (static to this TU) ============ */
 
 static char *ob_build_pk_where_clause(Relation rel, const char *pk_json_array);
+static char *ob_build_identity_where_clause(Relation rel, const char *key);
 static TupleTableSlot *ob_fetch_main_current_slot(Relation rel, const char *where_clause);
 static void apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_clause);
 static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt);
@@ -3075,6 +3076,41 @@ ob_build_pk_where_clause(Relation rel, const char *pk_json_array)
 }
 
 /*
+ * ob_build_identity_where_clause - keyless/ctid-aware apply row locator.
+ *
+ * Legacy PK tables store a JSON-array key and locate the MAIN row via
+ * ob_build_pk_where_clause().  Experimental keyless tables
+ * (overlay_branch.keyless_tables) store a tagged physical key instead:
+ *   "A:<blk>:<off>"  anchored to a MAIN row  -> ctid = '(blk,off)'::tid
+ *   "S:<seq>"        branch-only INSERT       -> no MAIN row; return NULL
+ * Returns a palloc'd WHERE clause, or NULL when there is nothing to locate
+ * on MAIN (callers treat NULL as "row absent").
+ */
+static char *
+ob_build_identity_where_clause(Relation rel, const char *key)
+{
+	Assert(key != NULL);
+
+	if (key[0] == 'A' && key[1] == ':')
+	{
+		unsigned int	blk = 0;
+		unsigned int	off = 0;
+
+		if (sscanf(key + 2, "%u:%u", &blk, &off) != 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("apply on %s: malformed keyless anchor key \"%s\"",
+							RelationGetRelationName(rel), key)));
+		return psprintf("ctid = '(%u,%u)'::tid", blk, off);
+	}
+
+	if (key[0] == 'S' && key[1] == ':')
+		return NULL;			/* synthetic branch-only row: no MAIN anchor */
+
+	return ob_build_pk_where_clause(rel, key);
+}
+
+/*
  * ob_fetch_main_current_slot: given pk WHERE clause, fetch MAIN row
  * and return a clean TupleTableSlot (or NULL).
  */
@@ -3369,15 +3405,9 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 				 errmsg("apply DELETE on %s: delta has empty key",
 						RelationGetRelationName(rel))));
 
-	elog(DEBUG1, "delpass[dbg] A2 build_pk_where");
-	where_clause = ob_build_pk_where_clause(rel, dt->key);
-	elog(DEBUG1, "delpass[dbg] A3 build_pk_where DONE where=%s", where_clause ? where_clause : "NULL");
-	if (where_clause == NULL || *where_clause == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("apply DELETE on %s: cannot build WHERE for pk=%s",
-						RelationGetRelationName(rel), dt->key)));
-
+	elog(DEBUG1, "delpass[dbg] A2 build_identity_where");
+	where_clause = ob_build_identity_where_clause(rel, dt->key);
+	elog(DEBUG1, "delpass[dbg] A3 build_identity_where DONE where=%s", where_clause ? where_clause : "NULL");
 	/* Pure-delta origin: old_version == NULL means this row never existed
 	 * on MAIN (it was INSERTed then DELETEd entirely inside the branch).
 	 * There is nothing to DELETE on MAIN; skipping prevents false-positive
@@ -3386,9 +3416,15 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 	{
 		elog(DEBUG1, "delpass[dbg] A4 pure-delta DELETE (no MAIN baseline) → NOP skip pk=%s",
 			 dt->key);
-		pfree(where_clause);
+		if (where_clause) pfree(where_clause);
 		return;
 	}
+
+	if (where_clause == NULL || *where_clause == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("apply DELETE on %s: cannot build WHERE for pk=%s",
+						RelationGetRelationName(rel), dt->key)));
 
 	elog(DEBUG1, "delpass[dbg] B fetch_main_slot");
 	main_slot = ob_fetch_main_current_slot(rel, where_clause);
@@ -3475,8 +3511,13 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 				 errmsg("apply UPDATE on %s: delta has NULL tuple_data for pk=%s",
 						RelationGetRelationName(rel), dt->key)));
 
-	where_clause = ob_build_pk_where_clause(rel, dt->key);
-	main_slot = ob_fetch_main_current_slot(rel, where_clause);
+	where_clause = ob_build_identity_where_clause(rel, dt->key);
+	/* A NULL clause means a keyless "S:" synthetic key: there is no MAIN
+	 * anchor, so behave as a missing MAIN row (the pure-delta branch below
+	 * then falls back to insert_pass). */
+	main_slot = (where_clause != NULL)
+		? ob_fetch_main_current_slot(rel, where_clause)
+		: NULL;
 	if (main_slot == NULL)
 	{
 		char	   *reason;
@@ -3488,13 +3529,13 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 		 * handle pure UPDATE when old_version empty by insert_pass". */
 		if (dt->old_version == NULL)
 		{
-			pfree(where_clause);
+			if (where_clause) pfree(where_clause);
 			apply_relation_insert_pass(rel, dt);
 			return;
 		}
 		reason = psprintf("UPDATE pk=%s MAIN row missing at apply time (concurrent DELETE)",
 						  dt->key);
-		pfree(where_clause);
+		if (where_clause) pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),
 								   reason);
@@ -3626,8 +3667,12 @@ apply_relation_insert_pass(Relation rel, DeltaTuple *dt)
 
 	if (dt->key != NULL && *dt->key != '\0')
 	{
-		where_clause = ob_build_pk_where_clause(rel, dt->key);
-		main_slot = ob_fetch_main_current_slot(rel, where_clause);
+		where_clause = ob_build_identity_where_clause(rel, dt->key);
+		/* NULL clause = keyless "S:" synthetic key (branch-only row); there
+		 * is no MAIN anchor to locate, so treat as row absent. */
+		main_slot = (where_clause != NULL)
+			? ob_fetch_main_current_slot(rel, where_clause)
+			: NULL;
 		if (main_slot != NULL)
 		{
 			char *reason = psprintf("INSERT pk=%s MAIN row already present (MAIN pk already contains this PK)",
@@ -3638,7 +3683,7 @@ apply_relation_insert_pass(Relation rel, DeltaTuple *dt)
 									   RelationGetRelationName(rel),
 									   reason);
 		}
-		pfree(where_clause);
+		if (where_clause) pfree(where_clause);
 	}
 
 	reldesc = RelationGetDescr(rel);

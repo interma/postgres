@@ -992,7 +992,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					}
 
 					elog(DEBUG2, "UD[dbg] G before serialize_pk");
-					pk = overlay_serialize_pk(rel, old_clean_slot);
+					pk = overlay_serialize_identity(rel, old_clean_slot, op);
 					elog(DEBUG2, "UD[dbg] H pk=%s", pk ? pk : "(null)");
 
 					overlay_delta_insert(overlay_branch_get_current_id(),
@@ -1112,6 +1112,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 #if PURE_DELTA_STEP >= 5
 					/* define early (cleanup block below uses it) */
 					struct WR_PDR1 { char *s; bytea *t; char *ov; };
+					struct WR_PDC1 { TupleTableSlot *slot; char *key; };
 #endif
 					int32 bid = overlay_branch_get_current_id();
 					Oid relid = RelationGetRelid(rel);
@@ -1236,7 +1237,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							{
 								TupleTableSlot *ps = reconstruct_slot_from_delta(rel,
 								                                                 dtu.tuple_data);
-								if (ps) cand_inserts = lappend(cand_inserts, ps);
+								if (ps)
+								{
+									struct WR_PDC1 *c1_ = (struct WR_PDC1 *) palloc0(sizeof(struct WR_PDC1));
+									c1_->slot = ps;
+									c1_->key = pstrdup(r->s);
+									cand_inserts = lappend(cand_inserts, c1_);
+								}
 							}
 						}
 						list_free(seen);
@@ -1292,7 +1299,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						econtext = scan_ps->ps_ExprContext;
 						foreach(lc, cand_inserts)
 						{
-							TupleTableSlot *slot = (TupleTableSlot*) lfirst(lc);
+							struct WR_PDC1 *c1_ = (struct WR_PDC1 *) lfirst(lc);
+							TupleTableSlot *slot = c1_->slot;
 							bool passes = true;
 							if (qual_scan != NULL || qual_extra != NULL)
 							{
@@ -1335,7 +1343,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							if (!passes) continue;
 							if (cmd == CMD_DELETE)
 							{
-								char *pk = overlay_serialize_pk(rel, slot);
+								char *pk = pstrdup(c1_->key);
 								ndone++;
 								/* Run overlay_delta_insert on per-query context to
 								 * avoid UB: CurrentMemoryContext at this point may
@@ -1622,7 +1630,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								ExecClearTuple(post_image);
 								ExecStoreHeapTuple(post_htup, post_image, true);
 
-								pk = overlay_serialize_pk(rel, post_image);
+								pk = pstrdup(c1_->key);
 								tdata = overlay_serialize_tuple(rel, post_image);
 
 								{
@@ -1682,8 +1690,12 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 #endif /* >=8 */
 						}
 						foreach(lc, cand_inserts)
-							ExecDropSingleTupleTableSlot(
-								(TupleTableSlot*) lfirst(lc));
+						{
+							struct WR_PDC1 *c1_ = (struct WR_PDC1 *) lfirst(lc);
+							if (c1_->slot) ExecDropSingleTupleTableSlot(c1_->slot);
+							if (c1_->key) pfree(c1_->key);
+							pfree(c1_);
+						}
 						list_free(cand_inserts);
 						cand_inserts = NIL;
 					}
@@ -1773,6 +1785,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						oc_action = ONCONFLICT_NOTHING;
 					}
 				}
+				/* keyless ctid mode has no PK to arbitrate ON CONFLICT against;
+				 * the 2-phase UPSERT conflict detector is PK-only.  Reject
+				 * explicitly (0A000) rather than silently mis-promoting. */
+				if (!overlay_relation_has_pk(rel) && oc_action != ONCONFLICT_NONE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("overlay_branch: INSERT ... ON CONFLICT (UPSERT) is not supported on a table without a PRIMARY KEY (overlay_branch.keyless_tables=on)"),
+							 errhint("Add a PRIMARY KEY, or rewrite the statement as a plain INSERT / UPDATE / DELETE.")));
+
 				{
 					const char *pk_colname_dummy = NULL;
 					if (!overlay_get_pk_single_attno(rel, (AttrNumber*) &pk_attno,
@@ -1800,7 +1821,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (count != 0 && ninserted >= count)
 					break;
 
-				pk = overlay_serialize_pk(rel, slot);
+				pk = overlay_serialize_identity(rel, slot, DELTA_OP_INSERT);
 				tdata = overlay_serialize_tuple(rel, slot);
 
 				/* ================================================================

@@ -12,7 +12,7 @@
 
 ---
 
-## 整体状态（2026-10-08 M3 MVP freeze — V4 全段主路径完成）
+## 整体状态（2026-10-16 — V4 全段主路径完成 + V5 B6 keyless）
 
 | 维度 | 当前状态 | 验收证据 |
 |------|---------|---------|
@@ -20,21 +20,26 @@
 | V3 multi-session MVCC T1 + T2 | ✅ 完成 (2026-09-14) | BranchContext 扩展、NOTIFY、阈值失效 |
 | V4 Review 260926 Batch 1–6 S 主路径 (S02–S10, S13–S14, S16–S18) | ✅ 17/31 CONTAINED | 见本文 V4 章节 |
 | 分类一 POC correctness：R01–R24 | ✅ **24/24 FIXED** | [review_260926_tracker.md](review/review_260926_tracker.md) |
-| 分类二 MVP 加固：G01/G02 | ✅ **2/6 FIXED MVP subset** | commit `0ec90f728a9` (G02 ACL double-defense) / `629d0ba227e` (G01 scope preflight) |
+| 分类二 MVP 加固：G01/G02 | ✅ **2/6 FIXED MVP subset** | G02 ACL double-defense / G01 scope preflight（详见下方 V4 章节） |
 | 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；A2 ✅ (Read/Write View Unification)；**A8 ✅ (MVP cost_branchscan cost model + planner correctness)**；**A9 ✅ (pg_branch identity & restore metadata: schema_hash/creation_snapshot_xmin/tablespace_list/col_signature, new get_branch_identity helper, 13+9 2x green)**；**A4 ✅ (SQL-layer empty-branch apply/discard fast-return wrapper, 10K-row 3-op 5 PASS markers, 13+9 2x green)**；A1/A6 ⚡ DEFER (M4+)；A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
 | 产品 P01–P03 / G03–G06 | ✅ P01/P02/P03 FIXED by 2026-10-11 trial run (10 PR 10/10 PASS: editor 100% / reviewer 10/10 pure-read / apply 100% / 0 silent-merge / 10 non-empty apply / 0 hidden catalog UPDATE; P02 weighted support 100% ≥80%). G03/G04/G06 remain 📌 MANIFEST (need real FAIL-case drill / M4+ owner fill / DBA live drill). G05 S28 ⚡ OPEN (100-concurrency baseline pending). | [example_sql §0.1 P01](example_sql.md#L68) / [§9.2 P02](example_sql.md#L870) / [agent_workflow §4 P03](agent_workflow.md#L151) / [ops_runbook G03-G06](ops_runbook.md) |
 | 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make USE_PGXS=1 PG_CONFIG=/tmp/pg17-writable/bin/pg_config -j` |
-| L3 单会话 pg_regress （13 files） | ✅ **13/13 PASS**，`diff -r results expected` = **0 lines**（2× consecutive stable R4/R5 后） | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) |
-| L1 isolationtester 多会话（9 specs） | ✅ **9/9 PASS**（2× consecutive stable 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / ob_view_unify_rescan |
+| L3 单会话 pg_regress （14 files） | ✅ **14/14 PASS**，`diff -r results expected` = **0 lines** | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) / **keyless** (B6 no-PK ctid identity: GUC off 0A000 / on WARNING+overlay / apply / conflict / PK path / UPSERT 0A000) |
+| L1 isolationtester 多会话（12 specs） | ✅ **12/12 PASS**（2× consecutive stable 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / ob_view_unify_rescan / **keyless_basic / keyless_pure_delta_repeat / keyless_apply_conflict** (B6 keyless ctid: GUC on WARNING + 读写叠加 + pure-delta 合成键幂等 + 跨会话 apply 冲突 0A000) |
 | 标签唯一性（G01_SCOPE_* × 11 + G02_* × 10 PASS） | ✅ 每个 label grep count = 2（1 SQL CASE WHEN token + 1 output row = 完美唯一） | rentry L3 out |
 | Shared-preload + extension script 重启闭环 | ✅ 每次 PG_CONFIG=/tmp/pg17-writable make install 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
 
-### 关键代码提交链（V3 之后）
+### 关键交付批次（V3 之后）
 
-1. `497ce4e9e4a` — squash 初始总 commit：3 commits + AGENTS/example_sql M 文件合并
-2. `ce9b72dfd84` — 5× squash Batch (G02/G01/A7)：G02 ACL double-defense / G01 scope preflight / A7 registry+DDL restricted / mvcc_review 3 syntax header / docs sync 11+8 baseline
-3. **TBD** — D-2 A2 Read/Write View Unification：A2.1 self-join 2 BranchScan independent (SJ1 pairs/SJ2 EXCEPT baseline) / A2.3 SAME-CSS NL LATERAL deterministic ReScan proof (3 outer × inner_cnt=14, 0-drop cursor-reset contract) / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions / A2.4 non-lateral NL no-crash count-match-baseline / + Makefile REGRESS/ISOLATION registration / 4 expected sync / 2× stable 12/12 L3 + 9/9 L1 0 diff
-4. **TBD** — D-3 A8 MVP cost model：cost_branchscan() O(M log M + N log M) 严格按 R11/R12（Phase A sort+dedup / Pass1 bsearch merge / Pass2 latest-wins linear chain）/ startup+total+rows != 0；PK fast-path 分支；critical add_path cost reject → lappend bypass 修复；13th L3 planner_cost（A8.1 SEQ cost≠0 / A8.2 PK cost << seq / A8.3 SJ 2× CustomScan + correctness 210 pairs）/ view_unify SJ expected 成本数值重同步；2× consecutive 13/13 L3 + 9/9 L1 0 diff
+> 相关改动常 squash 合并，故只记批次内容，不记 commit 号。
+
+1. **V3 Cat-1 收敛 + L3 拆分**：入口硬拦截等 14 项 correctness 修复 + G06 public-leak guard + R21 INSERT 前置检查 + AGENTS/example_sql 同步
+2. **G02/G01/A7 加固**：ACL 双层防御 / 分支作用域 preflight / schema epoch registry + DDL RESTRICTED
+3. **D-2 A2 读写视图统一**：self-join 2 BranchScan / SAME-CSS NL LATERAL ReScan / DECLARE-FETCH-MOVE cursor / 非 lateral NL 0-崩溃；Makefile REGRESS/ISOLATION 注册 + expected 同步
+4. **D-3 A8 MVP cost model**：cost_branchscan() O(M log M + N log M)，PK fast-path 分支，planner_cost L3（cost≠0 / PK<<SEQ / SJ 2× CustomScan）
+5. **A9 身份元数据 + A4 空分支 fast-return**：schema_hash / creation_snapshot_xmin 等 identity helper；SQL 层 empty-branch apply/discard wrapper
+6. **D-6/D-7 产品化 manifest + 真实试用**：P01–P03 试用闭环 + G03/G04/G06 manifest 归档
+7. **V5 B6 keyless（实验）**：无 PK 表 ctid 锚点身份 + GUC `overlay_branch.keyless_tables`（默认 off）
 
 ---
 
@@ -738,7 +743,7 @@ L3 限制：WITH HOLD/SCROLL WITHOUT HOLD/ORDER BY Sort/NL LATERAL 四种常见 
 - contrib/test_decoding 样例结构：`contrib/test_decoding/Makefile L9-12: ISOLATION = slot-creation-tables-catalogs ...`
 
 #### 8.2 Makefile 改造（Task 8 第一步，ISOLATION 变量 + isolation_schedule 新建 + REGRESS baseline 追加 mvcc suite）
-预期 Makefile patch（相对于 T6 commit c1a1a57）：
+预期 Makefile patch（相对于 T6 完成态）：
 ```makefile
 # contrib/overlay_branch/Makefile append
 ISOLATION            = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan
@@ -809,12 +814,12 @@ Section P PASS marker 之后追加 Section Q：
 
 ---
 
-## V4 — Review 260926 修复闭环（2026-09-26 → 2026-10-08，6 个独立 commit）
+## V4 — Review 260926 修复闭环（2026-09-26 → 2026-10-08）
 
 > V4 目标：把 review_260926 §9 R01–R22 22 项 correctness bug + G01/G02 产品化 MVP 加固，通过双× clean rebuild (Rebuild #2) 关成零 diff 的真实证据链。
 
-### V4.0 前置准备：squash 3 historical commits + M 文件
-- commit `497ce4e9e4a`（squash 总）：3 commits (早期 V3 / T1-T2 / misc) + AGENTS/example_sql.md M 文件 → 1 msg 英文简并
+### V4.0 前置准备：squash 历史 commit + M 文件
+- 将 3 个历史 commit（早期 V3 / T1-T2 / misc）与 AGENTS/example_sql.md 的 M 文件 squash 为一条英文简并 commit
 - 修复：`pg_manage_overlay_branches` 为 PG 保留前缀角色名 → 全仓 17 处 sed 替换为 `overlay_branch_administrators`
 
 ### V4 S 批次完成表 (M0–M3 Batch 1–6)
@@ -826,8 +831,8 @@ Section P PASS marker 之后追加 Section Q：
 | Batch 3 — S07：BranchScan sort+bsearch + Pass2 latest-wins + RSS 回收（R11/R12/R13） | Pass1 O(N×M) → sort(DeltaTuple** by key)+bsearch(FIND) O(M log M + N log M)，同 key run 内 max(list pos)=latest-wins（修复 latent I→U first-match bug）；Pass2 去错误 ptr-hash fold → 双遍纯线性；return 前遍历 pfree(dt/key/tuple_data)+list_free 完全零回收 TopMCxt | 10-05 | PASS:S07_HASH_MERGE_CORRECT_COUNT_64（64 rows）+ PASS:S07_APPLY_MATCHES_OVERLAY（group EXCEPT 0）；审计无泄漏，双× clean rebuild 0 diff |
 | Batch 4 — S08：统一 Overlay 输入 + pure-delta UPDATE pass（R01/R02/R04/R20/R21 MVP subset + P1..P12） | 8-phase pure-delta UPDATE pass：B SPI SELECT op I/U → C helper enter/exit → D 深拷贝 es_query_cxt → E delta_lookup latest + seen dedup → F 取 qual_scan/qual_extra → G ExecQual 每 slot → H CMD_DEL/U set-merge（含 R03 PK bms guard + R20 jisnull=true）；MVP no-qual NOP guard；R21 INSERT preconditions：NOT NULL 23502 + PK UNIQUE 23505 MAIN & delta 双侧查 + UPSERT Phase I/II 独立 dedup 不重复；L1 pure_delta upsert/update/delete 3 specs × 3 permutations | 10-06 | P1..P12 全链路 + R_SETNULL R20_2 pure UPDATE NULL / R20_5 4×toggle / R02_PURE_UPDATE_CHAIN v=pure_c+1+2+3 / R_SETNULL R21 PK bms 0A000；L1 pure_delta_upsert 6 19ms / update 7 29ms / delete 8 28ms；双× clean rebuild L3 11/11 + L1 8/8 0 diff |
 | Batch 5 — S14/S17/S10：typed key + base_image 校验（R14/R15/R18） + PlanCache（R07） | R14：typed_pk + typed_pk_n 懒加载（build_from_slot slot_getsomeattrs + build_from_key_text + typed_pk_cmp fmgr OidFunctionCall2Coll eq/lt）；R15：_base JSON enrichment + apply_check_base_image_match FOR UPDATE jsonb_object_agg ORDER BY key 规范比较；R17：apply CAS UPDATE state='applying' WHERE active；delta_insert state guard（applying ERROR already applying / terminal no writes）；R18：delete/update_pass token compare 后立即 apply_check；R07：CacheInvalidateRelcacheAll + CommandEndInvalidationMessages 二连 5 站点 | 10-07 | R-TYPEDKEY TK_BPCHAR r-trim / TK_NUM 12.3=12.30 / TK_TSTZ +08/+00；R_VERSION CONFLICT-1 HOT prereq INFO + apply 55000 ERROR MAIN data preserved / CONFLICT-2 rewrite xmin/ctid；M M1 manual UPDATE state='applying' → INSERT ERROR state guard；R_CTX R07 5 断言（GREEN 18 / RED 21 / GREEN_101 / RED_102 / EXIT_BASELINE）全 PASS |
-| Batch 6 — S13：双门禁产品化（G02 ACL double-defense + G01 scope preflight + R22 delta view REVOKE PUBLIC） | G02：SQL L1（SCHEMA USAGE PUBLIC + catalog GRANTs + synonym PUBLIC EXECUTE SECURITY INVOKER + delta-view REVOKE R22） × C L2（ob_acl_check_lifecycle 统一 42501，is_superuser_or_mgmt SysCache AUTHNAME + is_member_of_role mgmt，5 wrapper + 1 internal 顶部调用）；角色保留名修复；G01：ob_check_branch_scope 7 UNION ALL flat subqueries（ns + pg_depend deptype='e' 扩展对象双重过滤），ord 1..7 first-hit 0A000，create_internal 最顶部调用（零副作用：无 seq 前进，无 catalog row） | 10-08 commits `0ec90f728a9`, `4a67002605e`, `629d0ba227e` | G02 10 subcases A1→E：A1/A2 42501 / B1 PASS owner-use / B2 42501 alice-use-bobs / C1/C2 42501 discard/apply / D1 mgmt-alice-create PASS / D2 mgmt-alice-discard PASS / E delta-view 42501；G01 10+1 SCOPE A→Z：clean PASS（A/Z）× 9 categories (B FK-pk / C FK-selfref / D trigger / E1 partition-parent / E2 partition-child / F inherits / G unlogged / H generated-stored / I view-unsupported-relkind) 全部 0A000 first-hit；每个 label count=2 × unique；双× Rebuild 2 L3 11/11 + L1 8/8 diff -r = 0 lines |
-| Batch 7 — S19：A7 schema epoch registry + DDL restricted MVP（R23 schema drift 55000 + R24 DDL 0A000） | **版本链路简化（最高约束）**：扩展尚未发布，删除 1.1/1.2/1.3 四脚本，control `default_version=1.0` 回退，Makefile DATA 单行仅 `overlay_branch--1.0.sql`；**Schema registry catalog**：pg_branch_registry (bid FK CASCADE + (bid, relid) PK + schema/table 名 + total/pk cols + col/pk MD5 16B) + ACL REVOKE/GRANT PUBLIC 解决 plain user SPI SECURITY INVOKER；**INCREMENTAL 生命周期模型**：create 不 populate → Stage1 first-use populate → Stage2a 5 UNION drift check → Stage2b LEFT JOIN 增量登记 NEW TABLE；apply_internal CAS EXCLUSIVE 前调；discard 级联 DELETE；**DDL 门禁**：11 reason 前缀 §A7 0A000，DropStmt OBJECT_INDEX ALLOW，AlterSchema/AlterOwner → ERROR，CommentStmt ALLOW | 10-08 commit `d1efab151f5` | rentry.sql Section 12 A7 12 subcases 全 PASS（D2 bool_or / D5 drift 55000 / D6 discard+fresh / D11 exit-before-discard / D12 UPDATE-exit+reapply）；basic/mvcc_bounds 时序 create→CREATE TABLE→use first-use INCREMENTAL 不 NEW-drift；mvcc_review 3 Section header 语法修复；mvcc_usage 版本号 1.3→1.0 + §A7 reason sync；双× rebuild L3 11/11 + L1 8/8 diff=0；VPATH + 硬链接 + stale postmaster + tmp_install 陈旧 4 类根因沉淀 |
+| Batch 6 — S13：双门禁产品化（G02 ACL double-defense + G01 scope preflight + R22 delta view REVOKE PUBLIC） | G02：SQL L1（SCHEMA USAGE PUBLIC + catalog GRANTs + synonym PUBLIC EXECUTE SECURITY INVOKER + delta-view REVOKE R22） × C L2（ob_acl_check_lifecycle 统一 42501，is_superuser_or_mgmt SysCache AUTHNAME + is_member_of_role mgmt，5 wrapper + 1 internal 顶部调用）；角色保留名修复；G01：ob_check_branch_scope 7 UNION ALL flat subqueries（ns + pg_depend deptype='e' 扩展对象双重过滤），ord 1..7 first-hit 0A000，create_internal 最顶部调用（零副作用：无 seq 前进，无 catalog row） | 10-08 | G02 10 subcases A1→E：A1/A2 42501 / B1 PASS owner-use / B2 42501 alice-use-bobs / C1/C2 42501 discard/apply / D1 mgmt-alice-create PASS / D2 mgmt-alice-discard PASS / E delta-view 42501；G01 10+1 SCOPE A→Z：clean PASS（A/Z）× 9 categories (B FK-pk / C FK-selfref / D trigger / E1 partition-parent / E2 partition-child / F inherits / G unlogged / H generated-stored / I view-unsupported-relkind) 全部 0A000 first-hit；每个 label count=2 × unique；双× Rebuild 2 L3 11/11 + L1 8/8 diff -r = 0 lines |
+| Batch 7 — S19：A7 schema epoch registry + DDL restricted MVP（R23 schema drift 55000 + R24 DDL 0A000） | **版本链路简化（最高约束）**：扩展尚未发布，删除 1.1/1.2/1.3 四脚本，control `default_version=1.0` 回退，Makefile DATA 单行仅 `overlay_branch--1.0.sql`；**Schema registry catalog**：pg_branch_registry (bid FK CASCADE + (bid, relid) PK + schema/table 名 + total/pk cols + col/pk MD5 16B) + ACL REVOKE/GRANT PUBLIC 解决 plain user SPI SECURITY INVOKER；**INCREMENTAL 生命周期模型**：create 不 populate → Stage1 first-use populate → Stage2a 5 UNION drift check → Stage2b LEFT JOIN 增量登记 NEW TABLE；apply_internal CAS EXCLUSIVE 前调；discard 级联 DELETE；**DDL 门禁**：11 reason 前缀 §A7 0A000，DropStmt OBJECT_INDEX ALLOW，AlterSchema/AlterOwner → ERROR，CommentStmt ALLOW | 10-08 | rentry.sql Section 12 A7 12 subcases 全 PASS（D2 bool_or / D5 drift 55000 / D6 discard+fresh / D11 exit-before-discard / D12 UPDATE-exit+reapply）；basic/mvcc_bounds 时序 create→CREATE TABLE→use first-use INCREMENTAL 不 NEW-drift；mvcc_review 3 Section header 语法修复；mvcc_usage 版本号 1.3→1.0 + §A7 reason sync；双× rebuild L3 11/11 + L1 8/8 diff=0；VPATH + 硬链接 + stale postmaster + tmp_install 陈旧 4 类根因沉淀 |
 
 ### V4 遗留 OPEN 问题（分类二 + 架构 A）
 
@@ -851,6 +856,26 @@ Section P PASS marker 之后追加 Section Q：
 6. **pg_regress SQL runner ≠ psql**：rentry.sql 绝对不能 `\gset` / `\set` / psql meta-commands（L461 残留了一个 `\gset` → 被当成 literal 字符串写进 output，DO block 语法错误）。负向断言只能用 DO block + nested BEGIN/EXCEPTION WHEN feature_not_supported THEN NULL + RAISE EXCEPTION 'FAIL not blocked' 双保险，再外层用 SELECT 'PASS:' WHERE NOT EXISTS 验证 bid 确实不存在（即使 DO block 被吞也抓 FAIL）
 7. **pg_regress temp-inst ACL mystery bug**：有时 temp instance CREATE EXTENSION 装完 synonym wrapper 的 ACL 是 MGMT only（ubuntu=X + overlay_branch_administrators=X / 无 PUBLIC =X）。 workaround：rentry.sql 的 G02 开头显式重跑一遍所有 PUBLIC GRANTs + SCHEMA USAGE（DO $$ EXECUTE format(...) 用 @extschema@ 取动态名）
 8. **SPI_finish 忘记调 → WARNING: SPI stack left non-empty**：每个函数尾都 SPI_finish，pfree(sql.data) 在 FINISH 后（SPI 自身管理的 SPI 内存不能 pfree，只 pfree 我们自己 palloc 的 appendStringInfo Data）
+
+
+## V5 — B6 无 PK 表 ctid 实验特性（2026-10-16）
+
+> 目标：无 PK 表也能"开箱即用"地进入分支（不再因 G5 直接放弃），以**实验 GUC** 形式提供 best-effort 物理锚点身份。
+
+**交付**
+- GUC `overlay_branch.keyless_tables`（bool，默认 `off`，`PGC_SUSET`）：`off` = 现状（G5 拒绝 `0A000`）；`on` = 一行 WARNING + ctid 锚点身份（`A:<blk>:<off>` 锚定 MAIN 行 / `S:<seq>` 分支内纯 INSERT）。
+- 身份助手（`src/delta_store.c`）：`overlay_anchor_key_from_ctid` / `overlay_synthetic_key` / `overlay_serialize_identity` / `overlay_keyless_warn_once`；写路径 gate `overlay_should_redirect`；读路径 `src/branch_scan.c`（Pass1 生成 `A:` key / Pass2 丢弃孤儿锚点）；apply 定位 `src/branch_lifecycle.c : ob_build_identity_where_clause`（`S:` 合成键无 MAIN 锚点 → 跳过）。
+- **不改** `pg_branch_delta` 表结构、ACL（G02/R22）、registry 指纹（R23）。
+- **明确 out-of-scope**（记录于 doc，代码给 ERROR）：方案 B persistent slot（集群级 VACUUM 抑制 / HOT 失效）；keyless + UPSERT → `0A000`。
+
+**验收（2026-10-16）**
+- L3 **14/14** PASS（新增 `overlay_branch_keyless.sql` Part A–F，`diff -r` = 0 lines）
+- L1 **12/12** PASS（新增 `keyless_basic` / `keyless_pure_delta_repeat` / `keyless_apply_conflict`，0 diff）
+- 端到端 smoke：GUC off `0A000` / on 一行 WARNING + overlay / apply 落地一致
+
+**文档同步**
+- 设计：`doc/keyless_ctid_design.md`（§8 已决策 + §9 同步清单 ✅）
+- 用户/实现：`internals.md`（§1.1/§4.3/§5）、`README.md`、`example_sql.md` §5+§6.8、`AGENTS.md` §1 Managed tables（keyless 例外）+ §7 文档索引、`test_coverage_index.md`
 
 
 ## 关于 Step 6 留空
