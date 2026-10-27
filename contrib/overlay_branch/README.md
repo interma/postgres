@@ -85,7 +85,7 @@ overlay_branch/
 ├── include/          # C 头文件
 ├── src/              # C 源代码（5 个文件）
 ├── test/
-│   ├── regress/      # L3 pg_regress（14 套）
+│   ├── regress/      # L3 pg_regress（17 套）
 │   ├── isolation/    # L1 pg_isolation_regress（12 套）
 │   └── bench/        # L2 pgbench 压测
 ├── doc/              # 设计与示例文档
@@ -123,7 +123,7 @@ make check
 ## 当前状态
 
 - ✅ 核心功能全部交付：分支生命周期、透明读写叠加、apply/discard、snapshot/live 双模式
-- ✅ 测试绿标：L3 14/14 + L1 12/12 全 PASS（2× clean rebuild）
+- ✅ 测试绿标：L3 17/17 + L1 12/12 全 PASS（2× clean rebuild）
 - ⚠️ MVP 限制：默认仅支持有 PK 的普通 heap 表；不支持分区表、外键、MERGE、COPY FROM、Data-Modifying CTE 等（见 example_sql.md §5）
 - 🧪 实验特性：无 PK 表可通过 GUC `overlay_branch.keyless_tables=on` 开启 ctid 物理锚点身份（best-effort，默认关闭；见 [doc/keyless_ctid_design.md](doc/keyless_ctid_design.md)）
 

@@ -27,6 +27,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
@@ -472,6 +473,18 @@ overlay_guc_check_assign_current_branch(char **newval, void **extra,
 		return false;
 
 	/* ------------------------------------------------------------------
+	 * PARALLEL WORKER GUARD (MF-3): ParallelWorkerMain restores the
+	 * leader's GUC state via RestoreGUCState() → set_config_option(),
+	 * which fires this check hook.  At that point the worker has neither
+	 * an active snapshot nor a portal, so the read-only SPI validation
+	 * below would fail with "cannot execute SQL without an outer snapshot
+	 * or portal" and abort the worker.  The leader already validated the
+	 * value (this very hook ran there), so we simply accept it: the
+	 * worker never executes overlay scans anyway. */
+	if (IsParallelWorker())
+		return true;
+
+	/* ------------------------------------------------------------------
 	 * EARLY-INIT GUARD: During _PG_init / post-startup GUC sweep, no
 	 * database has been connected yet (MyDatabaseId is InvalidOid) and
 	 * SPI_connect will fail (no active snapshot / transaction).  In
@@ -581,6 +594,16 @@ overlay_guc_assign_current_branch(const char *newval, void *extra)
 	 * see flag=FALSE on the SECOND pass and enter the real side-effect
 	 * code — double-cleanup / double-pfree / state corruption. */
 	if (ob_in_guc_setconfig)
+		return;
+
+	/* ------------------------------------------------------------------
+	 * PARALLEL WORKER GUARD (MF-3): the assign hook is fired by
+	 * RestoreGUCState() in a fresh parallel worker, where SPI (and hence
+	 * use_internal()/ob_exit_branch_cleanup()) cannot run — there is no
+	 * snapshot or portal yet.  PG has already written the variable; we
+	 * only skip the side effects.  Workers never run overlay scans, so
+	 * this is safe and keeps the worker from aborting. */
+	if (IsParallelWorker())
 		return;
 
 	/* ---- PG GUC CONTRACT ------------------------------------------------
@@ -1750,11 +1773,9 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 		MemoryContext	oldcxt;
 		Oid				relid;
 		Relation		rel;
-		TupleDesc		reldesc;
 		ReturnSetInfo  *rsinfo;
-		TupleDesc		exp_desc;
 		int32			branch_id;
-		List		   *result_slots;
+		void		   *handle;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -1764,9 +1785,6 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("overlay_main_plus_delta: table must not be NULL")));
 		relid = PG_GETARG_OID(0);
-		rel = table_open(relid, AccessShareLock);
-		reldesc = RelationGetDescr(rel);
-		(void) reldesc;
 
 		rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 		if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
@@ -1775,25 +1793,39 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("overlay_main_plus_delta: must be called with explicit column list"),
 					 errhint("Use: FROM overlay_branch.overlay_main_plus_delta('t') AS x(id int, v text)")));
-		exp_desc = rsinfo->expectedDesc;
 
 		if (!overlay_branch_is_active())
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("overlay_main_plus_delta: no active branch"),
 					 errhint("Call use_branch('name') first.")));
+
+		/*
+		 * The PK check needs the relation, but the streaming handle opens (and
+		 * owns) its own copy — probe with a short-lived one.  The name must be
+		 * copied out before the close, since RelationGetRelationName() points
+		 * into relcache.
+		 */
+		rel = table_open(relid, AccessShareLock);
 		if (!overlay_relation_has_pk(rel) && !overlay_keyless_tables)
+		{
+			char	   *relname = pstrdup(RelationGetRelationName(rel));
+
+			table_close(rel, AccessShareLock);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("overlay_main_plus_delta requires a primary key on %s",
-							RelationGetRelationName(rel))));
+							relname)));
+		}
+		table_close(rel, AccessShareLock);
 
 		branch_id = overlay_branch_get_current_id();
 
 		overlay_overlay_helper_enter();
 		PG_TRY();
 		{
-			result_slots = ob_compute_overlay_slots(relid, branch_id);
+			handle = ob_overlay_srf_open(relid, branch_id,
+										 funcctx->multi_call_memory_ctx);
 		}
 		PG_CATCH();
 		{
@@ -1803,80 +1835,80 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 		PG_END_TRY();
 		overlay_overlay_helper_exit();
 
-		funcctx->user_fctx = result_slots;
-		funcctx->max_calls = list_length(result_slots);
-		table_close(rel, AccessShareLock);
-		(void) exp_desc;
+		funcctx->user_fctx = handle;
 
 		MemoryContextSwitchTo(oldcxt);
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
-	if (funcctx->call_cntr < funcctx->max_calls)
 	{
-		List		   *result_slots = (List *) funcctx->user_fctx;
-		TupleTableSlot *src_slot = (TupleTableSlot *) list_nth(result_slots,
-															  funcctx->call_cntr);
-		ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-		TupleDesc		exp_desc = rsinfo->expectedDesc;
-		TupleDesc		src_desc = src_slot->tts_tupleDescriptor;
-		Datum		   *values;
-		bool		   *isnulls;
-		int				exp_natts = exp_desc->natts;
-		MemoryContext	oldcxt;
-		HeapTuple		tuple;
-		Datum			result;
+		TupleTableSlot *src_slot = ob_overlay_srf_next(funcctx->user_fctx);
 
-		oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-		values = (Datum *) palloc0(sizeof(Datum) * exp_natts);
-		isnulls = (bool *) palloc0(sizeof(bool) * exp_natts);
-
-		for (int e = 0; e < exp_natts; e++)
+		if (src_slot == NULL)
 		{
-			Form_pg_attribute eatt = TupleDescAttr(exp_desc, e);
-			const char	   *ename = NameStr(eatt->attname);
-			bool			found = false;
+			ob_overlay_srf_close(funcctx->user_fctx);
+			funcctx->user_fctx = NULL;
+			SRF_RETURN_DONE(funcctx);
+		}
+		else
+		{
+			ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+			TupleDesc		exp_desc = rsinfo->expectedDesc;
+			TupleDesc		src_desc = src_slot->tts_tupleDescriptor;
+			Datum		   *values;
+			bool		   *isnulls;
+			int				exp_natts = exp_desc->natts;
+			MemoryContext	oldcxt;
+			HeapTuple		tuple;
+			Datum			result;
 
-			for (int s = 0; s < src_desc->natts; s++)
+			oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+			values = (Datum *) palloc0(sizeof(Datum) * exp_natts);
+			isnulls = (bool *) palloc0(sizeof(bool) * exp_natts);
+
+			for (int e = 0; e < exp_natts; e++)
 			{
-				Form_pg_attribute satt = TupleDescAttr(src_desc, s);
-				if (satt->attisdropped)
-					continue;
-				if (strcmp(NameStr(satt->attname), ename) == 0)
-				{
-					bool	sisnull;
-					Datum	sd = slot_getattr(src_slot,
-											  (AttrNumber) (s + 1),
-											  &sisnull);
+				Form_pg_attribute eatt = TupleDescAttr(exp_desc, e);
+				const char	   *ename = NameStr(eatt->attname);
+				bool			found = false;
 
-					if (!sisnull)
+				for (int s = 0; s < src_desc->natts; s++)
+				{
+					Form_pg_attribute satt = TupleDescAttr(src_desc, s);
+					if (satt->attisdropped)
+						continue;
+					if (strcmp(NameStr(satt->attname), ename) == 0)
 					{
-						int16	typlen;
-						bool	typbyval;
-						get_typlenbyval(satt->atttypid, &typlen, &typbyval);
-						sd = datumCopy(sd, typbyval, typlen);
+						bool	sisnull;
+						Datum	sd = slot_getattr(src_slot,
+												  (AttrNumber) (s + 1),
+												  &sisnull);
+
+						if (!sisnull)
+						{
+							int16	typlen;
+							bool	typbyval;
+							get_typlenbyval(satt->atttypid, &typlen, &typbyval);
+							sd = datumCopy(sd, typbyval, typlen);
+						}
+						values[e] = sd;
+						isnulls[e] = sisnull;
+						found = true;
+						break;
 					}
-					values[e] = sd;
-					isnulls[e] = sisnull;
-					found = true;
-					break;
+				}
+				if (!found)
+				{
+					values[e] = (Datum) 0;
+					isnulls[e] = true;
 				}
 			}
-			if (!found)
-			{
-				values[e] = (Datum) 0;
-				isnulls[e] = true;
-			}
+
+			tuple = heap_form_tuple(exp_desc, values, isnulls);
+			result = HeapTupleGetDatum(tuple);
+			MemoryContextSwitchTo(oldcxt);
+
+			SRF_RETURN_NEXT(funcctx, result);
 		}
-
-		tuple = heap_form_tuple(exp_desc, values, isnulls);
-		result = HeapTupleGetDatum(tuple);
-		MemoryContextSwitchTo(oldcxt);
-
-		SRF_RETURN_NEXT(funcctx, result);
-	}
-	else
-	{
-		SRF_RETURN_DONE(funcctx);
 	}
 }

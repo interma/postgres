@@ -94,10 +94,11 @@ V1/V2 的 `overlay_branch` 扩展在**单 session 单用户**场景下工作正�
 - `use_branch` 的 SQL 函数签名新增可选 `mode` 参数（默认 `'live'` 保持兼容）。
 
 #### FR6：Materialized BranchScan 失效（跨 Session Delta Drift）
-- V2 中 ExtendedCustomScanState.result_slots 在 `ob_branchscan_begin()` 时一次性 materialize，然后 `ReScanCustomScan` 复用。如果另一个 session 在本 scan 中途提交了新 delta，第二次 ReScan 仍返回旧 materialization。
+- V2 中 ExtendedCustomScanState 在 `ob_branchscan_begin()` 时一次性 materialize 结果集，然后 `ReScanCustomScan` 复用。如果另一个 session 在本 scan 中途提交了新 delta，第二次 ReScan 仍返回旧 materialization。
 - V3：
-  - `ob_branchscan_rescan()` 不使用缓存的 result_slots，强制**重新计算**（释放旧 slots 列表，重新调用 `ob_compute_overlay_slots_internal`）。
-  - 首次 scan 保留 materialization（性能不变），但 ReScan 必须 fresh。
+  - `ob_branchscan_rescan()` 不复用任何缓存，强制**重新计算**：关闭并丢弃当前 `OverlayScanState`，
+    `MemoryContextReset(scan_cxt)`，下一次 `ExecCustomScan` 懒打开 → 重跑 Pass1 + Pass2 读最新 delta heap。
+  - 首次 scan 与 ReScan 走同一条流式路径（阶段 2 / RD-6 后不再有「首次 materialize」与「ReScan fresh」两条代码路径）。
 
 #### FR7：Use 计数 / Pin 追踪
 - 在共享内存（`shmem_startup_hook` 注册，使用 `RequestAddinShmemSpace`）中维护一个 hash 表：`branch_id → {pin_count, applying: bool}`。
@@ -341,31 +342,25 @@ RETURNS void ...
 
 ### B.7 FR6：BranchScan ReScan Freshness（精确实现机制 & Edge Case）
 
-**Bug root（V2 vs V3 语义差异）**：V2 中 `ob_branchscan_rescan()` 只是把 `ebs->cursor = list_head(result_slots)`，复用 Begin/首次 Exec 时 materialize 好的 slots 列表；如果另一 session（或同一 session WITH HOLD cursor 跨事务期间）在 pg_branch_delta 表中新增了行，第二次 ReScan 仍返回旧值。V3 要求 ReScan 必须 fresh。
+**Bug root（V2 vs V3 语义差异）**：V2 中 `ob_branchscan_rescan()` 只是把游标复位，复用 Begin/首次 Exec 时 materialize 好的 slots 列表；如果另一 session（或同一 session WITH HOLD cursor 跨事务期间）在 pg_branch_delta 表中新增了行，第二次 ReScan 仍返回旧值。V3 要求 ReScan 必须 fresh。
 
-**5 步严格实现顺序（branch_scan.c `ob_branchscan_rescan`）**：
+**阶段 2 / RD-6 后的实现（等价于「从未扫描」语义）**：
  1. **Invalidation Kickout Sync 先做**（和 §T2-TODO-3 协同，见本 §D.7.2 L644 风险项）：
-    `ob_invalidate_check_throttled(CurrentBranchContext, /*force_all=*/false);`
-    目的：快速路径清空本 backend `ob_latest_bcast_generation`，让 NOTIFY 到达的 state 变更在下一次 `Pass1 MAIN SELECT`（重新 materialize 时内部调用的 SPI readonly）前就生效；**如果 kickout 未触发也不影响正确性**，因为 Step 4 重新跑 Pass1+Pass2 天然读最新 delta heap。
- 2. **NULL guard（E1. never-materialized）**：`if (!ebs->materialized)` → 仅跑 Step 1 + Step 5 reset 4 state bits，**直接 return**；无需进入 slot 释放。
- 3. **Dealloc 老 materialization**：严格对称于 materialize 的所有权：
-    ```
-    foreach lc in ebs->result_slots:  ExecDropSingleTupleTableSlot(lfirst);
-    list_free(ebs->result_slots);     ebs->result_slots = NIL;
-    ```
- 4. **Reset 4 state bits = "从未 materialize"语义**：
-    `materialized=false; cursor=NULL; main_scan_done=false; delta_scan_done=false;`
-    → 保证下一次 `ExecCustomScan` 进入 first_call branch 重走 Pass1 MAIN + Pass2 Delta + Merge Lazy 全套，完全等价于新 CustomScanState。
- 5. **不重置 planner 决定的静态字段**：`filter_pk_only`、`pk_only_eq_keys`、`target_rel` 自 planner 确定后不变，保留（省重解析）。PG PlanState 通用字段（ss.ps.ps_TupFromTlist 等）由上层 `nodeCustom.c` 的 `ExecReScan` 统一 reset，**我们绝不能手动写**。
+    `ob_invalidate_check_throttled(/*force_all=*/false);`
+    目的：快速路径清空本 backend `ob_latest_bcast_generation`，让 NOTIFY 到达的 state 变更在下一次重扫前生效；**如果 kickout 未触发也不影响正确性**，因为重新打开迭代器天然读最新 delta heap。
+ 2. **丢弃当前迭代器 + 重置扫描上下文**：`overlay_scan_close(ebs->scan); ebs->scan = NULL; MemoryContextReset(ebs->scan_cxt);`
+    迭代器持有的一切（`slot_desc` / delta payload / `TableScanDesc` / 探针 slot）都归属 `scan_cxt`，一次性回收。
+ 3. **等价于新 CustomScanState**：下次 `ExecCustomScan` 见到 `ebs->scan == NULL` → 懒打开，重走 Pass1 MAIN + Pass2 Delta 全套。
+ 4. **不重置 planner 决定的静态字段**：`has_pk_pred` / `pk_where_sql` / `pk_serialized_key` / `general_where_sql` 自 planner 确定后不变，保留（省重解析）。PG PlanState 通用字段（ss.ps.ps_TupFromTlist 等）由上层 `nodeCustom.c` 的 `ExecReScan` 统一 reset，**我们绝不能手动写**。
 
-**3 个非平凡 Edge Case（已覆盖在 5 步流程中）**：
- - **E1. never-materialized ReScan**（典型：EXPLAIN without ANALYZE 实际执行首 scan 前 ReScan 一下）→ Step 2 guard 直接 return，避免对 NIL 列表的无效迭代；
- - **E2. WITH HOLD Cursor 跨事务 ReScan**（真 target 测试场景）：COMMIT 时 PG 将 cursor 内容持久化到 tuplestore；下一事务 FETCH ALL 通过 MOVE BACKWARD ALL 触发 ReScanCustomScan → 走 Step 1-5 fresh materialization，看到事务间新增的 WR delta 行。**pg_regress L3 single-session 即采用此模式模拟跨 session**。
- - **E3. SCROLL CURSOR + MOVE BACKWARD ALL / FETCH PRIOR 触发的逆向 ReScan**：PG 在重置 cursor 位置后会主动调 ReScanCustomScan；我们的 4 状态位重置后 merge loop 从 scratch 重跑，天然兼容正反方向 scan。
+**非平凡 Edge Case**：
+ - **E1. never-materialized ReScan**（典型：EXPLAIN without ANALYZE 实际执行首 scan 前 ReScan 一下）：RD-6 后无「已 materialize」状态位，`ebs->scan == NULL` 时 `overlay_scan_close` 直接 no-op，重扫退化为下一条 Exec 的懒打开 —— 天然安全；
+ - **E2. WITH HOLD Cursor 跨事务 ReScan**（真 target 测试场景）：COMMIT 时 PG 将 cursor 内容持久化到 tuplestore；下一事务 FETCH ALL 通过 MOVE BACKWARD ALL 触发 ReScanCustomScan → 丢弃迭代器后重开，看到事务间新增的 WR delta 行。**pg_regress L3 single-session 即采用此模式模拟跨 session**。
+ - **E3. SCROLL CURSOR + MOVE BACKWARD ALL / FETCH PRIOR 触发的逆向 ReScan**：PG 在重置 cursor 位置后会主动调 ReScanCustomScan（由上层 tuplestore spool 承载）；我们丢弃迭代器后从头重跑，天然兼容正反方向 scan。BranchScan 自身不实现 MarkPos/RestorePos（见 [branchscan.md §D.4](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/branchscan.md)）。
 
 **性能注解（符合 R7：正确性优先，性能记录到 doc 不急于优化）**：
- - ReScan fresh 每次都重跑 Pass1 MAIN SQL（SPI readonly 一次 table_scan），最坏复杂度 O(|MAIN| + |DELTA|) 与首次 scan 相同。对于超大分支这是 N²（N 次 ReScan = N² MAIN 全表扫描）。
- - V3.1 优化思路（**TODO，不在 T6 做**）：在 `result_slots` materialize 时同时记录 `(bid, pg_branch_delta.max_rowversion)` 两个版本戳；ReScan 时若 bid 未变 & delta max_rowversion 未变 & MAIN 写入计数未变（可借助 `pg_stat_user_tables.n_live_tup_estimate` 近似）→ 跳过 fresh materialize，直接 reset cursor（回到 V2 语义）。正确性有影响时才回退 fresh。
+ - ReScan fresh 每次都重跑 Pass1 MAIN 扫描 + Pass2 delta 遍历，最坏复杂度 O(|MAIN| + |DELTA|) 与首次 scan 相同。对于超大分支这是 N²（N 次 ReScan = N² MAIN 全表扫描）。
+ - V3.1 优化思路（**TODO**）：在打开迭代器时记录 `(bid, pg_branch_delta.max_rowversion)` 版本戳；ReScan 时若 bid 未变 & delta max_rowversion 未变 & MAIN 写入计数未变（可借助 `pg_stat_user_tables.n_live_tup_estimate` 近似）→ 跳过重扫，直接复位迭代器。正确性有影响时才回退 fresh。
 
 ### B.8 FR7（可选）：共享内存 Pin 表 — ❌ Cancelled-by-Design (V3, 2026-09-17, R7 correctness first)
 

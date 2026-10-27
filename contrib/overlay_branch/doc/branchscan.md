@@ -6,6 +6,8 @@
 > - **Part A**：V2 骨架——设计调研、实施步骤切片、风险矩阵（原 plan）
 > - **Part B**：V2 优化——P0 PK O(1) 快路径 + P2 非 PK 条件下推 + 协议 + 验证断言（原 strategy §1-7）
 > - **Part C**：硬约束踩坑——L3 Delta O(1) lookup MemoryContext 生命周期（原 strategy §8）
+> - **Part D**：阶段 2 读路径架构——去 SPI / 流式早停（RD-8 / RD-7 / RD-6）
+> - **Part E**：P0 谓词下推扩展——从「单列等值」到 `IN` / 范围 / `OR`
 
 ---
 
@@ -22,7 +24,7 @@ SELECT * FROM overlay_branch.overlay_main_plus_delta('public.t')
 内部 2-pass 合并逻辑已经在 `overlay_main_plus_delta()` 中实现（Step4b，`src/overlay_branch.c#L1487-L1710`），核心阶段可直接复用：
 1. `overlay_delta_list_for_rel(branch_id, relid)` 加载 `List<DeltaTuple*>`（L1543）
 2. SPI seqscan 主表（L1549-L1553）
-3. Pass1 主表 merge：逐行 serialize_pk → delta_list linear scan → 无匹配输出主表 / 'D' tombstone 跳过 / 'U'/'I' 输出 delta 覆盖行，matched entry 标记 `->emitted=true`（L1584-L1695）
+3. Pass1 主表 merge：逐行算 key（typed PK 优先；`M_total==0` 或 delta 全 typed 时跳过昂贵的 JSON 文本键 `serialize_pk`，见 performance.md §5 阶段 1b RD-8）→ delta 匹配 → 无匹配输出主表 / 'D' tombstone 跳过 / 'U'/'I' 输出 delta 覆盖行，matched entry 标记 `->emitted=true`（L1584-L1695）
 4. Pass2 未出现的 delta INSERT 行补漏：遍历 delta_list 找 `!emitted && op='I'` → `reconstruct_slot_from_delta` 输出（L1673-L1695）
 5. 辅助：`reconstruct_slot_from_delta(Relation, bytea)` 把 tuple_data bytea 还原成 `TTSOpsVirtual` slot
 
@@ -436,3 +438,268 @@ SPI_finish();
 | SPI_finish 后 dt->key 仍有效 | ✅ | ❌ 悬垂 | ✅ |
 | bs67 DELETE tombstone skip | — | ❌ FAIL | ✅ PASS |
 | ADV_A id=10 UPDATE green override | — | ❌ FAIL | ✅ PASS |
+
+---
+
+# Part D — 阶段 2 读路径架构（去 SPI / 流式早停）
+
+> 消除 MAIN 基线读取的 SPI 中间物化与结果集全量物化，使大表分支读接近原生扫描，
+> 并让 `LIMIT` / 游标能早期终止。**不改** planner hook 的 P0/P2 谓词识别逻辑
+> （custom_private 6 元素协议保持不变）。
+
+## D.1 现状与瓶颈
+
+| 环节 | 阶段 2 前的现状 | 代价 |
+|---|---|---|
+| MAIN 基线读取 | `ob_spi_one_shot("SELECT * FROM rel [WHERE ...]")` | SPI 把整张结果集物化进 `SPI_tuptable`，再逐列 `SPI_getbinval` + `datumCopy` 拷入 virtual slot = **两次全量拷贝** |
+| 结果集 | 首次 `ExecCustomScan` 即全量叠加进扫描上下文（`ebs->materialized` 游标） | `LIMIT` / 游标 / `EXPLAIN ANALYZE` 无法截断 |
+| 每行 PK 文本键 | `overlay_serialize_pk()` 一条 `to_jsonb(ARRAY[...])` SPI | ≈8.4 µs/行；读 Pass1 strcmp 回退、写路径、apply 共用 |
+
+**三处均已在阶段 2 消除**：RD-8（PK 键纯 C 化，§D.2）、RD-7（MAIN 去 SPI，§D.3）、RD-6（流式迭代器，§D.4）。
+
+## D.2 RD-8 收尾 — `overlay_serialize_pk` 纯 C 化（**已完成**）
+
+**输出契约（必须字节不变）**：`to_jsonb(ARRAY[e1::text, ...])::text`
+→ `["v1", "v2", ...]`；NULL 元素 → `null`；元素 = PK 列 output function 结果
+（BPCHAR 先 r-trim，见现行注释）经 JSON 字符串转义。多列 PK 依序拼接。
+
+**实现**：`[` + 逐列（`", "` 分隔——jsonb 文本数组元素以「逗号+空格」连接；
+isnull → `null`；否则 `escape_json(buf, valstr)`）+ `]`。
+`escape_json()`（`utils/json.h`）即 jsonb 的字符串转义实现
+（`jsonb_put_escaped_value`），故字节一致。去掉 SPI 后该函数不再依赖
+ActiveSnapshot / SPI proc 上下文；写路径
+（[L1623](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1623) /
+[L1729](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1729) /
+[L1754](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1754)）与 apply 同步受益，
+且顺带消除 Part C 那类“SPI proc 悬垂指针”风险面。
+
+**验证**：L3 / L1 全绿。读侧 Section F 覆盖空 delta / all-typed delta 快捷路径，
+Section G 新增 JSON 转义用例（PK 或列值含 `"` 与 `\`）——该用例同时暴露并修复了一个
+**既有写侧缺陷**（见下）。
+
+**连带修复｜`pg_branch_delta.tuple_data` 写入转义**：为覆盖转义路径而新增的用例立即
+触发 `invalid input syntax for type bytea`。根因：`overlay_delta_insert`
+（[delta_store.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L206-L238)）
+用 `quote_literal_cstr(json)` + `(%s)::bytea` 存行 JSON，而 `::bytea` 按 **legacy escape 格式**
+解析，`\"` 直接报错、`\\` 折叠为单字节——凡列值含 `"` 或 `\` 的分支写都会失败或静默损坏。
+改为直接拼 `'\x<hex>'::bytea`（与读侧 `convert_from('\x..'::bytea,'UTF8')` 对称），
+逐字节保真，且兼容 `overlay_debug_delta_insert` 存储任意二进制（如 `DECODE('feedface','hex')`）。
+
+## D.3 RD-7 — MAIN 基线读取去 SPI（**已完成**）
+
+把 [branch_scan.c L278-L330](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L278-L330)
+的 SPI SELECT + 结果读取，替换为直接堆扫描：
+
+- **快照**：沿用现有语义——SNAPSHOT 模式下用 `CurrentBranchContext->branch_main_snapshot`，
+  否则 `GetActiveSnapshot()`；直接传给 `table_beginscan`（不再需要 push/pop，因为不再借道 SPI）。
+- **扫描**：`table_beginscan(rel, snap, 0, NULL)` + 逐行 `table_scan_getnextslot()`；
+  探针 slot 用 `TTSOpsBufferHeapTuple`（`MakeSingleTupleTableSlot(rel_desc, &TTSOpsBufferHeapTuple)`）。
+- **预过滤**：用 `node->ss.ps.qual` 对应的 `ExprState`（= baserestrictinfo 全套）对 MAIN 行**预筛**，
+  与现行 P0+P2 下推语义等价：MAIN 行不满足则不进 Pass1；被分支改过的行由 Pass2 orphan 规则补回；
+  最终 `scan.plan.qual` 仍照常对叠加结果复筛
+  （[L1862](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1862)）→ 正确性兜底不变。
+- **P0 点查例外（保留 SPI）**：`has_pk_pred` 时仍走原 SPI SELECT（≤1 行，无物化成本），
+  以复用 planner 的 PK 索引能力。**理由**：手搓 btree `ScanKey` 需自行完成
+  字面量 → PK 列类型的严格 coercion（BPCHAR / NUMERIC / collation 跨类型），
+  一旦 key 不匹配会**静默返回 0 行**（Pass2 只补 delta 行），风险远高于收益；
+  而该路径只命中 1 行，去 SPI 的收益近乎为零。
+- **辅助列**：不再需要 `pk_where_sql` / `general_where_sql` 的 SQL 文本（改由 qual 预筛），
+  仅保留 `pk_serialized_key` 供 delta O(1) lookup；custom_private 协议不新增/不删元素（兼容）。
+
+### D.3.1 实现要点（踩坑记录）
+
+1. **virtual slot 上编译的 qual 不能直接跑在 buffer-heap 探针 slot 上**。
+   CustomScan 的 scan slot 是 `TTSOpsVirtual`（nodeCustom.c），于是 `ExecComputeSlotInfo()`
+   认定「slot 恒为 virtual → 永不需 de-form」，**整条 `EEOP_SCAN_FETCHSOME` 被优化掉**；
+   `EEOP_SCAN_VAR` 遂按 `scanslot->tts_values[attnum]` 直取，并 `Assert(attnum < tts_nvalid)`。
+   把未物化的 `TTSOpsBufferHeapTuple` 探针 slot 塞进 `econtext->ecxt_scantuple` 会触发该断言 /
+   越界（`execExprInterp.c` EEOP_SCAN_VAR）。**修法**：`ExecQual` 之前先
+   `slot_getsomeattrs(probe, natts)` 手工物化（等价于 `cesscan` 自己的 de-form）。
+2. **P0 分支的 SPI 上下文会吞掉刚建好的行**。`ob_spi_one_shot()` 会 `SPI_connect()`，
+   而 `SPI_connect()` 把 `CurrentMemoryContext` 重挂到 SPI proc 上下文——`SPI_finish()`
+   一调用就整块销毁。RD-7 后 P0 分支把 `SPI_finish()` 前移到了「读完 tuptable」处，
+   因此**逐行物化的 mslot / `lappend` 的 List 必须先切回 `result_cxt`**（否则 Pass1 读到
+   `0x7f7f…` clobber 崩溃）。旧代码之所以没炸，只是因为它的 `SPI_finish()` 恰好在最末尾。
+   非 P0 直扫分支无 `SPI_connect`，天然在 `result_cxt`，无需切换。
+
+## D.4 RD-6 — 按需吐行（流式 + 早停）（**已完成**）
+
+叠加读路径由「先全量物化 `List<TupleTableSlot*>`」改为**迭代器**：
+
+- `OverlayScanState` + `overlay_scan_open()` / `overlay_scan_next()` / `overlay_scan_close()`
+  （[branch_scan.c L371 / L642 / L885](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L371-L910)）：
+  持有 `slot_desc`、排序后的 delta 指针数组、MAIN 侧读取源（P0 SPI 单元子行 / 非 P0 `TableScanDesc`）、
+  Pass1/Pass2 进度。Pass1 按需取一行 MAIN 行 → 匹配 / 重建 → 返回；堆扫尽后进入 Pass2
+  逐条补发未命中的 delta I/U 孤儿 → 返回；再 `NULL`。**迭代顺序与旧的「全量物化」逐字节一致**。
+- `ob_branchscan_exec()`（[L1974](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1974)）
+  懒打开迭代器，每次只拉一行 → 上层 `Limit` 停止调用即可早停；游标跨多次 Exec 复用同一迭代器。
+- SRF `overlay_main_plus_delta` 改为流式句柄 `ob_overlay_srf_open` / `ob_overlay_srf_next` /
+  `ob_overlay_srf_close`（[L1791](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1791-L1835)），
+  对外结果集不变；`LIMIT` 截断时由 `MemoryContextRegisterResetCallback` 保证 handle 被释放。
+- **MarkPos / RestorePos 不实现**：`CustomPath.flags` 不含 `CUSTOMPATH_SUPPORT_MARK_RESTORE`，
+  exec methods 表对应槽位留 NULL（前向堆扫无法回退）。planner 会在需要时自动插入 `Materialize`
+  （`ExecSupportsMarkRestore()` / MergeJoin inner path）。
+- **正确性**：Pass1 未结束前不进入 Pass2；`LIMIT` 截断只影响「无 ORDER BY 时的任意子集」语义
+  （SQL 标准允许），不破坏任何有序 / 聚合查询（它们会拉干）。
+- **关联子计划不参与静态下推**：`baserestrictinfo` 中含 PARAM_EXEC / 外层 Var 的 clause 由
+  [`ob_expr_has_outer_ref()`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L927-L946)
+  在 deparse 前剔除。这类 clause 既无法反编译成独立 SQL 片段，又会让 `ruleutils.get_parameter()`
+  以 NULL plan 解引用 `dpns->plan`（`deparse_context_for()` 留 `plan == NULL`）而**崩溃**；
+  剔掉后由 `scan.plan.qual` 逐行复筛。相关子计划的 rewind 靠 ReScan 重建迭代器。
+- **内存生命周期**：迭代器与所有对外 slot 归属 `scan_cxt`（BranchScan）/ `multi_call_memory_ctx`（SRF）；
+  `End` / `ReScan` 释放（[`overlay_scan_close`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L885-L910) + `MemoryContextDelete` / `MemoryContextReset`）。
+
+## D.5 实施切片（每片独立 Green-Bar + 本地 commit）
+
+1. **2a**：RD-8 收尾（纯 C `overlay_serialize_pk`）——**已完成**（含 Section G 转义用例
+   及其暴露的 `tuple_data` bytea 写入修复）。
+2. **2b**：RD-7（去 SPI 直扫 + qual 预筛；P0 保留 SPI）——**已完成**
+   （新增 `scan_pk` Section H：全扫 / 预筛 orphan 补回 / 复筛兜底 / P0 点查 / SRF 等价 / LIMIT）。
+3. **2c**：RD-6（迭代器 + 早停）——**已完成**（新增 `scan_pk` Section I，见 §D.6）。
+
+## D.6 验证与风险
+
+- 每片：2× clean rebuild 0 warning；L3 17/17；L1 12/12 `diff -r` 0 行；`LC_ALL=C.utf8`。
+- **RD-7 已完成**，`overlay_branch_scan_pk` 新增 **Section H**（8 用例，全 PASS）覆盖：
+  无谓词全扫（`RD7_FULLSCAN`）、非 PK 预筛 orphan 补回（分支改动落在谓词列，
+  `RD7_PREFILTER_ORPHAN`）、`scan.plan.qual` 复筛兜底（`RD7_REQUAL_NET`）、
+  P0 点查结果 + tombstone 消失（`RD7_P0_BRANCH` / `RD7_P0_TOMBSTONE`）、
+  SRF 与直读结果一致（`RD7_SRF_EQUIV`）、`LIMIT`（`RD7_LIMIT`）、MAIN 零污染（`RD7_MAIN_CLEAN`）。
+- **RD-6 已完成**，`overlay_branch_scan_pk` 新增 **Section I**（9 用例，全 PASS）覆盖：
+  拉干全扫（`RD6_STREAM_FULL`）、Pass1 内早停（`RD6_LIMIT_PASS1`）、
+  跨 Pass1→Pass2 边界早停（`RD6_LIMIT_PASS2`）、游标跨多次 Exec 复用（`c_rd6` 四次 FETCH）、
+  SRF 早停释放（`rd6_srf_limit_rows`）、SRF 与直读等价（`RD6_SRF_EQUIV`）、
+  **相关子计划 rewind**（`rd6_rescan_ok`）、MAIN 零污染（`RD6_MAIN_CLEAN`）。
+- 风险 ① 预筛语义等价：已由 Section H 的“预筛 orphan 补回 + 复筛兜底”组合用例实测通过
+  （被预筛剔除但被分支改写的行由 Pass2 orphan 规则补回）。
+- 风险 ② 堆扫描 slot 生命周期：已收敛为两条硬规则——探针 slot 用 `TTSOpsBufferHeapTuple`
+  且**只**追 `tts_tid` / raw xmin，输出 slot 一律 `slot_desc` 的 `TTSOpsVirtual`；
+  预筛前必须 `slot_getsomeattrs`（见 D.3.1）。
+- 风险 ③ 早停下的结果集顺序：RD-6 严格保持「Pass1 走 MAIN 基线序，Pass2 走 delta append 序」，
+  故任何拉干查询（聚合 / ORDER BY / 全扫）结果与阶段 2 前**逐字节相同**；只有无 ORDER BY 的
+  `LIMIT` 取的是任意前缀（SQL 允许）。
+- 风险 ④ 关联谓词下推：见 §D.4 最后一条——PARAM_EXEC / 外层 Var 一律不下推，交由执行器复筛。
+
+---
+
+# Part E — P0 谓词下推扩展（`IN` / 范围 / `OR`）
+
+> P0 的 L1（MAIN SPI 谓词）与 L2（DELTA O(1) key）在 Part B 里是**同一个 `has_pk_pred` 开关**，
+> 且只在「单列 PK = 常量」时才启用。本 Part 把 L1 的识别面放宽到任意**只由 PK 列构成的
+> btree 比较**（等值 / 范围 / `IN` / 其 `AND`/`OR` 组合），同时把 L2 明确降级为「仅单点等值才
+> 走 O(1)」，其余走全量 delta 列表。**SPI 机制不变**。
+
+## E.1 目标与边界
+
+- **要做的**：把「MAIN 侧能被 PK 谓词收窄」的判定，从 `pk = Const` 推广到
+  `pk = c` / `pk <> …` 之外的 btree 五算子（`= < <= > >=`）、`pk IN (…)` / `= ANY(array)`、
+  以及这些子句的 `AND` / `OR` 组合。命中即把整段谓词 deparse 成 SQL 文本，透传给 MAIN SPI SELECT。
+- **不变的**：MAIN 一律走 SPI（复用 planner 选出的 PK 索引扫描，规避手工 btree ScanKey 的
+  字面量→PK 类型强制转换陷阱，见 §B.3）；`scan.plan.qual` 仍对每一行复筛（§B.1 正确性兜底）。
+- **不做**（明确排除，回退到 P2 / qual）：
+  - 多列 PK、keyless 表 —— `overlay_get_pk_single_attno()` 本就不命中，P0 不启用；
+  - `IS NULL` / `IS NOT NULL`（`NullTest`）、`NOT`（`NOT_EXPR`）；
+  - `<> ALL(…)` / `= ALL(…)`（`ScalarArrayOpExpr.useOr == false`）；
+  - `OR` 中混入非 PK 分支（`OR` 不可拆分，整条放弃）；
+  - 数组元素或右操作数含非 `Const` 节点（子查询 / Param / Var）——无法静态化为 SQL 片段。
+
+## E.2 识别范围（node 形态）
+
+新增单一判定函数 `ob_is_pk_pushable_clause(clause, rti, pk_attno)`，递归判定一条顶层
+`RestrictInfo.clause` 是否「纯 PK 谓词」：
+
+| node 形态 | 接受条件 |
+|---|---|
+| `OpExpr(op, [Var(pk), Const])`（`Const` 可在左） | `op` 属于该 Var 类型的 btree 五算子（typcache `eq/lt/le/gt/ge_opr`） |
+| `ScalarArrayOpExpr(op, [Var(pk), Const-or-ArrayExpr])` | `useOr == true` 且 `op == eq_opr`；`ArrayExpr` 的每个元素都必须是 `Const` |
+| `BoolExpr(AND_EXPR / OR_EXPR, args)` | 所有 `args` 递归满足本判定 |
+| 其它 | 一律不接受 |
+
+`Var` 校验沿用 P0 原有三条：`varno == rti`、`varattno == pk_attno`、`varlevelsup == 0`。
+比较算子不再要求「等值」，因此不再需要 `get_commutator` —— 对 `OpExpr` 而言
+`id < 5` 与 `5 > id` 的 `opno` 各自都是类型自己的 btree 算子，直接判 `opno ∈ {eq,lt,le,gt,ge}`
+即可；deparse 后原样交给 SPI，语义由 `ruleutils` 保证。
+
+**单点等值判定**（决定 L2 是否可 O(1)）单独用一个 `ob_pk_point_const(clause, rti, pk_attno, &con)`：
+只认 `OpExpr(=, [Var(pk), Const])` / `OpExpr(=, [Const, Var(pk)])`。
+
+## E.3 双层策略：L1 放宽、L2 退化
+
+Planner hook 的 P0 采集改为「**收集全部** 纯 PK 子句 → 用 `AND` 串起 → 一次性 deparse」：
+
+```
+pk_clauses = [ r for r in baserestrictinfo if ob_is_pk_pushable_clause(r.clause) ]
+has_pk_pred       ← deparse(AND(pk_clauses)) 成功
+pk_where_sql      ← 该 SQL 文本（IN / BETWEEN 区间 / OR 都落在这一串文本里）
+pk_serialized_key ← 仅当 len(pk_clauses)==1 且该条是单点等值时才序列化；否则为空
+```
+
+- **L1 MAIN**：`pk_where_sql` 作为 SPI `SELECT * FROM rel WHERE (pk_where_sql) [AND (general_where)]`
+  的过滤条件。`IN` / 范围 / `OR` 都能被 `deparse_expression` 忠实还原，故 L1 **自动获益**，
+  无需新增任何执行侧代码路径。
+- **L2 DELTA**：沿用 [`overlay_scan_open`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L419-L433) 已有的二分支——
+  `pk_serialized_key` 非空 → `overlay_delta_lookup` 单点 O(1)；**为空 → `overlay_delta_list_for_rel` 全量加载 + qsort + bsearch**。
+  于是 `IN` / 范围 / `OR` 的 delta 侧自动落到「全量列表」这条已被 P2 验证过的路径，
+  **零新增代码**，正确性由同一套 Pass1 bsearch / Pass2 orphan 规则兜底。
+
+> 取舍：L2 不再对多值谓词做「逐 key lookup」优化（可做但有界收益 + 需处理 key 个数上界）；
+> 本扩展以「L1 拿到索引扫描」为主要收益来源，delta 侧复用全量路径换取最小改动面。
+
+## E.4 协议与执行
+
+**custom_private 6 元素协议不变**（§B.5）。唯一变更是**语义放宽**：
+
+| index | 变更 |
+|---|---|
+| 1 `pkflag` | 维持 0/1；1 表示「有可用 pk_where_sql」——**不再要求 pk_serialized_key 非空** |
+| 2 `pk_where_sql` | 文本内容可为 `IN` / 范围 / `OR` 片段，长度上限 64KB 不变 |
+| 3 `pk_serialized_key` | **允许空串**：空 → Executor 侧 delta 走全量列表 |
+
+- Planner 打包端（[L1646-L1674](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1646-L1674)）本就不要求 key 非空，无需改动。
+- Executor 解包端（[L1997-L2022](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1997-L2022)）原把「where 或 key 任一为空」整体判为 `has_pk_pred=false`，已拆开：
+  `has_pk_pred ← (pk_where_sql 非空)`；`pk_serialized_key ← (非空则取，空则 NULL)`。
+- `≠ 1.0` 之外无协议版本号；旧计划（4 元素）继续 fallthrough，不回归。
+
+**P0 SPI 执行改为多行物化**：原实现只取 `SPI_tuptable->vals[0]`（点查 ≤1 行的假设），
+现改为遍历 `SPI_processed` 全部行，逐行建 `ObMainRow` 追加到 `st->p0_rows`。
+迭代器（`overlay_scan_next` Pass1 的 `p0_cur` 游标）本就按 `List` 逐条取，无需改动。
+
+> 已知取舍：P0 路径把 MAIN 结果一次性物化，故 P0 命中的查询失去了 RD-6 的 MAIN 侧早停；
+> 但谓词已被收窄、且走的是 planner 的 PK 索引扫描，物化行数有界。非 P0 路径仍保持流式早停。
+
+## E.5 正确性论证
+
+三层不变式共同保证「结果集与 SRF 全量叠加一致」：
+
+1. **`scan.plan.qual` 永远复筛**：P0 只减少喂给 Pass1 的 MAIN 行，不改行内容；
+   最终每行仍过 `ExecQual`（§B.1）。谓词下推写多/写少都不会让错误行进入结果。
+2. **被过滤掉的 MAIN 行不会丢结果**：P0 的 `pk_where_sql` 与顶层 qual 同源，
+   被它排除的 MAIN 行本就不满足顶层 qual；唯一例外是「分支 UPDATE 把行改进了谓词范围」——
+   该 delta 行在 Pass1 无 MAIN 配对，落入 Pass2 orphan 规则补发（I/U 重建），由 qual 决定去留。
+3. **delta 全量列表不会多发错误行**：Pass2 对未配对的 I/U 一律重建后交给 qual；
+   范围/IN 之外的 orphan 会被 qual 丢掉，语义安全（与 §D.3 的 qual 预筛策略同构）。
+
+## E.6 回退矩阵（在 §B.6 基础上增补）
+
+| 阶段 | 新增错误 | 回退动作 | 结果 |
+|---|---|---|---|
+| Planner P0 识别 | 子句含 `useOr=false` 的 SASE / `OR` 混入非 PK 分支 / 数组元素非 `Const` / 类型无 btree 算子 | 该子句不入选 `pk_clauses` | 该子句落到 P2 / qual；其余 PK 子句照常下推 |
+| Planner P0 识别 | 有 PK 子句但合并 deparse 失败 | `has_pk_pred=false`，`pk_where_sql/key` 全清 | **全部** PK 子句回到 P2（因为 P2 的排除以 `has_pk_pred` 为前提） |
+| Executor 解包 | `pk_where_sql` 空但 key 非空 | `has_pk_pred=false` | 回退全扫（不会用空谓词去 SPI） |
+| Delta 侧 | `pk_serialized_key` 为空（IN/范围/OR） | 走 `overlay_delta_list_for_rel` 全量列表 | 正确，代价 O(M log M) |
+
+> P2 的排除条件必须是 `has_pk_pred && ob_is_pk_pushable_clause(clause)`——两个条件缺一不可；
+> 若 P0 deparse 失败（`has_pk_pred=false`），PK 子句必须能被 P2 重新收编，否则会漏筛。
+
+## E.7 验证断言（新增 `scan_pk` Section J）
+
+| Test | 内容 | 通过标准 |
+|---|---|---|
+| `PKIN_BASIC` | `WHERE id IN (1,3,5)`（含分支内改/删/增） | BS 结果 = SRF 全量叠加，行图景一致 |
+| `PKRANGE_BASIC` | `WHERE id BETWEEN 2 AND 4` | 同上 |
+| `PKRANGE_OPEN` | `WHERE id > 3` / `WHERE id < 3` | 同上 |
+| `PKOR_BASIC` | `WHERE id = 1 OR id = 4` | 同上 |
+| `PKIN_PLUS_NONPK` | `WHERE id IN (…) AND tag = '…'`（P0 + P2 协同） | 无重复下推，结果一致 |
+| `PKIN_ORPHAN` | 分支把谓词外的行 UPDATE 进谓词范围（Pass2 orphan 补回） | 结果一致 |
+| `PKIN_EXPLAIN` | `EXPLAIN` 只出现 `Custom Scan`，无 SeqScan 泄露 | 单节点 |
+| `PKIN_MAIN_CLEAN` | `RESET` 后 MAIN 零污染 | 逐行比对 |

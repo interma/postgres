@@ -1,12 +1,12 @@
-# Overlay Branch 测试覆盖索引 (26 entries: 14 L3 + 12 L1)
+# Overlay Branch 测试覆盖索引 (29 entries: 17 L3 + 12 L1)
 
-> L3 = pg_regress 单会话 SQL 文件 (14 个)；L1 = isolationtester 多会话隔离测试 (12 个 specs)。
+> L3 = pg_regress 单会话 SQL 文件 (17 个)；L1 = isolationtester 多会话隔离测试 (12 个 specs)。
 
 | 文件名 (去掉前缀/后缀) | 中文覆盖范围 (30-60 字) | 对应 Rxx / Gxx / Bxx 编号 |
 |----------|-------------------------|------------------------|
 | basic (L3) | 基础用例：CREATE/USE/APPLY/DISCARD 全流程 + simple CRUD inside branch + 主表增量回读 | R01 (lifecycle 4 fns) + G01 (基础路径) |
 | user (L3)  | 角色切换：SET ROLE 普通用户在分支写数据 / 跨 role 可见性 / pg_branch owner 语义比对 | R08 (multi-role visibility) + §G02 OWNER 矩阵 |
-| scan_pk (L3) | BranchScan 走 PK 索引/UNIQUE 约束命中：等值查询 / 范围 / 纯 PK 场景，含 junk attnum 验证 | R02 (BranchScan PK align) + G07 |
+| scan_pk (L3) | BranchScan 走 PK 索引/UNIQUE 约束命中：等值查询 / 范围 / 纯 PK 场景，含 junk attnum 验证；Section F/G = RD-8 读路径键快捷路径与纯 C JSON 转义（PK/列值含 `"` `\`）；Section H = RD-7 MAIN 去 SPI 直扫 + baserestrictinfo 预筛 + Pass2 orphan 兜底（全扫/预筛补回/复筛/P0 点查/SRF 等价/LIMIT）；Section I = RD-6 流式迭代器按需吐行（Pass1 早停/跨 Pass2 早停/游标复用/SRF 早停/相关子计划 rewind）；**Section J = P0 谓词下推扩展**（IN / BETWEEN 范围 / 开区间 / OR 的 PK 条件合并 deparse 透传 MAIN SPI；P0+P2 协同；范围下的 Pass2 orphan 补回与越界 orphan 丢弃；EXPLAIN 单节点无 SeqScan 泄露） | R02 (BranchScan PK align) + G07 + RD-8 + RD-7 + RD-6 + **P0 谓词下推扩展** |
 | scan_type (L3) | 多列类型覆盖：int/bigint/text/numeric/timestamptz/date 的 PK 序列化 + BranchScan 类型 dispatch | R07 (PK serialize 多类型) |
 | mvcc_bounds (L3) | Live Mode 下 MAIN 已提交写入的可见性边界；分支内对 MAIN 新版本 RC 级可见性；**§D-5 A4 5 subcases (empty apply/discard <500ms + 10K I/U/D apply <60s)** | R10 (MAIN write → Branch visible) + S05 MVCC + **A4 5 PASS markers / R26** |
 | mvcc_usage (L3) | 典型 Live Mode 使用流：并发 MAIN 写入 → Branch 叠加读一致；含未提交 vs 已提交分界 | S05 Live MVCC § |
@@ -18,6 +18,9 @@
 | **view_unify (L3)** | D-2 review_260926 A2 Read/Write View Unification：A2.1 self-join (SJ1 12-pair / SJ2 baseline-EXCEPT-0 / SJ3 visual) / A2.3 SAME-CSS ReScan 3×14 deterministic proof / A2.4 non-lateral NL no-crash / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions (CUR1 14rows / CUR2 id=3 NOT EXISTS / CUR3 amt=111,112) | §A2 architecture (OPEN → ✅) |
 | **planner_cost (L3)** | D-3 review_260926 A8 MVP cost_branchscan cost model：A8.1 SEQ scan cost != 0.00 / A8.2 PK scan cost << seq / A8.3 SELF-JOIN 2× BranchScan 节点 + SJ correctness 210 pairs；standalone 验证 add_path→lappend 关键根因修复（real cost 静默 reject 旁路 delta merge） | §A8 architecture (OPEN → ✅) + R11/R12 complexity estimate proof |
 | **keyless (L3)** | B6 无 PK 表 ctid 实验特性：GUC off 拒绝 0A000 / on 一行 WARNING + 正确叠加读写 / apply 落地 + 二次 apply 阻止 / 并发 MAIN 改写锚点行 → apply 冲突且保留 MAIN / PK 表路径不受 GUC 影响 / keyless UPSERT 0A000 | B6 (keyless ctid identity) + §R8 G5 例外 |
+| **parallel (L3)** | MF-2/MF-3 分支内禁止并行：活跃分支下 planner hook 清空 partial_pathlist，EXPLAIN 只出现单一 CustomScan 且无 Gather（堵住静默读 MAIN 的旧数据） | MF-2/MF-3 + §3 并行盲点 |
+| **memgrow (L3)** | MF-1 会话级内存稳定：单会话内连续 200 次全量叠加 chunk，`pg_backend_memory_contexts` 增量 = 0（堵住 TopMemoryContext 泄漏 + delta 侧中间副本） | MF-1 + §3 内存所有权 |
+| **pushdown (L3)** | RD-1/RD-2 (MF-5) 非 PK 下推 + Pass2 孤儿路径：四种 op 形状下 `grp=7` 结果集正确（含 Pass1 零命中、每个 delta 都成孤儿的极端），无重复行，并断言 delta key 结构性唯一 | RD-1/RD-2/MF-5 + §2.1 读路径 |
 | ob_apply_mutex (L1) | isolationtester: 2 session 并发 apply 同一 branch → CAS loser 55000, winner 成功; delta 写入期间状态 guard | S16 FR3 CAS + R17 write-set freeze |
 | ob_state_inval (L1) | isolationtester: apply/discard 后 LISTEN ob_branch_state payload `<bid>:<new_state>` 广播; 相邻 session is_active() 立即失效节流重查 | S13 FR1 NOTIFY + FR4 throttled catalog recheck |
 | ob_applying_freeze (L1) | isolationtester: APPLY 过程 MAIN 并发读/写 freeze 边界; discarded/applied 终态禁止二次 apply/discard | S04 Apply freeze § + FR1/FR5 boundary + R17 applying state guard |

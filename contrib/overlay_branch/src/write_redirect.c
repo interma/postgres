@@ -1236,7 +1236,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							    dtu.tuple_data != NULL)
 							{
 								TupleTableSlot *ps = reconstruct_slot_from_delta(rel,
-								                                                 dtu.tuple_data);
+								                                                 dtu.tuple_data,
+								                                                 queryDesc->estate->es_query_cxt);
 								if (ps)
 								{
 									struct WR_PDC1 *c1_ = (struct WR_PDC1 *) palloc0(sizeof(struct WR_PDC1));
@@ -1950,7 +1951,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							}
 
 							pre_image_slot = reconstruct_slot_from_delta(
-								rel, pure_tuple_bytes);
+								rel, pure_tuple_bytes,
+								queryDesc->estate->es_query_cxt);
 							old_version = oldver_txt ? pstrdup(oldver_txt) : NULL;
 							promotion = 0; /* pure-only mark; combined with
 											* Phase II below */

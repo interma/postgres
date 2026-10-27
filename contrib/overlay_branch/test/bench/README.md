@@ -1,6 +1,6 @@
 # T8 L2 pgbench 并发压测 Fixture（非门禁，手动调试用）
 
-> R7 约束重申：正确性第一，性能第二。**本 L2 fixture 不是 `make check` 门禁**（门禁 = L1 12/12 isolation specs + L3 14/14 pg_regress），仅在下列场景才需要手动跑：
+> R7 约束重申：正确性第一，性能第二。**本 L2 fixture 不是 `make check` 门禁**（门禁 = L1 12/12 isolation specs + L3 17/17 pg_regress），仅在下列场景才需要手动跑：
 > - 想对 FR2 V1 锁协议做高并发压力测试（CAS winner/loser 高频）
 > - 想概率性触发 NOTIFY 路径（长连接 LISTEN 稳定）
 > - 想复现 edge-case race 但 L1 12 specs 无法覆盖时
@@ -13,6 +13,11 @@
 |---|---|---|
 | `apply_contention_fixture.sql` | **一次性初始化脚本**：CREATE EXTENSION / pgbench_accounts 10000 行 baseline rows / 8 branches `bs_pgbench_{1..8}` | 首次压测前，**只跑 1 次**（idempotent） |
 | `apply_contention.sql` | **pgbench custom script**：每连接按 `CLIENT_ID mod 10` 分配 4 种角色（60% WR writer / 20% branch switcher / 10% applyer / 10% discarder），随机 DML / apply / discard / live↔snapshot rotate | 每次压测持续执行，由 `pgbench -T 60` 控时间 |
+| `run_perf_baseline.sh` | **性能基线驱动脚本**：`run_perf_baseline.sh [N] [M]`（默认 200000/20000）→ `LC_ALL=C.utf8 psql -f perf_baseline.sql`，并把全量 transcript `tee` 到 `perf_baseline_<N>_<M>.log` | 想取某组 (N,M) 规模的可比对 wall-clock 数字时手动跑（非门禁） |
+| `perf_baseline.sql` | **可复现性能基线**：自建/自清 `public.ob_perf_base`（可控 set-based delta），按 performance.md 成本中心依次量 M1 MAIN seqscan / M2 M=0 叠加 / M3 全量叠加 / M4 PK 等值(P0) / M5 非 PK(P2) / M6 EXPLAIN / M7 delta 体积放大 / M8 apply 计时 / M9 apply 后 MAIN；每步夹 `pg_backend_memory_contexts` 泄漏观测 | 性能优化前后取对照、或验证 MF-1/MF-4/MF-5 修复效果时手动跑 |
+| `perf_baseline_<N>_<M>.log` | **运行产物**（非手工编辑）：上一条脚本 `tee` 出的完整 psql transcript，留档做前后对照 | 由 `run_perf_baseline.sh` 自动生成；入库存档用于对照（不入库可忽略） |
+
+> 目录内分两类：`apply_contention*` = **并发正确性** L2 压测（本文其余章节）；`perf_baseline*` = **性能基线** L2 fixture（对照 [performance.md](../../doc/performance.md) 成本中心，只出数字不做 PASS/FAIL）。
 
 ---
 
@@ -134,8 +139,8 @@ SELECT count(*) AS sessions_in_branch FROM pg_stat_activity
 [L1 pg_isolation 12 specs] —— "所有并发关键拓扑精确调度"
          │  (FR2/FR3/FR4/FR5/FR6 逐条语义 verify)
          ▼
-[L3 pg_regress 14 suites] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
-         │  (本扩展 make check 默认门禁 = L1 + L3 合计 26/26 zero-diff 2×)
+[L3 pg_regress 17 suites] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
+         │  (本扩展 make check 默认门禁 = L1 + L3 合计 29/29 zero-diff 2×)
          ▼
 [L2 pgbench (本目录, 手动)] —— "高并发真实负载下的正确性兜底 sanity check"
          │  (NOT 门禁。用于性能探索 / 触发 L1/L3 没测到的边缘 race)

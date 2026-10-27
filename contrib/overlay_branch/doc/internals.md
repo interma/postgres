@@ -115,21 +115,24 @@ promo=2 时用 `fetch_tuple_by_ctid` 取 MAIN 旧行作为 scantuple，`ExecProj
 
 ### 1.3 增量读的实现方式（2-pass 叠加）
 
-详见 [branchscan.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/branchscan.md)。核心算法在 `ob_compute_overlay_slots_internal`（[branch_scan.c:139-795](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L139-L795)）：
+详见 [branchscan.md](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/branchscan.md)。核心算法由流式迭代器
+[`OverlayScanState` + `overlay_scan_next()`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L371-L910) 实现：
 
 - **Pass 1**：扫 MAIN 行，对每行序列化 PK → bsearch delta → 无匹配输出 MAIN，匹配 DELETE 则丢弃，匹配 I/U 则用 delta 覆盖
-- **Pass 2**：追加未被 pass 1 消费的 delta（pure-INSERT）
+- **Pass 2**：追加未被 pass 1 消费的 delta（pure-INSERT / UPDATE 孤儿）
 
-**性能优化**：从 O(N×M) 朴素双扫描改为 O(M log M + N log M)——先对 delta 按 PK 排序 + latest-wins 去重，再用 bsearch 匹配 MAIN 行。
+两遍都**按需逐行吐行**（不再预先全量物化 `List<slot>`），因此 `LIMIT` / 游标可以早停。
+
+**性能优化**：从 O(N×M) 朴素双扫描改为 O(M log M + N log M)——先对 delta 按 PK 排序，再用 bsearch 匹配 MAIN 行（`pg_branch_delta` 主键 `(branch_id, relid, key)` 已保证 key 唯一，无需执行层去重折叠）。
 
 ### 1.4 算法性能考虑
 
 | 优化点 | 说明 |
 |--------|------|
 | sort + bsearch | delta 排序后 MAIN 行用二分查找，避免 N×M 全表扫描 |
-| latest-wins 去重 | qsort 后同 key 连续，只保留最后追加的 delta，修复 I→U 链首匹配 bug |
 | P0 PK 等值快速路径 | `WHERE pk = const` 时只查一条 delta，MAIN 侧也只查一行 |
 | typed PK 比较 | 用 PG 原生 btree 比较函数替代 strcmp，避免 BPCHAR/NUMERIC 语义错误 |
+| 流式早停 | MAIN 侧直扫堆（非 P0）按需吐行；读路径整体迭代器化，`LIMIT` 可截断 |
 | 递归 guard | 内部 SPI 查询不被 BranchScan 包裹，避免栈溢出 |
 | lappend bypass | 绕过 `add_path` 成本比较，强制 BranchScan 为唯一候选 |
 
@@ -266,7 +269,7 @@ UPDATE/DELETE 子计划的 slot 包含 junk attrs（ctid、tableoid 等），列
 
 ### 4.8 memory context 纪律
 
-所有跨 SPI 边界返回的字符串/bytea/TypedKey 都 `datumCopy`/`pstrdup` 到 `TopMemoryContext`，因为 `SPI_finish` 会销毁 SPI proc 上下文。BranchScan 的 result_slots 也分配在 TopMemoryContext，由调用方释放。
+所有跨 SPI 边界返回的字符串/bytea/TypedKey 都 `datumCopy`/`pstrdup` 到 `TopMemoryContext`，因为 `SPI_finish` 会销毁 SPI proc 上下文。BranchScan 的迭代器状态与所有对外 slot 归属 `scan_cxt`（SRF 侧为 `multi_call_memory_ctx`），由 `End` / `ReScan` 释放。
 
 ### 4.9 快照纪律
 

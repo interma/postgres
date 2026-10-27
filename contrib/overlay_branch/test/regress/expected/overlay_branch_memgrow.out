@@ -1,0 +1,117 @@
+-- contrib/overlay_branch/test/regress/sql/overlay_branch_memgrow.sql
+--
+-- MF-1 regression: repeated full-table branch reads must not grow the
+-- backend's memory for the lifetime of the session.
+--
+-- Background
+--   Two independent leaks used to grow TopMemoryContext by one unreclaimable
+--   chunk per scanned row, so a long-lived session's RSS grew without bound:
+--
+--     1. BranchScan materialization and reconstruct_slot_from_delta() built
+--        each result slot (and its own CreateTupleDescCopy()) in
+--        TopMemoryContext.  ExecDropSingleTupleTableSlot() only pfree()s the
+--        slot and ReleaseTupleDesc() is a no-op for a -1 refcount copy, so one
+--        tupdesc per result row stayed in TopMemoryContext forever.  Slots now
+--        live in a per-scan context, reset at Rescan and deleted at
+--        EndCustomScan.
+--     2. delta_store.c read the TEXT delta columns with
+--        TextDatumGetCString(datumCopy(d, ...)): the intermediate datumCopy()
+--        varlena was never freed, leaking once per delta row per scan.
+--
+-- Assertion
+--   Measure TopMemoryContext.total_bytes, run many full-table branch reads,
+--   measure again.  With the leaks in place one scan of the 2200-row result
+--   grew TopMemoryContext by ~26 KB (several MB over the loop below); the
+--   fixed code returns to a flat baseline.  The 2 MB ceiling keeps the test
+--   robust against unrelated one-off allocations while still failing
+--   decisively if either leak comes back.
+--
+--   The probe runs inside a DO block because the A7 gate rejects DDL
+--   (including CREATE TEMP TABLE) while a branch is active.
+--
+-- Tags: MF-1, memory, TopMemoryContext, BranchScan, delta_store
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+NOTICE:  extension "overlay_branch" already exists, skipping
+CREATE TABLE ob_mem (id int PRIMARY KEY, v text);
+INSERT INTO ob_mem SELECT g, repeat('x', 40) || g FROM generate_series(1, 2000) g;
+ANALYZE ob_mem;
+SELECT overlay_branch.create_branch('ob_mem_b1');
+ create_branch 
+---------------
+             7
+(1 row)
+
+SELECT overlay_branch.use_branch('ob_mem_b1');
+ use_branch 
+------------
+ 
+(1 row)
+
+UPDATE ob_mem SET v = 'u' || v WHERE id % 10 = 0;                          -- 200 overlaid rows
+INSERT INTO ob_mem SELECT g, 'n' || g FROM generate_series(2001, 2200) g;  -- 200 pure delta
+-- Warm-up: first executions also fill relcache/syscache/plan cache.
+SELECT count(*) FROM ob_mem;
+ count 
+-------
+  2200
+(1 row)
+
+SELECT count(*) FROM ob_mem;
+ count 
+-------
+  2200
+(1 row)
+
+SELECT count(*) FROM ob_mem;
+ count 
+-------
+  2200
+(1 row)
+
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..200 LOOP
+    PERFORM count(*) FROM ob_mem;
+  END LOOP;
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 2097152 THEN
+    RAISE NOTICE 'MF1_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+NOTICE:  MF1_MEM_STABLE_PASS: grew=0 bytes
+-- Sanity: the reads above really did exercise the overlay merge (2000 + 200).
+SELECT CASE WHEN count(*) = 2200 THEN 'MF1_RESULT_CORRECT_PASS'
+            ELSE 'MF1_RESULT_CORRECT_FAIL: got=' || count(*) END AS res
+  FROM ob_mem;
+           res           
+-------------------------
+ MF1_RESULT_CORRECT_PASS
+(1 row)
+
+-- Cleanup
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('ob_mem_b1');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE ob_mem;
+RESET ALL;

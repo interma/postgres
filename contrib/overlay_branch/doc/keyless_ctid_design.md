@@ -100,7 +100,7 @@ overlay_serialize_identity(rel, slot, op):
 
 ### 3.3 读路径映射（BranchScan 2-pass）
 
-合并算法 [ob_compute_overlay_slots_internal](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L139-L795) 结构不变，仅**身份提取与比较**两处替换：
+合并算法 [`overlay_scan_next()`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L642-L884) 结构不变，仅**身份提取与比较**两处替换：
 
 | 阶段 | PK 现状 | keyless 改造 |
 |------|---------|--------------|
@@ -261,7 +261,7 @@ DETAIL:  Target relation: kl.
 | 4 | [delta_store.c : `overlay_should_redirect`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1209-L1211) | 无 PK → return false | `if (!has_pk && !overlay_keyless_tables) return false;` |
 | 5 | [delta_store.c : `overlay_serialize_pk`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L826) 调用点（[write_redirect.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/write_redirect.c#L995) 等 4 处） | 统一 PK 序列化 | 新增 `overlay_serialize_identity(rel, slot, op)`，按 has_pk 分派（§3.2） |
 | 6 | [delta_store.c : `overlay_tuple_version`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1094) | `blk:off-x<xmin>` | 复用，无需改 |
-| 7 | [branch_scan.c : `ob_compute_overlay_slots_internal`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L139-L795) | PK 提取 + typed_pk_cmp | main identity 改 ctid；新增 anchor 比较器；Pass 2 处理孤儿 |
+| 7 | [branch_scan.c : `overlay_scan_next`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L642-L884) | PK 提取 + typed_pk_cmp | main identity 改 ctid；新增 anchor 比较器；Pass 2 处理孤儿 |
 | 8 | [branch_scan.c : planner hook](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1022-L1028) | 无 PK → return；PK fast-path | keyless 时继续注入并跳过 P0 fast-path |
 | 9 | [branch_lifecycle.c : `ob_build_pk_where_clause`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_lifecycle.c#L2852) | apply 用 PK 定位 | 新增 `ob_build_identity_where_clause`（`A:`→ctid，`S:`→跳过，PK→现状） |
 | 10 | [branch_lifecycle.c : apply old_version/base-image 校验](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_lifecycle.c#L3409) | ctid/xmin + `_base` | 复用，无需改 |

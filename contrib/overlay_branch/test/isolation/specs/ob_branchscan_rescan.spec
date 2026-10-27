@@ -1,8 +1,9 @@
 # ob_branchscan_rescan.spec — L1 pg_isolation_regress (T8)
-# FR6 cross-session fresh-plan materialization (equivalent to inner rescan path
-# since both hit ob_compute_overlay_slots_internal fresh compute).
+# FR6 cross-session fresh rescan (the inner-rescan path shares the same
+# iterator re-open as ordinary exec: ReScan drops the OverlayScanState and
+# the next ExecCustomScan re-opens it against the latest delta).
 # 2 MAIN rows + WR delta 3 → read1=3.  s2 inserts WR delta id=4 (committed) →
-# s1 read2=4 (fresh materialization under s2's new delta now visible).
+# s1 read2=4 (fresh overlay under s2's new delta now visible).
 
 setup
 {

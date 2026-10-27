@@ -9,11 +9,25 @@
 extern void branch_scan_init(void);
 
 /*
- * Public 2-pass overlay helper shared by
- * SRF overlay_main_plus_delta() and BranchScan BeginCustomScan().
- * Returns List<TupleTableSlot*> allocated in TopMemoryContext; each slot is
- * TTSOpsVirtual with its own independent CreateTupleDescCopy() of the relation.
- * Caller is responsible for list_free_deep(ExecDrop) at end. */
-extern List *ob_compute_overlay_slots(Oid relid, int32 branch_id);
+ * Streaming 2-pass overlay helper shared by
+ * SRF overlay_main_plus_delta() and BranchScan ExecCustomScan().
+ * The handle is opaque; ob_overlay_srf_next() returns ONE merged row per call
+ * (TTSOpsVirtual, owned by result_cxt) and NULL once the scan is drained.
+ *
+ * result_cxt owns every allocation made for the returned slots (slots,
+ * tupdescs, datum copies).  The CALLER picks a context whose lifetime
+ * matches the result set:
+ *   • BranchScan   → per-scan context (child of es_query_cxt)
+ *   • SRF          → funcctx->multi_call_memory_ctx
+ * NULL → CurrentMemoryContext.
+ *
+ * ob_overlay_srf_open() opens (and owns) the relation; the handle registers a
+ * context reset callback, so ob_overlay_srf_close() is optional — releasing on
+ * drain OR on context delete both work, and both are idempotent.  Callers must
+ * NOT ExecDrop the emitted slots once result_cxt is destroyed. */
+extern void *ob_overlay_srf_open(Oid relid, int32 branch_id,
+								 MemoryContext result_cxt);
+extern TupleTableSlot *ob_overlay_srf_next(void *handle);
+extern void ob_overlay_srf_close(void *handle);
 
 #endif

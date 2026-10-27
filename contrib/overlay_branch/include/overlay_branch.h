@@ -170,6 +170,15 @@ typedef struct TypedKey
 	bool		isnull;			/* true = NULL PK part (error for strict) */
 	bool		typbyval;		/* cached: true = Datum is pass-by-value */
 	int16		typlen;			/* cached: typlen from pg_type */
+	/* ===== RD-5: memoised comparison functions for typid =====
+	 * Points at the per-type FmgrInfo owned by delta_store.c's PK cache
+	 * (allocated in TopMemoryContext, never freed), so the pointers stay
+	 * valid for the whole backend lifetime regardless of when the owning
+	 * DeltaTuple / TypedKey array is released.  NULL = unavailable (the
+	 * type has no btree sort operators); overlay_typed_pk_cmp() then
+	 * falls back to its legacy per-comparison catalog lookup. */
+	struct FmgrInfo *eq_finfo;	/* "<->" (btree equality) */
+	struct FmgrInfo *lt_finfo;	/* "<"   (btree less-than) */
 } TypedKey;
 
 /* ----------
@@ -484,7 +493,8 @@ extern bool             overlay_in_write_redirect(void);
 extern void             overlay_write_redirect_enter(void);
 extern void             overlay_write_redirect_exit(void);
 extern int              ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount);
-extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data);
+extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
+													MemoryContext result_cxt);
 
 /* ----------
  * Slot/fetch helpers (delta_store.c) — used by write_redirect.c

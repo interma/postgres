@@ -614,8 +614,8 @@ ERROR:  overlay_branch: Data-Modifying CTE (WITH ... UPDATE/INSERT/DELETE ... RE
 | plain INSERT/UPDATE/DELETE | ✅ 支持 |
 | INSERT … ON CONFLICT（PK） | ✅ 支持 |
 | UPDATE/DELETE … RETURNING | ✅ 支持 |
-| WHERE pk = CONST | ✅ 推荐路径 |
-| Seq scan / range pred | ✅ 支持 |
+| PK 谓词（`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / 其 `AND`/`OR` 组合） | ✅ 推荐路径（走 PK 索引） |
+| 非 PK 谓词（任意 filter / Seq scan） | ✅ 支持 |
 | 分支内 TEMP 表操作 | ✅ 支持（白名单）|
 | CREATE TABLE / ALTER / DROP / CREATE INDEX / DROP TRIGGER | ❌ 0A000（退回 Main 执行）|
 | 分区表 | ❌ 拒绝 |

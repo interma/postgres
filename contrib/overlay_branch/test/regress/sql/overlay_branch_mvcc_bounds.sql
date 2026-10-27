@@ -512,38 +512,39 @@ SELECT 'PASS:O0_COVERAGE_GAPS_9_BRANCHES_FILLED' AS section_o_status;
  * SECTION P: FR6 BranchScan ReScan Fresh Materialization (T6)
  * ================================================================
  * Background: V2 `ob_branchscan_rescan` was a cursor-reset stub that
- * kept result_slots untouched.  Any ReScan (e.g. a NestedLoop join
- * driver iterating multiple outer tuples over our CustomScan inner
- * child, a future SCROLL cursor calling ExecutorRewind after new delta
- * rows landed, or a cross-session WITH HOLD portal rewound after a
- * LISTEN/NOTIFY kickout) returned stale rows from the first
- * materialization and never saw rows appended to pg_branch_delta
- * between Pass 1 and a later ReScan.
+ * kept the materialised slot list untouched.  Any ReScan (e.g. a
+ * NestedLoop join driver iterating multiple outer tuples over our
+ * CustomScan inner child, a future SCROLL cursor calling
+ * ExecutorRewind after new delta rows landed, or a cross-session
+ * WITH HOLD portal rewound after a LISTEN/NOTIFY kickout) returned
+ * stale rows from the first materialisation and never saw rows
+ * appended to pg_branch_delta between Pass 1 and a later ReScan.
  *
- * T6 rewires `ob_branchscan_rescan` to a strict 4-step drop + reset
- * contract (see multi_session_mvcc.md S B.7 for the full 5-step spec
- * plus 3 edge cases E1/E2/E3 and the V3.1 correctness-over-performance
- * skip-rescan TODO):
+ * RD-6 made the whole read path a forward-only streaming iterator, so
+ * rescan freshness is now structural rather than something a stub
+ * could accidentally break (see multi_session_mvcc.md S B.7):
  *
  *   Step 1. Call ob_invalidate_check_throttled(for_dml=false) so any
  *           cross-session kickout (T8) is honoured before re-reading.
- *   Step 2. E1 guard: if materialized==false (never materialized yet),
- *           Assert slots=NIL + cursor=mark_cursor=NULL + return.
- *   Step 3. DROP every old slot (ExecDropSingleTupleTableSlot in a
- *           foreach loop), list_free(result_slots), set result_slots=NIL.
- *   Step 4. Reset materialized=false, cursor=NULL, mark_cursor=NULL so
- *           the FOLLOWING ExecCustomScan() enters its lazy "first
- *           call" path and re-runs Pass1 MAIN seqscan + Pass2 Delta
- *           list + 2-way Merge strictly fresh, with NO in-place edit
- *           of a previously-yielded list item.
+ *   Step 2. DROP the iterator and reset its context:
+ *           overlay_scan_close(ebs->scan); ebs->scan = NULL;
+ *           MemoryContextReset(ebs->scan_cxt).  Everything the
+ *           iterator owned (slot_desc, delta payload, TableScanDesc,
+ *           probe slot) is reclaimed with the context.
+ *   Step 3. The FOLLOWING ExecCustomScan() sees scan == NULL and
+ *           lazily re-opens it, re-running Pass1 MAIN scan + Pass2
+ *           delta walk strictly fresh.  (No "materialised" flag and no
+ *           E1 guard remain: closing a never-opened iterator is a
+ *           no-op, so a ReScan-before-first-Exec is naturally safe.)
  *
- *   (No Step 5.  The optional UpdateChangedParamSet propagation used
- *    by Sort/Agg wrappers when chgParam must reach an outer buffered
- *    node is intentionally OMITTED from this implementation: it is
- *    unsafe for NestedLoop outer drivers and triggers SEGV under
- *    LATERAL inner-child rescan.  Sort/Agg chgParam bubbling is
- *    deferred to T8 pg_isolation_regress where it can be tested under
- *    an explicit plan-parameterisation harness.)
+ *   (No chgParam propagation.  The optional UpdateChangedParamSet
+ *    bubbling used by Sort/Agg wrappers when chgParam must reach an
+ *    outer buffered node is intentionally OMITTED from this
+ *    implementation: it is unsafe for NestedLoop outer drivers and
+ *    triggers SEGV under LATERAL inner-child rescan.  Sort/Agg
+ *    chgParam bubbling is deferred to T8 pg_isolation_regress where
+ *    it can be tested under an explicit plan-parameterisation
+ *    harness.)
  *
  * L3 pg_regress plan-driver limitation
  * -------------------------------------
@@ -554,8 +555,9 @@ SELECT 'PASS:O0_COVERAGE_GAPS_9_BRANCHES_FILLED' AS section_o_status;
  *     (pquery.c:L1672-L1711 holdStore path) and NEVER re-enter
  *     ExecutorRewind, so our callback is never invoked.
  *   - SCROLL WITHOUT HOLD cursors over non-MarkRestore plans (our
- *     CustomScan has optional Mark/Restore methods but the planner
- *     only pre-conditions MarkRestore paths for SCROLL when the plan
+ *     CustomScan deliberately exposes NO Mark/Restore methods and does
+ *     not set CUSTOMPATH_SUPPORT_MARK_RESTORE, so the planner only
+ *     pre-conditions MarkRestore paths for SCROLL when the plan
  *     tree is ALL-markable from leaf to root) transparently spool the
  *     first forward FETCH into a portal-level tuplestore; MOVE BACKWARD
  *     after that only rewinds the spool (DoPortalRewind) and skips

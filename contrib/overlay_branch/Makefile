@@ -37,7 +37,10 @@ REGRESS = \
   overlay_branch_rentry \
   overlay_branch_view_unify \
   overlay_branch_planner_cost \
-  overlay_branch_keyless
+  overlay_branch_keyless \
+  overlay_branch_parallel \
+  overlay_branch_memgrow \
+  overlay_branch_pushdown
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \

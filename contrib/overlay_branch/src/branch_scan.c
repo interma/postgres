@@ -12,13 +12,16 @@
 
 #include "access/heapam.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/stratnum.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "executor/tuptable.h"
 #include "executor/nodeCustom.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -60,8 +63,6 @@ static void  ob_branchscan_begin(CustomScanState *node, EState *estate, int efla
 static TupleTableSlot *ob_branchscan_exec(CustomScanState *node);
 static void  ob_branchscan_end(CustomScanState *node);
 static void  ob_branchscan_rescan(CustomScanState *node);
-static void  ob_branchscan_mark_pos(CustomScanState *node);
-static void  ob_branchscan_rest_pos(CustomScanState *node);
 
 static const CustomPathMethods  ob_branchscan_path_methods = {
     "overlay_branch_branchscan",
@@ -80,9 +81,138 @@ static const CustomExecMethods ob_branchscan_exec_methods = {
     .ExecCustomScan     = ob_branchscan_exec,
     .EndCustomScan      = ob_branchscan_end,
     .ReScanCustomScan   = ob_branchscan_rescan,
-    .MarkPosCustomScan  = ob_branchscan_mark_pos,
-    .RestrPosCustomScan = ob_branchscan_rest_pos,
+    /* MarkPos/RestorePos intentionally left NULL.  We never advertise
+     * CUSTOMPATH_SUPPORT_MARK_RESTORE, so the planner inserts a Material node
+     * above us whenever an upper node (MergeJoin) needs mark/restore; a
+     * forward heap scan cannot be rewound in a streaming iterator, so
+     * nodeCustom.c's own "does not support MarkPos" error is the correct
+     * failure mode if that assumption ever breaks. */
 };
+
+/* ================================================================
+ * RD-6 — streaming 2-pass overlay iterator.
+ *
+ * The old helper returned a fully materialised List<TupleTableSlot*>:
+ * the FIRST ExecCustomScan call paid for the whole overlay (MAIN heap
+ * scan + delta merge + every reconstructed row) before yielding tuple
+ * one, so LIMIT / cursors could not stop early.  The iterator below
+ * produces ONE merged row per overlay_scan_next() call instead.
+ *
+ * Iteration ORDER is byte-for-byte the old one (Pass 1 walks the MAIN
+ * baseline in heap/SPI order, Pass 2 walks delta_list in append order),
+ * so every result set is unchanged — only *when* the work happens moves.
+ *
+ * The state is allocated in the caller's result context (BranchScan →
+ * ebs->scan_cxt, child of es_query_cxt; SRF → multi_call_memory_ctx) so
+ * its lifetime matches the slots it hands out.  close() releases the
+ * delta payload (TopMemoryContext), the heap scan descriptor and the probe
+ * slot; the relation and the state itself are owned by the caller (the
+ * relation is borrowed, the state is reclaimed with the context).
+ * ================================================================ */
+typedef struct OverlayScanState
+{
+    MemoryContext   result_cxt;   /* owns every emitted slot / datum copy */
+    Relation        rel;          /* borrowed: the caller keeps it open */
+    TupleDesc       reldesc;
+    TupleDesc       slot_desc;    /* shared TTSOpsVirtual desc for emitted rows */
+    int             natts;
+    bool            rel_has_pk;
+
+    List           *delta_list;   /* owned; payload lives in TopMemoryContext */
+    DeltaTuple    **arr;          /* delta_list pointers, sorted by key */
+    int             M_total;
+    bool            delta_all_typed;
+
+    /* ---- Pass 1: MAIN baseline source ---- */
+    bool            has_pk_pred;
+    /* non-P0: live forward heap scan + buffer-heap probe slot */
+    TableScanDesc   tscan;
+    TupleTableSlot *probe;
+    bool            do_prefilter;
+    ExprState      *qual;
+    ExprContext    *qual_econtext;
+    /* P0 point query: SPI produced at most one pre-materialised MAIN row
+     * (ObMainRow) here.  Its slot->tts_tid carries the keyless ctid anchor
+     * and raw_xmin the anchor freshness check (ob_anchor_is_stale). */
+    List           *p0_rows;
+    ListCell       *p0_cur;
+    bool            pass1_done;
+
+    /* ---- Pass 2: pure-delta orphans (no MAIN counterpart) ---- */
+    bool            pass2_started;
+    ListCell       *pass2_cur;
+} OverlayScanState;
+
+static OverlayScanState *overlay_scan_open(Relation rel, int32 branch_id,
+                                           bool has_pk_pred,
+                                           const char *pk_where_sql,
+                                           const char *pk_serialized_key,
+                                           bool has_general_where,
+                                           const char *general_where_sql,
+                                           ExprState *qual,
+                                           ExprContext *qual_econtext,
+                                           MemoryContext result_cxt);
+static TupleTableSlot *overlay_scan_next(OverlayScanState *st);
+static void overlay_scan_close(OverlayScanState *st);
+
+/* Search key bundle for the Pass 1 bsearch: carries BOTH the typed pk
+ * (preferred) and the legacy JSON text key (fallback) for a single MAIN
+ * row, so the fixed-signature comparator needs no per-call global state. */
+typedef struct ObSearchKey
+{
+    TypedKey   *typed_pk;      /* NULL if the MAIN-side build failed */
+    int         typed_n;       /* columns in typed_pk, 0 if invalid */
+    const char *text_key;      /* serialised JSON text (may be NULL) */
+} ObSearchKey;
+
+/* qsort comparator for DeltaTuple** by key: typed pk when BOTH sides carry
+ * one (R14 native type semantics for BPCHAR / NUMERIC / TIMESTAMPTZ),
+ * legacy strcmp(dt->key) otherwise.  NULL keys sort last. */
+static int
+ob_cmp_dtp_by_key(const void *a, const void *b)
+{
+    DeltaTuple *const *da = (DeltaTuple *const *) a;
+    DeltaTuple *const *db = (DeltaTuple *const *) b;
+    DeltaTuple *dta = (da) ? *da : NULL;
+    DeltaTuple *dtb = (db) ? *db : NULL;
+    const char *ka = (dta) ? dta->key : NULL;
+    const char *kb = (dtb) ? dtb->key : NULL;
+
+    if (ka == NULL && kb == NULL) return 0;
+    if (ka == NULL) return +1;
+    if (kb == NULL) return -1;
+    if (dta != NULL && dtb != NULL &&
+        dta->typed_pk_n > 0 && dtb->typed_pk_n > 0 &&
+        dta->typed_pk != NULL && dtb->typed_pk != NULL)
+        return overlay_typed_pk_cmp(dta->typed_pk, dta->typed_pk_n,
+                                    dtb->typed_pk, dtb->typed_pk_n);
+    return strcmp(ka, kb);
+}
+
+/* bsearch comparator: const ObSearchKey* (key) vs DeltaTuple** (element). */
+static int
+ob_cmp_searchkey_vs_dtp(const void *vkey, const void *velem)
+{
+    const ObSearchKey *skb = (const ObSearchKey *) vkey;
+    DeltaTuple *const *pdt = (DeltaTuple *const *) velem;
+    DeltaTuple *dt = (pdt) ? *pdt : NULL;
+    const char *ka;
+    const char *kd;
+
+    if (skb == NULL && dt == NULL) return 0;
+    if (skb == NULL) return +1;
+    if (dt == NULL) return -1;
+    if (skb->typed_pk != NULL && skb->typed_n > 0 &&
+        dt->typed_pk != NULL && dt->typed_pk_n > 0)
+        return overlay_typed_pk_cmp(skb->typed_pk, skb->typed_n,
+                                    dt->typed_pk, dt->typed_pk_n);
+    ka = skb->text_key;
+    kd = dt->key;
+    if (ka == NULL && kd == NULL) return 0;
+    if (ka == NULL) return +1;
+    if (kd == NULL) return -1;
+    return strcmp(ka, kd);
+}
 
 /* ----- ExtendedCustomScanState: embed CustomScanState as 1st field per PG
  * design rule (ExecInitCustomScan nodeCustom.c L36-40).  BranchScanState
@@ -95,14 +225,11 @@ typedef struct ExtendedCustomScanState
 {
     CustomScanState css;          /* MUST be first field for IsA/castNode */
     /* our private state follows */
-    List         *result_slots;
-    ListCell     *cursor;
-    ListCell     *mark_cursor;    /* saved position for Mark/Restore */
+    OverlayScanState *scan;       /* streaming iterator; NULL until first Exec */
+    MemoryContext scan_cxt;       /* owns the iterator + every emitted slot */
     Relation      rel;
-    TupleDesc     rel_desc;
     Oid           relid;
     int32         branch_id;
-    bool          materialized;
     /* P0 PK-IndexScan MVP: 从 Planner hook 透传的快速路径信息 */
     bool          has_pk_pred;
     char         *pk_where_sql;
@@ -132,19 +259,23 @@ typedef struct ExtendedCustomScanState
  * the anchored ctid but written by a different transaction is a DIFFERENT
  * logical row.
  *
+ * `raw_xmin` is the MAIN reader's captured HeapTupleHeaderGetRawXmin for
+ * the matched row (ObMainRow.raw_xmin): the physical scan slot itself is
+ * reused/popped before Pass 1 runs, so only the xmin value is carried
+ * forward.
+ *
  * Returns true when the anchor is provably stale (delta must NOT be
  * matched; the Pass 2 orphan rule then drops it, exactly like the
  * concurrently-UPDATEd case).  A frozen tuple is accepted as-is: VACUUM
  * can freeze a tuple in place, so a non-normal xmin proves nothing.
  * ================================================================ */
 static bool
-ob_anchor_is_stale(const DeltaTuple *dt, HeapTuple htup)
+ob_anchor_is_stale(const DeltaTuple *dt, TransactionId raw_xmin)
 {
     const char   *dash;
     unsigned long anchor_xmin;
 
-    if (dt == NULL || dt->key == NULL || dt->old_version == NULL ||
-        htup == NULL || htup->t_data == NULL)
+    if (dt == NULL || dt->key == NULL || dt->old_version == NULL)
         return false;
     if (!(dt->key[0] == 'A' && dt->key[1] == ':'))
         return false;
@@ -155,130 +286,260 @@ ob_anchor_is_stale(const DeltaTuple *dt, HeapTuple htup)
     if (sscanf(dash + 2, "%lu", &anchor_xmin) != 1)
         return false;
 
-    if (!TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(htup->t_data)))
+    if (!TransactionIdIsNormal(raw_xmin))
         return false;
 
-    return ((TransactionId) anchor_xmin) != HeapTupleHeaderGetRawXmin(htup->t_data);
+    return ((TransactionId) anchor_xmin) != raw_xmin;
 }
 
+/* One MAIN baseline row as produced by the MAIN reader below: the merge
+ * input slot plus the physical half of the keyless anchor.  The ctid half
+ * lives in slot->tts_tid; raw_xmin is kept separately because the anchor
+ * freshness check (ob_anchor_is_stale) is only meaningful for keyless
+ * tables and must survive past the end of the heap scan. */
+typedef struct ObMainRow
+{
+    TupleTableSlot *slot;
+    TransactionId   raw_xmin;
+} ObMainRow;
+
 /* ================================================================
- * SHARED 2-pass helper (called by BOTH SRF and CustomScan Executor)
+ * SHARED streaming 2-pass overlay iterator (used by BOTH the SRF and the
+ * CustomScan executor).
  *
  *   PK-predicate fast-path (P0 MVP):
  *     has_pk_pred = true
  *     pk_where_sql = non-empty SQL fragment like "id = 10::integer"
  *     pk_serialized_key = non-empty JSON array string like '["10"]'
- *   → SPI MAIN 查询用 WHERE 子句（不是 SELECT * FROM table 全表）
- *   → Delta 用 overlay_delta_lookup 精确匹配（不是 list_for_rel 全量）
+ *   -> MAIN 用 SPI SELECT ... WHERE pk_where_sql（<=1 行点查）
+ *   -> Delta 用 overlay_delta_lookup 精确匹配（不是 list_for_rel 全量）
  *
- *   General non-PK qual pushdown (P2 MVP):
- *     has_general_where = true
- *     general_where_sql = deparse_expression() 产出的一个或多个 AND 子句，
- *                        例如 "color = 'green'::text AND amt < 100::numeric"
- *   → SPI MAIN 查询把这段追加 (PK 和 general 均存在时用 "AND (general)")
- *   → Delta 侧仍走 list_for_rel 全量（非 PK 条件无法按主键 key 索引），
- *     但 MAIN 侧行数已大幅减少，通常 10x~100x 收益。
+ *   RD-7 — everything else reads the MAIN heap directly:
+ *     qual / qual_econtext = executor-owned ExprState (= baserestrictinfo)
+ *                            + the ExprContext to evaluate it in.  NULL
+ *                            (SRF path) disables the prefilter.
+ *   -> table_beginscan/table_scan_getnextslot 取代 SPI `SELECT *`
+ *   -> qual 预筛 MAIN 行（仅 PK 表：keyless 靠 Pass2 兜底不成立）
+ *
+ *   General non-PK qual pushdown (P2 MVP) 的 SQL 文本现在只服务 P0
+ *   点查；非 P0 的等价过滤由 qual 预筛承担。
+ *
+ * RD-6 把旧 helper 从“先全量物化 List<slot>”改为迭代器：
+ *   overlay_scan_open()  一次性 setup（delta 加载 + 排序 + 读取端上膛）
+ *   overlay_scan_next()  每次产出一行（Pass1 走 MAIN 基线，Pass2 补发 delta 孤儿）
+ *   overlay_scan_close() 释放临时资源（堆扫描述符 / 探针 slot / delta payload）
+ * 迭代顺序与旧实现逐字节一致 → 结果集不变，只有“何时做工作”变了，
+ * 从而让 LIMIT / 游标可以早停。
  * ================================================================ */
-static List *
-ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tupdesc,
-                                  bool has_pk_pred,
-                                  const char *pk_where_sql,
-                                  const char *pk_serialized_key,
-                                  bool has_general_where,
-                                  const char *general_where_sql)
+
+/* Free the delta payload loaded by overlay_scan_open(): every DeltaTuple plus
+ * its key / old_version / tuple_data strings (all palloc'd in TopMemoryContext
+ * by delta_store.c) and the lazily-built typed_pk.  R13 S07: leaking these
+ * grew the backend RSS without bound on long sessions (MF-1). */
+static void
+ob_overlay_free_delta_list(List *delta_list)
 {
-    Relation    rel;
+    ListCell *lc;
+
+    foreach(lc, delta_list)
+    {
+        DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
+
+        if (dt == NULL)
+            continue;
+        /* key always exists (list_for_rel always pstrdup("") for isnull).
+         * tuple_data is NULL for op=DELETE entries; non-NULL for I/U.
+         * old_version is NULL for pure-delta INSERTs, else the MAIN base
+         * version copy (also TopMemoryContext).  typed_pk is the R14 add-on
+         * built lazily in overlay_scan_open(). */
+        if (dt->key != NULL) pfree(dt->key);
+        if (dt->old_version != NULL) pfree(dt->old_version);
+        if (dt->tuple_data != NULL) pfree(dt->tuple_data);
+        if (dt->typed_pk != NULL && dt->typed_pk_n > 0)
+            overlay_typed_pk_free(dt->typed_pk, dt->typed_pk_n);
+        pfree(dt);
+    }
+    list_free(delta_list);
+}
+
+/*
+ * One-time setup for a streaming overlay scan over `rel` (the caller keeps
+ * the relation open and owns the lock).  result_cxt owns the iterator, the
+ * shared slot descriptor and every slot handed out by overlay_scan_next();
+ * NULL means CurrentMemoryContext (caller-managed, same contract as before).
+ */
+static OverlayScanState *
+overlay_scan_open(Relation rel, int32 branch_id,
+                  bool has_pk_pred,
+                  const char *pk_where_sql,
+                  const char *pk_serialized_key,
+                  bool has_general_where,
+                  const char *general_where_sql,
+                  ExprState *qual,
+                  ExprContext *qual_econtext,
+                  MemoryContext result_cxt)
+{
+    OverlayScanState *st;
     TupleDesc   reldesc;
     int         natts;
-    bool        rel_has_pk_;
-    List       *delta_list;
-    List       *result_slots = NIL;
-    const char *q_nspname;
-    const char *q_relname;
-    char       *q_qualified;
-    StringInfoData sql;
-    bool        any_where;
-    int         ret;
+    Oid         relid;
+    MemoryContext oldcxt;
 
-    rel = table_open(relid, AccessShareLock);
+    Assert(rel != NULL);
     reldesc = RelationGetDescr(rel);
     natts = reldesc->natts;
-    rel_has_pk_ = overlay_relation_has_pk(rel);
+    relid = RelationGetRelid(rel);
 
-    /* P0 PK-IndexScan MVP: 选 delta 加载策略 */
+    oldcxt = MemoryContextSwitchTo(result_cxt != NULL ? result_cxt
+                                                      : CurrentMemoryContext);
+
+    st = (OverlayScanState *) palloc0(sizeof(OverlayScanState));
+    st->result_cxt    = CurrentMemoryContext;
+    st->rel           = rel;
+    st->reldesc       = reldesc;
+    st->natts         = natts;
+    st->rel_has_pk    = overlay_relation_has_pk(rel);
+    st->has_pk_pred   = has_pk_pred;
+    st->qual          = qual;
+    st->qual_econtext = qual_econtext;
+    /* Prefilter MAIN rows with the executor's baserestrictinfo qual ONLY for
+     * PK tables.  A MAIN row filtered out here whose branch edit still lives
+     * in the delta falls to the Pass 2 orphan rule: Pass 2 reconstructs a *PK*
+     * orphan from tuple_data, but DROPS an unmatched keyless ("A:") anchor
+     * (resurrecting it by ctid would be unsafe).  So keyless must scan MAIN
+     * unfiltered and rely on the executor's post-merge qual re-check. */
+    st->do_prefilter   = (qual != NULL && qual_econtext != NULL && st->rel_has_pk);
+
+    /* RD-3: one shared tupdesc for every emitted slot.  CreateTupleDescCopy()
+     * is NOT reference-counted (tdrefcount == -1), so MakeSingleTupleTableSlot
+     * / slot drop PinTupleDesc/ReleaseTupleDesc are no-ops and the descriptor
+     * simply lives in result_cxt until the caller resets it. */
+    st->slot_desc = CreateTupleDescCopy(reldesc);
+
+    /* ---- delta side: P0 singleton lookup vs full (branch_id, relid) list ---- */
     if (has_pk_pred && pk_serialized_key != NULL && pk_serialized_key[0] != '\0')
     {
-        DeltaTuple *singleton;
+        DeltaTuple *singleton = (DeltaTuple *) palloc0(sizeof(DeltaTuple));
 
-        singleton = (DeltaTuple *) palloc0(sizeof(DeltaTuple));
         if (overlay_delta_lookup(branch_id, relid, pk_serialized_key, singleton))
-            delta_list = list_make1(singleton);
+            st->delta_list = list_make1(singleton);
         else
         {
             pfree(singleton);
-            delta_list = NIL;
+            st->delta_list = NIL;
         }
     }
     else
-        delta_list = overlay_delta_list_for_rel(branch_id, relid);
+        st->delta_list = overlay_delta_list_for_rel(branch_id, relid);
 
-    q_nspname = get_namespace_name(RelationGetNamespace(rel));
-    q_relname = RelationGetRelationName(rel);
-    q_qualified = quote_qualified_identifier(q_nspname, q_relname);
-    initStringInfo(&sql);
-    any_where = false;
+    st->M_total = list_length(st->delta_list);
 
-    /* Build the SPI SELECT with any combination of pushdown conditions. */
-    appendStringInfo(&sql, "SELECT * FROM %s", q_qualified);
-    pfree(q_qualified);
-
-    if (has_pk_pred && pk_where_sql != NULL && pk_where_sql[0] != '\0')
+    /* ---- sort the delta pointers by key + warm the typed PKs ----
+     * O(N x M) strcmp per MAIN row would stall the executor on realistic
+     * workloads, so the pre-flight builds every delta key ONCE and qsort()s the
+     * pointer array; Pass 1 then bsearch()es each MAIN row: O(M log M + N log M).
+     * Build failures (no PK / relation changed) leave typed_pk_n == 0 so the
+     * comparators fall back to the legacy strcmp(dt->key).  No post-sort dedup:
+     * pg_branch_delta is keyed by PRIMARY KEY (branch_id, relid, key) and this
+     * list is loaded with an exact (branch_id, relid) filter, so keys are
+     * already unique (RD-1/RD-2) — the old O(M^2) fold was identity. */
+    if (st->M_total > 0)
     {
-        appendStringInfo(&sql, " WHERE (%s)", pk_where_sql);
-        any_where = true;
-    }
-    if (has_general_where && general_where_sql != NULL && general_where_sql[0] != '\0')
-    {
-        if (any_where)
-            appendStringInfo(&sql, " AND (%s)", general_where_sql);
-        else
+        int       i;
+        ListCell *lc;
+
+        st->arr = (DeltaTuple **) palloc(sizeof(DeltaTuple*) * (st->M_total + 1));
+        i = 0;
+        foreach(lc, st->delta_list)
+            st->arr[i++] = (DeltaTuple *) lfirst(lc);
+
+        st->delta_all_typed = true;
+        for (i = 0; i < st->M_total; i++)
         {
-            appendStringInfo(&sql, " WHERE (%s)", general_where_sql);
+            DeltaTuple *dtp = st->arr[i];
+
+            if (dtp != NULL && dtp->typed_pk_n < 0 && dtp->key != NULL)
+            {
+                int       nout = 0;
+                TypedKey *out  = overlay_build_typed_pk_from_key_text(rel, dtp->key, &nout);
+
+                if (out != NULL && nout > 0)
+                {
+                    dtp->typed_pk   = out;
+                    dtp->typed_pk_n = nout;
+                }
+                else
+                {
+                    dtp->typed_pk   = NULL;
+                    dtp->typed_pk_n = 0;
+                }
+            }
+            /* RD-8: one entry without a typed key forces the whole scan back
+             * onto the JSON-text comparison path. */
+            if (dtp == NULL || dtp->typed_pk_n <= 0)
+                st->delta_all_typed = false;
+        }
+        qsort(st->arr, st->M_total, sizeof(DeltaTuple*), ob_cmp_dtp_by_key);
+    }
+
+    /* ================================================================
+     * Pass 1 source: MAIN baseline reader
+     * ================================================================
+     * • has_pk_pred (P0): SPI `SELECT * FROM rel WHERE pk = val` (<=1 row).
+     *   We deliberately keep SPI here to reuse the planner's PK index scan:
+     *   hand-rolling a btree ScanKey would require strict literal->PK-type
+     *   coercion (BPCHAR / NUMERIC / collation) and a mismatch would silently
+     *   return 0 rows.
+     * • everything else: a direct forward heap scan (table_beginscan), pulled
+     *   one row at a time by overlay_scan_next().  No SPI, no whole-result-set
+     *   materialisation.
+     * ================================================================ */
+    if (has_pk_pred)
+    {
+        const char   *q_nspname = get_namespace_name(RelationGetNamespace(rel));
+        const char   *q_relname = RelationGetRelationName(rel);
+        char         *q_qualified;
+        StringInfoData sql;
+        bool          any_where;
+        bool          pushed_snap_;
+        bool          pop_done_;
+        int           ret;
+
+        q_qualified = quote_qualified_identifier(q_nspname, q_relname);
+        initStringInfo(&sql);
+        any_where = false;
+
+        appendStringInfo(&sql, "SELECT * FROM %s", q_qualified);
+        if (pk_where_sql != NULL && pk_where_sql[0] != '\0')
+        {
+            appendStringInfo(&sql, " WHERE (%s)", pk_where_sql);
             any_where = true;
         }
-    }
+        if (has_general_where && general_where_sql != NULL && general_where_sql[0] != '\0')
+        {
+            if (any_where)
+                appendStringInfo(&sql, " AND (%s)", general_where_sql);
+            else
+            {
+                appendStringInfo(&sql, " WHERE (%s)", general_where_sql);
+                any_where = true;
+            }
+        }
+        pfree(q_qualified);
 
-    /* ----- Guard: run the internal MAIN seqscan *outside* the Planner
-     * hook overlay (otherwise infinite recursion: helper → SPI SELECT →
-     * Planner hook → CustomScan → helper …).  Use PG_TRY to restore the flag
-     * on ANY error path — otherwise a single failed helper call leaves the
-     * flag stuck true for the rest of the session and *disables*
-     * transparent overlay reads permanently.
-     *
-     * V3 FR5 (T5): Push/Pop Snapshot Balance Rules
-     * --------------------------------------------
-     * When the branch uses SNAPSHOT mode, the MAIN baseline read must use
-     * the frozen TransactionSnapshot captured at use_branch() entry time and
-     * stored in ctx->branch_main_snapshot.  We wrap ONLY push it AROUND the
-     * single ob_spi_one_shot() call (not longer — no helper-wide push without pop
-     * early-return ereport(ERROR) double-pops or imbalance).
-     *
-     * BALANCE INVARIANT (strict):
-     *   • pushed_snap_ = (ctx != NULL && ctx->snap != NULL)
-     *   • TRY body: push → SPI → pfree sql → check ret; ONLY ONE pop BEFORE any
-     *     control-flow leaves the TRY block.
-     *   • CATCH body: pop ONLY if the push was STILL ACTIVE (not yet popped)
-     *     by the normal path).  We track this with a separate
-     *     `pop_done` flag that both TRY and CATCH can see (declared at
-     *     outer block scope so CATCH can read write it).
-     *   • helper enter/exit are balanced independently (already handled outermost.  Live mode: zero
-     *     overhead (no push pop skipped entirely).                          */
-    {
-        bool        pushed_snap_;
-        bool        pop_done_;
-
+        /* ----- Guard: run the internal MAIN query *outside* the Planner hook
+         * overlay (otherwise infinite recursion: helper -> SPI SELECT ->
+         * Planner hook -> CustomScan -> helper ...).  PG_TRY restores the flag
+         * on ANY error path — otherwise one failed call leaves it stuck true
+         * for the rest of the session and disables transparent overlay reads.
+         *
+         * Push/Pop Snapshot Balance Rules: in SNAPSHOT mode the MAIN baseline
+         * read must use the frozen snapshot captured at use_branch() time.
+         * Exactly one push brackets the single ob_spi_one_shot() call and
+         * exactly one pop follows it; pop_done_ lets the CATCH path avoid a
+         * double pop. */
         pushed_snap_ = (CurrentBranchContext != NULL &&
-                      CurrentBranchContext->branch_main_snapshot != NULL);
+                        CurrentBranchContext->branch_main_snapshot != NULL);
         pop_done_ = false;
 
         overlay_overlay_helper_enter();
@@ -297,10 +558,9 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
             if (ret != SPI_OK_SELECT)
             {
                 SPI_finish();
-                table_close(rel, AccessShareLock);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
-                         errmsg("ob_compute_overlay_slots: SPI main seqscan failed ret=%d", ret)));
+                         errmsg("overlay_scan_open: SPI main point query failed ret=%d", ret)));
             }
         }
         PG_CATCH();
@@ -312,345 +572,232 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
         }
         PG_END_TRY();
         overlay_overlay_helper_exit();
+
+        /* ob_spi_one_shot() left SPI connected and reparented the current
+         * memory context onto the SPI proc context — which SPI_finish()
+         * destroys.  The row built below MUST survive that, so re-enter
+         * result_cxt first (doc RD-7 pitfall #2). */
+        MemoryContextSwitchTo(st->result_cxt);
+
+        if (SPI_processed > 0 && SPI_tuptable != NULL &&
+            SPI_tuptable->vals != NULL)
+        {
+            TupleDesc       td_spi = SPI_tuptable->tupdesc;
+            uint64          row;
+
+            /* The PK pushdown is no longer a point query: IN / range / OR
+             * can match many MAIN rows, so materialise ALL of them (each in
+             * result_cxt) and let the Pass1 cursor drain the list. */
+            for (row = 0; row < SPI_processed; row++)
+            {
+                HeapTuple       htup = SPI_tuptable->vals[row];
+                TupleTableSlot *mslot;
+                ObMainRow      *mrow;
+                int             a;
+
+                mslot = MakeSingleTupleTableSlot(st->slot_desc, &TTSOpsVirtual);
+                for (a = 0; a < natts; a++)
+                {
+                    bool                isnull;
+                    Form_pg_attribute   ratt = TupleDescAttr(reldesc, a);
+                    Datum               d;
+
+                    d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
+                    mslot->tts_isnull[a] = isnull;
+                    mslot->tts_values[a] = isnull
+                                               ? (Datum) 0
+                                               : datumCopy(d, ratt->attbyval, ratt->attlen);
+                }
+                ExecStoreVirtualTuple(mslot);
+                mslot->tts_nvalid = natts;
+                mslot->tts_tid = htup->t_self;
+
+                mrow = (ObMainRow *) palloc(sizeof(ObMainRow));
+                mrow->slot = mslot;
+                mrow->raw_xmin = (htup->t_data != NULL)
+                                     ? HeapTupleHeaderGetRawXmin(htup->t_data)
+                                     : InvalidTransactionId;
+                st->p0_rows = lappend(st->p0_rows, mrow);
+            }
+        }
+        st->p0_cur = list_head(st->p0_rows);
+        SPI_finish();
+    }
+    else
+    {
+        Snapshot snap;
+
+        if (CurrentBranchContext != NULL &&
+            CurrentBranchContext->branch_main_snapshot != NULL)
+            snap = CurrentBranchContext->branch_main_snapshot;
+        else
+            snap = GetActiveSnapshot();
+
+        st->probe = MakeSingleTupleTableSlot(reldesc, &TTSOpsBufferHeapTuple);
+        st->tscan = table_beginscan(rel, snap, 0, NULL);
     }
 
+    MemoryContextSwitchTo(oldcxt);
+    return st;
+}
+
+/*
+ * Produce the next merged overlay row, or NULL once both passes are done.
+ * Pass 1 walks the MAIN baseline (heap scan / P0 point row) and applies the
+ * matching delta side-effect (keep / tombstone / reconstruct); Pass 2 then
+ * emits the delta INSERT/UPDATE orphans that had no MAIN counterpart.
+ */
+static TupleTableSlot *
+overlay_scan_next(OverlayScanState *st)
+{
+    MemoryContext oldcxt;
+
+    if (st == NULL)
+        return NULL;
+
+    oldcxt = MemoryContextSwitchTo(st->result_cxt);
+
+    /* ---------- Pass 1: MAIN baseline row merged with its delta ---------- */
+    while (!st->pass1_done)
     {
-        HeapTuple  *htups = NULL;
-        TupleDesc   td_spi = NULL;
-        uint64      n = 0;
-        MemoryContext oldcxt;
+        TupleTableSlot *main_slot = NULL;
+        TransactionId   raw_xmin = InvalidTransactionId;
 
-        if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
+        if (st->has_pk_pred)
         {
-            htups = SPI_tuptable->vals;
-            td_spi = SPI_tuptable->tupdesc;
-            n = SPI_processed;
+            ObMainRow *mrow;
+
+            if (st->p0_cur == NULL)
+            {
+                st->pass1_done = true;
+                break;
+            }
+            mrow = (ObMainRow *) lfirst(st->p0_cur);
+            st->p0_cur = lnext(st->p0_rows, st->p0_cur);
+            main_slot = mrow->slot;
+            raw_xmin  = mrow->raw_xmin;
         }
-
-        /* All result slots (from MAIN or delta INSERT) go in
-         * TopMemoryContext so they outlive this helper call.  Switch
-         * here regardless of whether MAIN has rows (SPI_processed==0
-         * case: delta INSERT-only result set still needs correct cxt). */
-        oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-
-        /* ================================================================
-         * REVIEW-260926 / R11 R12 —  O(N × M) → O(M log M + N log M) merge
-         * ================================================================
-         * Hot loop in Pass1 used to be:
-         *     foreach MAIN i  { serialize pk;  foreach(dt in delta_list) strcmp; }
-         * which is exactly O(N × M) comparisons (N = #MAIN rows, M = #delta rows).
-         * Under realistic workloads N≈1e5 rows × M≈50k deltas = 5e9 string
-         * comparisons which stalls the executor for minutes.
-         *
-         * Fix: sort delta_list pointers by dt->key (C string strcmp order),
-         * collapse to unique keys keeping the LATEST entry (fixes the
-         * latent I→U first-match semantic bug from the O(N×M) scan), then
-         * use bsearch per MAIN row:
-         *   Phase A (copy+sort):          O(M log M)
-         *   Phase B (unique latest-wins): O(M + K²)  K = max same-key run.
-         *                                  For real-world K ∈ 1..3 this is
-         *                                  effectively O(M).  We intentionally
-         *                                  do NOT rely on qsort stability.
-         *   Pass1 (MAIN merge):           O(N log M_unique)
-         *
-         * Pass2 also used to use an HTAB keyed by `const char *` +
-         * HASH_BLOBS.  That produced WRONG fold behaviour because
-         * HASH_BLOBS keysize=sizeof(pointer) hashes the ADDRESS of the
-         * key string, not its CONTENTS.  Two different allocations for
-         * the same logical key would land in different buckets and the
-         * dedup silently failed (multi-op pure-I/U chains emitted
-         * duplicate rows).  Pass2 is therefore also rewritten as two
-         * pure linear walks (no hash table) over delta_list, with
-         * explicit per-key latest-wins bookkeeping; complexity O(M²)
-         * worst-case for pathological all-keys-equal input, in practice
-         * 1-to-few per-key → O(M).
-         *
-         * Latest-wins tie-break for same-key multi-op (Pass1 + Pass2):
-         *   I→U  → keep U   (Pass1 MAIN merge uses U.tuple_data; Pass2
-         *                    pure path reconstructs U, fixes latent I bug).
-         *   U→U  → keep last U.
-         *   U→D  → keep D   (Pass1 MAIN tombstone; Pass2 drops key).
-         *   I→U→D→I (reborn) → keep the final I.
-         * The "original delta_list order" (= append chronological by
-         * construction inside delta_store.c list_for_rel) is the ground
-         * truth for "latest": higher list-index = later. */
+        else
         {
-            /* ---- SORT / BSEARCH PASS1 HELPERS ---- */
-            int            M_total = list_length(delta_list);
-            DeltaTuple   **arr = NULL;
-            int            i_arr;
-            ListCell      *lc;
-            /* qsort comparator: DeltaTuple** vs DeltaTuple**.
-             * Prefer overlay_typed_pk_cmp when BOTH sides have non-NULL
-             * typed_pk (R14: preserves PG native type semantics for
-             * BPCHAR / NUMERIC / TIMESTAMPTZ etc.); fall back to legacy
-             * strcmp(dt->key) whenever either side lacks a typed key so
-             * the comparator is a total order regardless of populate
-             * state.  NULL keys (shouldn't happen; defensive) sort to
-             * the end. */
-            int cmp_dtp_by_cstr(const void *a, const void *b)
+            int a;
+
+            if (!table_scan_getnextslot(st->tscan, ForwardScanDirection, st->probe))
             {
-                DeltaTuple *const *da = (DeltaTuple *const *) a;
-                DeltaTuple *const *db = (DeltaTuple *const *) b;
-                DeltaTuple *dta = (da) ? *da : NULL;
-                DeltaTuple *dtb = (db) ? *db : NULL;
-                const char *ka = (dta) ? dta->key : NULL;
-                const char *kb = (dtb) ? dtb->key : NULL;
-                if (ka == NULL && kb == NULL) return 0;
-                if (ka == NULL) return +1;
-                if (kb == NULL) return -1;
-                if (dta != NULL && dtb != NULL &&
-                    dta->typed_pk_n > 0 && dtb->typed_pk_n > 0 &&
-                    dta->typed_pk != NULL && dtb->typed_pk != NULL)
-                    return overlay_typed_pk_cmp(dta->typed_pk, dta->typed_pk_n,
-                                                dtb->typed_pk, dtb->typed_pk_n);
-                return strcmp(ka, kb);
-            }
-            /* Search key bundle: carries BOTH the typed pk (preferred)
-             * and legacy text pk (fallback) for a single MAIN row.  Used
-             * as the bsearch "key" pointer so the fixed-signature
-             * comparator receives everything it needs without any
-             * per-call global state. */
-            typedef struct SearchKeyBundle
-            {
-                TypedKey   *typed_pk;      /* NULL if MAIN-side build failed */
-                int         typed_n;       /* columns in typed_pk, 0 if invalid */
-                const char *text_key;      /* serialised JSON text (non-NULL) */
-            } SearchKeyBundle;
-            /* bsearch comparator: const SearchKeyBundle* (search key) vs
-             * DeltaTuple** (array element).  Typed comparison is used
-             * whenever BOTH sides carry a populated typed pk; otherwise
-             * falls back to strcmp on the legacy text key.  NULL safety
-             * everywhere because comparator is used with qsort/bsearch
-             * from libc (we cannot guarantee non-NULL pointers on all
-             * paths for all libc implementations). */
-            int cmp_searchkey_vs_dtp(const void *vkey, const void *velem)
-            {
-                const SearchKeyBundle *skb = (const SearchKeyBundle *) vkey;
-                DeltaTuple *const *pdt = (DeltaTuple *const *) velem;
-                DeltaTuple       *dt  = (pdt) ? *pdt : NULL;
-                const char       *ka;
-                const char       *kd;
-                if (skb == NULL && dt == NULL) return 0;
-                if (skb == NULL) return +1;
-                if (dt == NULL) return -1;
-                if (skb->typed_pk != NULL && skb->typed_n > 0 &&
-                    dt->typed_pk != NULL && dt->typed_pk_n > 0)
-                    return overlay_typed_pk_cmp(skb->typed_pk, skb->typed_n,
-                                                dt->typed_pk, dt->typed_pk_n);
-                ka = skb->text_key;
-                kd = dt->key;
-                if (ka == NULL && kd == NULL) return 0;
-                if (ka == NULL) return +1;
-                if (kd == NULL) return -1;
-                return strcmp(ka, kd);
+                st->pass1_done = true;
+                break;
             }
 
-            if (M_total > 0)
+            if (st->do_prefilter)
             {
-                arr = (DeltaTuple **) palloc(sizeof(DeltaTuple*) * (M_total + 1));
-                i_arr = 0;
-                foreach(lc, delta_list)
-                {
-                    arr[i_arr++] = (DeltaTuple *) lfirst(lc);
-                }
-                /* ---- PRE-FLIGHT: lazy-populate typed_pk for every dt
-                 * in the working array whose typed_pk_n is still -1.
-                 * We do this ONCE here (before qsort) instead of
-                 * repeatedly inside the comparators / post-sort /
-                 * Pass2, because the helper needs Relation `rel`
-                 * (available in this helper scope) and may internally
-                 * invoke SPI (cheap amortised once per dt → O(M) vs
-                 * O(M log M) × N bsearch lookups if done per compare).
-                 * Build failures (no PK / relation changed) are left
-                 * as typed_pk_n==-1 → every comparator above falls
-                 * back to legacy strcmp gracefully. */
-                {
-                    int pfi;
-                    for (pfi = 0; pfi < M_total; pfi++)
-                    {
-                        DeltaTuple *dtp = arr[pfi];
-                        if (dtp != NULL && dtp->typed_pk_n < 0 && dtp->key != NULL)
-                        {
-                            int       nout = 0;
-                            TypedKey *out  = NULL;
-                            out = overlay_build_typed_pk_from_key_text(rel, dtp->key, &nout);
-                            if (out != NULL && nout > 0)
-                            {
-                                dtp->typed_pk   = out;
-                                dtp->typed_pk_n = nout;
-                            }
-                            else
-                            {
-                                dtp->typed_pk   = NULL;
-                                dtp->typed_pk_n = 0;
-                            }
-                        }
-                    }
-                }
-                qsort(arr, M_total, sizeof(DeltaTuple*), cmp_dtp_by_cstr);
+                TupleTableSlot *saved_scan;
+                bool            ok;
 
-                /* ---- POST-SORT LATEST-WINS DEDUP (per key) ----
-                 * Runs of identical keys are contiguous after qsort.  For
-                 * each run we pick the entry with the HIGHEST original
-                 * position in delta_list (highest pos = latest by
-                 * chronological append → correct semantic regardless of
-                 * whether qsort was stable).
-                 *
-                 * R14: key-equality test uses overlay_typed_pk_cmp when
-                 * BOTH sides carry a typed pk; otherwise falls back to
-                 * strcmp on the legacy text key.  This fixes BPCHAR
-                 * r-trim / NUMERIC precision / TIMESTAMPTZ runs where
-                 * qsort had already clustered the semantically equal
-                 * entries but strcmp would slice a run in two. */
-                {
-                    int w = 0;
-                    int r = 0;
-                    while (r < M_total)
-                    {
-                        int         rr = r + 1;
-                        DeltaTuple *dtr = arr[r];
-                        while (rr < M_total)
-                        {
-                            DeltaTuple *dtrr = arr[rr];
-                            bool        eq;
-                            if (dtr == NULL || dtrr == NULL)
-                            {
-                                if (dtr == NULL && dtrr == NULL) eq = true;
-                                else                              eq = false;
-                            }
-                            else if (dtr->typed_pk_n > 0 && dtrr->typed_pk_n > 0 &&
-                                     dtr->typed_pk != NULL && dtrr->typed_pk != NULL)
-                            {
-                                eq = (0 == overlay_typed_pk_cmp(dtr->typed_pk, dtr->typed_pk_n,
-                                                                dtrr->typed_pk, dtrr->typed_pk_n));
-                            }
-                            else if (dtr->key == NULL || dtrr->key == NULL)
-                            {
-                                eq = (dtr->key == dtrr->key);
-                            }
-                            else
-                            {
-                                eq = (0 == strcmp(dtr->key, dtrr->key));
-                            }
-                            if (!eq) break;
-                            rr++;
-                        }
-                        /* Scan run arr[r..rr-1] → find one with max original pos. */
-                        {
-                            int     best_in_run = r;
-                            int64   best_pos    = -1;
-                            int     j;
-                            for (j = r; j < rr; j++)
-                            {
-                                ListCell   *lc2;
-                                int         idx = 0;
-                                foreach(lc2, delta_list)
-                                {
-                                    if (((DeltaTuple*) lfirst(lc2)) == arr[j])
-                                        break;
-                                    idx++;
-                                }
-                                /* idx==M_total if not found (impossible;
-                                 * we built arr from delta_list). */
-                                if (idx > best_pos) { best_pos = idx; best_in_run = j; }
-                            }
-                            arr[w++] = arr[best_in_run];
-                        }
-                        r = rr;
-                    }
-                    M_total = w;   /* shrunk: M_unique ≤ M_total */
-                }
+                /* The qual was compiled against a TTSOpsVirtual scan slot, so
+                 * ExecComputeSlotInfo() elided the EEOP_SCAN_FETCHSOME de-form
+                 * step: EEOP_SCAN_VAR then reads scanslot->tts_values[] directly
+                 * and asserts attnum < tts_nvalid.  The buffer-heap probe slot
+                 * is NOT de-formed (tts_nvalid == 0), so materialise its
+                 * attributes here to satisfy that contract. */
+                slot_getsomeattrs(st->probe, st->natts);
+                saved_scan = st->qual_econtext->ecxt_scantuple;
+                st->qual_econtext->ecxt_scantuple = st->probe;
+                ResetExprContext(st->qual_econtext);
+                ok = ExecQual(st->qual, st->qual_econtext);
+                st->qual_econtext->ecxt_scantuple = saved_scan;
+                if (!ok)
+                    continue;
             }
 
-        /* Pass 1: MAIN baseline rows, merged with delta side-effects. */
-        for (uint64 i = 0; i < n; i++)
-        {
-            HeapTuple        htup = htups[i];
-            TupleTableSlot  *main_slot;
-            TupleTableSlot  *output_slot;
-            char           *pk_key;
-            DeltaTuple     *match = NULL;
-            TupleDesc       slot_desc;
-            TypedKey       *main_typed_pk;
-            int             main_typed_n;
-            SearchKeyBundle skb;
-
-            slot_desc = CreateTupleDescCopy(reldesc);
-            main_slot = MakeSingleTupleTableSlot(slot_desc, &TTSOpsVirtual);
-            ExecClearTuple(main_slot);
-            main_typed_pk = NULL;
-            main_typed_n  = 0;
-
-            for (int a = 0; a < natts; a++)
+            main_slot = MakeSingleTupleTableSlot(st->slot_desc, &TTSOpsVirtual);
+            for (a = 0; a < st->natts; a++)
             {
-                bool                    isnull;
-                Form_pg_attribute       ratt = TupleDescAttr(reldesc, a);
-                Datum                   d;
+                bool                isnull;
+                Form_pg_attribute   ratt = TupleDescAttr(st->reldesc, a);
+                Datum               d;
 
-                d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
+                d = slot_getattr(st->probe, (AttrNumber)(a + 1), &isnull);
                 main_slot->tts_isnull[a] = isnull;
-                if (!isnull)
-                {
-                    int16   typlen;
-                    bool    typbyval;
-                    get_typlenbyval(ratt->atttypid, &typlen, &typbyval);
-                    d = datumCopy(d, typbyval, typlen);
-                }
-                main_slot->tts_values[a] = d;
+                main_slot->tts_values[a] = isnull
+                                               ? (Datum) 0
+                                               : datumCopy(d, ratt->attbyval, ratt->attlen);
             }
             ExecStoreVirtualTuple(main_slot);
-            main_slot->tts_nvalid = natts;
+            main_slot->tts_nvalid = st->natts;
+            main_slot->tts_tid = st->probe->tts_tid;
+            /* BufferHeapTupleTableSlot: the probe points straight at a heap
+             * tuple living in the page buffer, so read the raw xmin now, before
+             * the slot is reused by the next table_scan_getnextslot() call. */
+            raw_xmin = HeapTupleHeaderGetRawXmin(
+                ((HeapTupleTableSlot *) st->probe)->tuple->t_data);
+        }
 
-            if (rel_has_pk_)
+        /* ---- merge this MAIN row against the sorted delta array ---- */
+        {
+            char            *pk_key = NULL;
+            DeltaTuple      *match = NULL;
+            TypedKey        *main_typed_pk = NULL;
+            int              main_typed_n = 0;
+            TupleTableSlot  *output_slot;
+            int              tpk_i;
+
+            /* RD-8: no key work when the delta side is empty. */
+            if (st->M_total > 0)
             {
-                pk_key = overlay_serialize_pk(rel, main_slot);
-                main_typed_pk = overlay_build_typed_pk_from_slot(rel, main_slot,
-                                                                  &main_typed_n);
+                if (st->rel_has_pk)
+                {
+                    /* The typed PK (pure C, no SPI) is the comparison key
+                     * whenever both sides have one (R14).  The JSON text key is
+                     * only the strcmp fallback and costs a full SPI round trip
+                     * per row — build it ONLY when some delta entry lacks a
+                     * typed key, or when this row's typed build failed (then the
+                     * comparator must fall back to text, otherwise the delta row
+                     * would be silently unmatched and its side-effect dropped). */
+                    main_typed_pk = overlay_build_typed_pk_from_slot(st->rel, main_slot,
+                                                                     &main_typed_n);
+                    if (!st->delta_all_typed || main_typed_pk == NULL)
+                        pk_key = overlay_serialize_pk(st->rel, main_slot);
+                }
+                else
+                {
+                    /* Keyless: anchor key from the MAIN row's physical ctid,
+                     * captured by the reader into slot->tts_tid. */
+                    ItemPointerData ip_ = main_slot->tts_tid;
+
+                    if (ItemPointerIsValid(&ip_) &&
+                        ItemPointerGetBlockNumber(&ip_) != InvalidBlockNumber &&
+                        ItemPointerGetOffsetNumber(&ip_) != 0)
+                        pk_key = psprintf("A:%u:%u",
+                                          ItemPointerGetBlockNumber(&ip_),
+                                          ItemPointerGetOffsetNumber(&ip_));
+                }
             }
-            else
-            {
-                /* Keyless: anchor key from the MAIN row's physical ctid;
-                 * SPI preserves t_self for plain seqscan result rows. */
-                ItemPointerData ip_ = htups[i]->t_self;
 
-                pk_key = NULL;
-                main_typed_pk = NULL;
-                main_typed_n = 0;
-                if (ItemPointerIsValid(&ip_) &&
-                    ItemPointerGetBlockNumber(&ip_) != InvalidBlockNumber &&
-                    ItemPointerGetOffsetNumber(&ip_) != 0)
-                    pk_key = psprintf("A:%u:%u",
-                                      ItemPointerGetBlockNumber(&ip_),
-                                      ItemPointerGetOffsetNumber(&ip_));
-            }
-
-            match = NULL;
-            if (pk_key != NULL && arr != NULL && M_total > 0)
+            if (st->arr != NULL && st->M_total > 0 &&
+                (main_typed_pk != NULL || pk_key != NULL))
             {
+                ObSearchKey   skb;
                 DeltaTuple  **found;
+
                 skb.typed_pk = main_typed_pk;
                 skb.typed_n  = main_typed_n;
                 skb.text_key = pk_key;
-                found = (DeltaTuple **) bsearch(&skb, arr, M_total,
+                found = (DeltaTuple **) bsearch(&skb, st->arr, st->M_total,
                                                 sizeof(DeltaTuple*),
-                                                cmp_searchkey_vs_dtp);
-                if (found != NULL) match = *found;
+                                                ob_cmp_searchkey_vs_dtp);
+                if (found != NULL)
+                    match = *found;
             }
 
             /* keyless: a ctid-only match can hit a RECYCLED line pointer
-             * (VACUUM freed it, a later INSERT reused it).  Reject the
-             * anchor in that case so the branch edit is not grafted onto
-             * an unrelated row; the delta then falls to the Pass 2 orphan
-             * rule below and is dropped. */
-            if (!rel_has_pk_ && match != NULL &&
-                ob_anchor_is_stale(match, htup))
+             * (VACUUM freed it, a later INSERT reused it).  Reject the anchor
+             * then, so the branch edit is not grafted onto an unrelated row;
+             * the delta falls to the Pass 2 orphan rule and is dropped. */
+            if (!st->rel_has_pk && match != NULL &&
+                ob_anchor_is_stale(match, raw_xmin))
                 match = NULL;
 
             if (match == NULL)
-            {
                 output_slot = main_slot;
-            }
             else if (match->op == DELTA_OP_DELETE)
             {
                 ExecDropSingleTupleTableSlot(main_slot);
@@ -662,220 +809,328 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
                 if (match->tuple_data == NULL)
                     ereport(ERROR,
                             (errcode(ERRCODE_DATA_CORRUPTED),
-                             errmsg("ob_compute_overlay_slots: delta op=%c key=%s has NULL tuple_data",
+                             errmsg("overlay_scan_next: delta op=%c key=%s has NULL tuple_data",
                                     match->op, match->key)));
-                output_slot = reconstruct_slot_from_delta(rel, match->tuple_data);
+                output_slot = reconstruct_slot_from_delta(st->rel, match->tuple_data,
+                                                          st->result_cxt);
                 ExecDropSingleTupleTableSlot(main_slot);
                 match->emitted = true;
             }
+
             if (main_typed_pk != NULL && main_typed_n > 0)
             {
-                int            tpk_i;
                 for (tpk_i = 0; tpk_i < main_typed_n; tpk_i++)
                 {
                     TypedKey *mtk = &main_typed_pk[tpk_i];
+
                     if (!mtk->isnull && !mtk->typbyval && mtk->value != (Datum) 0)
                         pfree(DatumGetPointer(mtk->value));
                 }
                 pfree(main_typed_pk);
             }
-            pfree(pk_key);
+            if (pk_key != NULL)
+                pfree(pk_key);
 
             if (output_slot != NULL)
-                result_slots = lappend(result_slots, output_slot);
-        }
-            if (arr != NULL) pfree(arr);
-        }   /* end sort+bsearch + latest-wins Pass1 merge block */
-
-        /* Pass 2: pure delta INSERTs (rows created inside the branch
-         * that have no MAIN baseline counterpart).  MUST run even when
-         * n == 0: otherwise queries like "WHERE pk = <newkey>" fail
-         * because MAIN has 0 rows but Pass2 used to be nested inside
-         * the (n>0) block.
-         *
-         * Pure-delta multi-op fold: a single PK may have multiple
-         * pending delta entries (e.g. INSERT→UPDATE, or INSERT→UPDATE
-         * →DELETE, or UPDATE→UPDATE).  Without folding, Pass2 would
-         * emit duplicate rows because each op's DeltaTuple satisfies
-         * the `!emitted && (I||U)` guard independently.
-         *
-         * Collapse rules (same PK, preserve relative order):
-         *   - Any chain that ends in DELETE   → skip (row dies).
-         *   - Otherwise                        → use the LAST delta that
-         *     is not DELETE (either INSERT or UPDATE — reconstruct its
-         *     tuple_data as the final post-image).
-         *
-         * Implementation (pure linear walks, NO hash tables — avoids
-         * the earlier "hash on pointer-address" semantic bug):
-         *   Phase 2a (forward scan): build parallel int[] final_idx of
-         *     length ndelta.  For each un-emitted key find the LATEST
-         *     (highest index ≥ i) delta entry that shares its key.
-         *     Mark all lower duplicates final_idx[i] = -1.
-         *   Phase 2b (forward scan): for i with final_idx[i] == i:
-         *     op == I||U → reconstruct; op == D → total skip. */
-        {
-            bool        *emit_flags;
-            int          i, ndelta;
-            ListCell    *lc;
-
-            ndelta = list_length(delta_list);
-            if (ndelta == 0) goto pass2_done;
-            emit_flags = (bool*) palloc0(sizeof(bool) * ndelta);
-
-            /* Phase 2a: for each delta entry, decide whether we are the
-             * latest for our key. */
             {
-                int    *final_idx_latest;
-                int     cur;
-                final_idx_latest = (int *) palloc0(sizeof(int) * ndelta);
-                for (i = 0; i < ndelta; i++) final_idx_latest[i] = -1;
-
-                cur = 0;
-                foreach(lc, delta_list)
-                {
-                    DeltaTuple *dt_i = (DeltaTuple *) lfirst(lc);
-                    int         latest_j = cur;   /* assume self=latest */
-                    ListCell   *lc2;
-                    int         j;
-                    if (dt_i->emitted)            /* matched Pass1; skip */
-                    {
-                        cur++;
-                        continue;
-                    }
-                    /* Linear scan to find the rightmost same-key unemitted. */
-                    j = 0;
-                    foreach(lc2, delta_list)
-                    {
-                        DeltaTuple *dt_j = (DeltaTuple *) lfirst(lc2);
-                        bool        same_key;
-                        same_key = false;
-                        if (j > cur
-                            && !dt_j->emitted
-                            && dt_i->key != NULL
-                            && dt_j->key != NULL)
-                        {
-                            if (dt_i->typed_pk_n > 0 && dt_j->typed_pk_n > 0 &&
-                                dt_i->typed_pk != NULL && dt_j->typed_pk != NULL)
-                                same_key = (0 == overlay_typed_pk_cmp(
-                                                dt_i->typed_pk, dt_i->typed_pk_n,
-                                                dt_j->typed_pk, dt_j->typed_pk_n));
-                            else
-                                same_key = (0 == strcmp(dt_i->key, dt_j->key));
-                        }
-                        if (same_key)
-                        {
-                            latest_j = j;
-                        }
-                        j++;
-                    }
-                    final_idx_latest[cur] = (cur == latest_j) ? cur : -1;
-                    cur++;
-                }
-                /* Translate final_idx_latest[] → emit_flags (only for surviving) */
-                for (i = 0; i < ndelta; i++)
-                {
-                    ListCell   *lc3 = list_nth_cell(delta_list, i);
-                    DeltaTuple *dt = (DeltaTuple *) lfirst(lc3);
-                    if (final_idx_latest[i] == i
-                        && !dt->emitted
-                        && (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE))
-                    {
-                        emit_flags[i] = true;
-                    }
-                }
-                pfree(final_idx_latest);
+                MemoryContextSwitchTo(oldcxt);
+                return output_slot;
             }
-
-            /* Phase 2b: reconstruct only the emit_flags[i]==true rows. */
-            i = 0;
-            foreach(lc, delta_list)
-            {
-                DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
-                if (emit_flags[i])
-                {
-                    TupleTableSlot  *new_slot;
-
-                    /* keyless: an un-matched anchored delta ("A:...") is
-                     * an orphan whose MAIN row was concurrently changed or
-                     * removed; emitting it would resurrect/duplicate a row,
-                     * so drop it (doc/keyless_ctid_design.md 3.6). */
-                    if (!rel_has_pk_ && dt->key != NULL &&
-                        dt->key[0] == 'A' && dt->key[1] == ':')
-                    {
-                        i++;
-                        continue;
-                    }
-                    if (dt->tuple_data == NULL)
-                    {
-                        i++;
-                        continue;   /* defensive: already guarded */
-                    }
-                    new_slot = reconstruct_slot_from_delta(rel, dt->tuple_data);
-                    result_slots = lappend(result_slots, new_slot);
-                    dt->emitted = true;
-                }
-                i++;
-            }
-            pfree(emit_flags);
-pass2_done:
-            ;
         }
-
-        MemoryContextSwitchTo(oldcxt);
     }
-    SPI_finish();
 
-    /* ================================================================
-     * REVIEW-260926 / R13 S07 — TopMemoryContext RSS leak cleanup.
-     * ================================================================
-     * overlay_delta_list_for_rel allocates every DeltaTuple* (and
-     * dt->key, dt->tuple_data payload) in TopMemoryContext (see
-     * delta_store.c L413).  Previously those were leaked because the
-     * helper returns result_slots (also TopMCxt) and forgets the
-     * delta_list; repeated BranchScan calls would grow the session's
-     * RSS without bound until the backend exited (= OOM for long
-     * sessions).  Free every non-`emitted`? No: we allocated them
-     * all via palloc so we must pfree regardless; `emitted` is only
-     * a bookkeeping bool for Pass2 duplicate suppression and does
-     * NOT imply external ownership.
-     *
-     * Two allocation paths exist and BOTH must be cleaned up:
-     *   (1) PK-singleton fast-path: palloc0(sizeof(DeltaTuple)) at L167
-     *       → delta_list == list_make1(singleton) → singleton_free below
-     *       also works via lappend deconstruction list_free_deep alternative?
-     *       No, we iterate explicit because key/tuple_data are separate
-     *       palloc chunks.
-     *   (2) General full-list path: overlay_delta_list_for_rel returns
-     *       N list nodes; iterate and pfree each field.
-     *
-     * After this block delta_list is freed to empty list; any hash tables
-     * (Pass1 delta_hash, Pass2 final_map) were already destroyed via
-     * hash_destroy inside their blocks.  */
+    /* ---------- Pass 2: pure-delta orphans (no MAIN counterpart) ----------
+     * Rows created inside the branch with no MAIN baseline row.  Must run even
+     * when Pass 1 matched nothing (e.g. "WHERE pk = <newkey>"): MAIN returns 0
+     * rows and the orphan INSERT is the whole answer.  Keys are unique, so an
+     * un-emitted INSERT/UPDATE is emitted as-is and a DELETE stays dropped; an
+     * unmatched keyless ("A:") anchor is an orphan whose MAIN row was
+     * concurrently changed or removed, so it is dropped too (never resurrected
+     * by ctid — doc/keyless_ctid_design.md 3.6). */
+    if (!st->pass2_started)
     {
-        ListCell *lc_r13;
-        foreach(lc_r13, delta_list)
+        st->pass2_started = true;
+        st->pass2_cur = list_head(st->delta_list);
+    }
+    while (st->pass2_cur != NULL)
+    {
+        DeltaTuple *dt = (DeltaTuple *) lfirst(st->pass2_cur);
+
+        st->pass2_cur = lnext(st->delta_list, st->pass2_cur);
+        if (dt == NULL)
+            continue;
+        if (!dt->emitted &&
+            (dt->op == DELTA_OP_INSERT || dt->op == DELTA_OP_UPDATE))
         {
-            DeltaTuple *dt = (DeltaTuple *) lfirst(lc_r13);
-            if (dt == NULL) continue;
-            /* key always exists (list_for_rel always pstrdup("") for isnull).
-             * tuple_data is NULL for op=DELETE entries; non-NULL for I/U.
-             * typed_pk is R14 add-on: allocated lazily in pre-flight, contains
-             * typbyval=false datum deep copies so MUST be freed via helper
-             * before the DeltaTuple itself is pfree'd (otherwise RSS leak). */
-            if (dt->key != NULL) pfree(dt->key);
-            if (dt->tuple_data != NULL) pfree(dt->tuple_data);
-            if (dt->typed_pk != NULL && dt->typed_pk_n > 0)
-                overlay_typed_pk_free(dt->typed_pk, dt->typed_pk_n);
-            pfree(dt);
+            TupleTableSlot *new_slot;
+
+            if (!st->rel_has_pk && dt->key != NULL &&
+                dt->key[0] == 'A' && dt->key[1] == ':')
+                continue;
+            if (dt->tuple_data == NULL)
+                continue;   /* defensive: already guarded */
+
+            new_slot = reconstruct_slot_from_delta(st->rel, dt->tuple_data,
+                                                   st->result_cxt);
+            dt->emitted = true;
+            MemoryContextSwitchTo(oldcxt);
+            return new_slot;
         }
-        list_free(delta_list);
     }
 
-    if (out_tupdesc)
-        *out_tupdesc = CreateTupleDescCopy(reldesc);
+    MemoryContextSwitchTo(oldcxt);
+    return NULL;
+}
 
-    table_close(rel, AccessShareLock);
-    return result_slots;
+/*
+ * Release the transient resources of an iterator: the heap scan descriptor,
+ * the buffer-heap probe slot and the delta payload (TopMemoryContext).  The
+ * state itself, the shared slot descriptor and every emitted slot live in
+ * result_cxt and are reclaimed by whoever owns it (ebs->scan_cxt reset/delete,
+ * or the SRF's multi_call context); the relation is NOT closed here — it is
+ * borrowed from the caller.
+ */
+static void
+overlay_scan_close(OverlayScanState *st)
+{
+    if (st == NULL)
+        return;
+
+    if (st->tscan != NULL)
+    {
+        table_endscan(st->tscan);
+        st->tscan = NULL;
+    }
+    if (st->probe != NULL)
+    {
+        ExecDropSingleTupleTableSlot(st->probe);
+        st->probe = NULL;
+    }
+    if (st->arr != NULL)
+    {
+        pfree(st->arr);
+        st->arr = NULL;
+    }
+    if (st->delta_list != NIL)
+    {
+        ob_overlay_free_delta_list(st->delta_list);
+        st->delta_list = NIL;
+    }
+}
+
+/* ----------------------------------------------------------------
+ * ob_expr_has_outer_ref
+ *   True if the expression references state that lives outside the
+ *   relation being deparsed: a PARAM_EXEC Param or a Var with
+ *   varlevelsup > 0.
+ *
+ *   deparse_expression() with a bare deparse_context_for() namespace
+ *   cannot render such clauses: get_parameter() walks
+ *   dpns->plan->initPlan for a PARAM_EXEC, and deparse_context_for()
+ *   leaves dpns->plan == NULL, so ruleutils dereferences NULL.  A
+ *   correlated operand is also useless as a static pushdown fragment
+ *   (its value is only known at execution time), so callers drop it
+ *   and let scan.plan.qual re-check the row instead.
+ * ---------------------------------------------------------------- */
+static bool
+ob_expr_has_outer_ref(Node *node, void *context)
+{
+    (void) context;
+
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, Param))
+    {
+        if (((Param *) node)->paramkind == PARAM_EXEC)
+            return true;
+    }
+    else if (IsA(node, Var))
+    {
+        if (((Var *) node)->varlevelsup > 0)
+            return true;
+    }
+
+    return expression_tree_walker(node, ob_expr_has_outer_ref, NULL);
+}
+
+/* ----------------------------------------------------------------
+ * ob_pk_btree_op_strategy
+ *   Return the btree strategy number of opno inside vartype's default
+ *   btree opfamily (1=<  2=<=  3==  4=>=  5=>), or 0 when opno is not
+ *   an ordering comparison of that type.  This is what lets P0 accept
+ *   the five range/equality operators on a PK column without hard-coding
+ *   per-type operator OIDs.
+ * ---------------------------------------------------------------- */
+static int
+ob_pk_btree_op_strategy(Oid opno, Oid vartype)
+{
+    TypeCacheEntry *tc;
+    Oid             opfamily;
+    int             strat;
+
+    if (!OidIsValid(opno))
+        return 0;
+    tc = lookup_type_cache(vartype, TYPECACHE_BTREE_OPFAMILY);
+    if (tc == NULL)
+        return 0;
+    opfamily = tc->btree_opf;
+    if (!OidIsValid(opfamily))
+        return 0;
+    strat = get_op_opfamily_strategy(opno, opfamily);
+    if (strat < BTLessStrategyNumber || strat > BTGreaterStrategyNumber)
+        return 0;
+    return strat;
+}
+
+/* ----------------------------------------------------------------
+ * ob_is_pk_pushable_clause
+ *   True when clause is built ONLY from comparisons against the single PK
+ *   column of rel rti:  pk = c / pk < c / pk <= c / pk > c / pk >= c,
+ *   pk IN (...) / pk = ANY(...), and any AND/OR combination of those.
+ *   Such a clause can be deparsed into a self-contained SQL fragment and
+ *   pushed to the MAIN SPI query.
+ *
+ *   Anything else (IS NULL, NOT, ALL(...), a non-Const array element, a
+ *   mixed OR arm, ...) returns false: the caller then leaves the clause to
+ *   the P2 / plan.qual path.
+ * ---------------------------------------------------------------- */
+static bool
+ob_is_pk_pushable_clause(Node *clause, Index rti, AttrNumber pk_attno)
+{
+    if (clause == NULL)
+        return false;
+
+    if (IsA(clause, OpExpr))
+    {
+        OpExpr *op = (OpExpr *) clause;
+        Node   *left;
+        Node   *right;
+        Var    *var;
+
+        if (list_length(op->args) != 2)
+            return false;
+        left  = (Node *) linitial(op->args);
+        right = (Node *) lsecond(op->args);
+
+        if (IsA(left, Var) && IsA(right, Const))
+            var = (Var *) left;
+        else if (IsA(left, Const) && IsA(right, Var))
+            var = (Var *) right;
+        else
+            return false;
+
+        if (var->varno != rti || var->varattno != pk_attno ||
+            var->varlevelsup != 0)
+            return false;
+
+        return ob_pk_btree_op_strategy(op->opno, var->vartype) != 0;
+    }
+
+    if (IsA(clause, ScalarArrayOpExpr))
+    {
+        ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) clause;
+        Node      *left;
+        Node      *right;
+        Var       *var;
+        ListCell  *lc;
+
+        /* IN semantics only: `= ANY(...)` (useOr).  `ALL(...)` is not an
+         * IN list and is not index-pushable as a single fragment. */
+        if (!sa->useOr || list_length(sa->args) != 2)
+            return false;
+        left  = (Node *) linitial(sa->args);
+        right = (Node *) lsecond(sa->args);
+
+        if (!IsA(left, Var))
+            return false;
+        var = (Var *) left;
+        if (var->varno != rti || var->varattno != pk_attno ||
+            var->varlevelsup != 0)
+            return false;
+        if (ob_pk_btree_op_strategy(sa->opno, var->vartype)
+            != BTEqualStrategyNumber)
+            return false;
+
+        if (IsA(right, Const))
+            return !((Const *) right)->constisnull;
+        if (IsA(right, ArrayExpr))
+        {
+            foreach(lc, ((ArrayExpr *) right)->elements)
+            {
+                if (!IsA((Node *) lfirst(lc), Const))
+                    return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (IsA(clause, BoolExpr))
+    {
+        BoolExpr *b = (BoolExpr *) clause;
+        ListCell *lc;
+
+        if (b->boolop != AND_EXPR && b->boolop != OR_EXPR)
+            return false;
+        foreach(lc, b->args)
+        {
+            if (!ob_is_pk_pushable_clause((Node *) lfirst(lc), rti, pk_attno))
+                return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/* ----------------------------------------------------------------
+ * ob_pk_point_const
+ *   True only for a lone `pk = Const` / `Const = pk` equality; *out_con
+ *   receives the Const.  Only this shape yields a single serialized key
+ *   for the DELTA O(1) lookup (overlay_delta_lookup).
+ * ---------------------------------------------------------------- */
+static bool
+ob_pk_point_const(Node *clause, Index rti, AttrNumber pk_attno,
+                  Const **out_con)
+{
+    OpExpr *op;
+    Node   *left;
+    Node   *right;
+    Var    *var;
+    Const  *con;
+
+    *out_con = NULL;
+    if (clause == NULL || !IsA(clause, OpExpr))
+        return false;
+    op = (OpExpr *) clause;
+    if (list_length(op->args) != 2)
+        return false;
+    left  = (Node *) linitial(op->args);
+    right = (Node *) lsecond(op->args);
+
+    if (IsA(left, Var) && IsA(right, Const))
+    {
+        var = (Var *) left;
+        con = (Const *) right;
+    }
+    else if (IsA(left, Const) && IsA(right, Var))
+    {
+        con = (Const *) left;
+        var = (Var *) right;
+    }
+    else
+        return false;
+
+    if (var->varno != rti || var->varattno != pk_attno ||
+        var->varlevelsup != 0)
+        return false;
+    if (ob_pk_btree_op_strategy(op->opno, var->vartype)
+        != BTEqualStrategyNumber)
+        return false;
+
+    *out_con = con;
+    return true;
 }
 
 /* ================================================================
@@ -1111,130 +1366,83 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
 
         if (overlay_get_pk_single_attno(reln, &pk_attno, &pk_colname))
         {
+            List       *pk_clauses = NIL;
             ListCell   *rc;
+
+            /* Collect every top-level clause that is composed ONLY of
+             * PK-column btree comparisons: equality, range (</<=/>/>=),
+             * IN / = ANY(...), and any AND/OR combination of those.  They
+             * are ANDed into a single fragment and deparsed ONCE, so the
+             * MAIN SPI SELECT below still hands the predicate to the
+             * planner's PK index scan. */
             foreach(rc, rel->baserestrictinfo)
             {
                 RestrictInfo *rinfo = (RestrictInfo *) lfirst(rc);
-                OpExpr      *opexpr;
-                Node        *left, *right;
-                Var         *var;
-                Const       *con;
-                Oid         eqop;
-                bool        var_on_left;
 
                 if (!IsA(rinfo, RestrictInfo))
                     continue;
-                if (!IsA(rinfo->clause, OpExpr))
+                if (ob_expr_has_outer_ref((Node *) rinfo->clause, NULL))
                     continue;
-                opexpr = (OpExpr *) rinfo->clause;
-                if (list_length(opexpr->args) != 2)
-                    continue;
-                left  = (Node *) linitial(opexpr->args);
-                right = (Node *) lsecond(opexpr->args);
+                if (ob_is_pk_pushable_clause((Node *) rinfo->clause,
+                                             rti, pk_attno))
+                    pk_clauses = lappend(pk_clauses, rinfo->clause);
+            }
 
-                /* 识别 Var-Const 或 Const-Var 形式 */
-                if (IsA(left, Var) && IsA(right, Const))
+            if (pk_clauses != NIL)
+            {
+                Node       *top;
+                List       *dpctx;
+                char       *deparsed;
+
+                top = (Node *) ((list_length(pk_clauses) == 1)
+                                    ? (Node *) linitial(pk_clauses)
+                                    : (Node *) makeBoolExpr(AND_EXPR,
+                                                            pk_clauses,
+                                                            -1));
+                /* V2 strategy (doc/branchscan.md Part B/E): hand the whole
+                 * predicate node to ruleutils instead of assembling SQL by
+                 * hand, so the literal's consttype drives the output
+                 * function and no static format_type_be buffer leaks in. */
+                dpctx = deparse_context_for(RelationGetRelationName(reln),
+                                            rte->relid);
+                deparsed = NULL;
+                PG_TRY();
                 {
-                    var = (Var *) left;
-                    con = (Const *) right;
-                    var_on_left = true;
+                    deparsed = deparse_expression(top, dpctx, false, false);
                 }
-                else if (IsA(left, Const) && IsA(right, Var))
+                PG_CATCH();
                 {
-                    con = (Const *) left;
-                    var = (Var *) right;
-                    var_on_left = false;
-                }
-                else
-                    continue;
-
-                /* Var 必须指向本 rel 的 PK 列 */
-                if (var->varno != rti)
-                    continue;
-                if (var->varattno != pk_attno)
-                    continue;
-                if (var->varlevelsup != 0)
-                    continue;
-
-                /* 操作符必须是该 PK 类型的 btree 等值操作符（=）。
-                 * 用 typcache 拿该类型的默认 btree eq op OID。 */
-                {
-                    TypeCacheEntry *tcache;
-
-                    tcache = lookup_type_cache(var->vartype,
-                                               TYPECACHE_EQ_OPR);
-                    eqop = tcache ? tcache->eq_opr : InvalidOid;
-                }
-                if (!OidIsValid(eqop))
-                    continue;
-                if (var_on_left)
-                {
-                    if (opexpr->opno != eqop)
-                        continue;
-                }
-                else
-                {
-                    /* commuted: 检查 commutator op */
-                    Oid commut = get_commutator(opexpr->opno);
-                    if (commut != eqop)
-                        continue;
-                }
-
-                /* 命中：构造 pk_where_sql 片段 + 序列化 key。
-                 * V2 策略（见 doc/p0_pk_oidx_deparse_strategy.md §3）：
-                 *   直接把整个 OpExpr(Var(PK)=Const) 节点交给
-                 *   ruleutils 的 deparse_expression()，而不是手动按 PK
-                 *   列的 type 调 output function。这样：
-                 *   1) 字面量的 consttype 和实际输出函数严格对应（避免
-                 *      int4 Datum 当 int8 解读 → garbage SQL）；
-                 *   2) format_type_be static buffer 覆写问题不存在
-                 *      （deparse_expression 内部用 palloc 生成 cast）；
-                 *   3) 自定义类型的 output function ERROR 用 PG_TRY
-                 *      捕获后安全回退（has_pk_pred=false）。 */
-                {
-                    List       *dpctx;
-                    char       *deparsed;
-
-                    dpctx = deparse_context_for(
-                                RelationGetRelationName(reln),
-                                rte->relid);
+                    FlushErrorState();
                     deparsed = NULL;
-                    PG_TRY();
-                    {
-                        deparsed = deparse_expression(
-                                       (Node *) opexpr,
-                                       dpctx,
-                                       false,
-                                       false);
-                    }
-                    PG_CATCH();
-                    {
-                        FlushErrorState();
-                        deparsed = NULL;
-                    }
-                    PG_END_TRY();
-
-                    if (deparsed != NULL && *deparsed != '\0' &&
-                        strlen(deparsed) < 65536)
-                    {
-                        pk_where_sql = pstrdup(deparsed);
-                    }
-                    else
-                    {
-                        /* deparse 失败 → P0 回退，不消费这条谓词，
-                         * P2 会把它当作普通 qual 纳入 general_where。 */
-                        has_pk_pred = false;
-                        pk_where_sql = NULL;
-                        pk_serialized_key = NULL;
-                        continue;
-                    }
-
-                    pk_serialized_key = overlay_serialize_pk_from_single_datum(
-                        reln, pk_attno, con->constvalue,
-                        con->constisnull, con->consttype);
                 }
-                has_pk_pred = true;
-                break; /* 第一个命中的 PK 等值条件即可 */
+                PG_END_TRY();
+
+                if (deparsed != NULL && *deparsed != '\0' &&
+                    strlen(deparsed) < 65536)
+                {
+                    has_pk_pred = true;
+                    pk_where_sql = pstrdup(deparsed);
+
+                    /* L2 DELTA O(1): only a lone *point equality* yields one
+                     * serialized key.  IN / range / OR have no single key,
+                     * so pk_serialized_key stays empty and the delta side
+                     * falls back to the full (branch_id, relid) list (see
+                     * overlay_scan_open). */
+                    if (list_length(pk_clauses) == 1)
+                    {
+                        Const *con = NULL;
+
+                        if (ob_pk_point_const((Node *) linitial(pk_clauses),
+                                              rti, pk_attno, &con))
+                            pk_serialized_key =
+                                overlay_serialize_pk_from_single_datum(
+                                    reln, pk_attno, con->constvalue,
+                                    con->constisnull, con->consttype);
+                    }
+                }
+                /* deparse FAILED: has_pk_pred stays false so the P2 pass
+                 * below re-collects every PK clause into general_where —
+                 * never silently drop a predicate from the MAIN filter. */
             }
         }
 
@@ -1242,8 +1450,13 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          * 不是 PK=Const 自身的剩余 clauses，用 AND 组合后 deparse 成
          * SQL 文本透传到 Executor，MAIN 的 SPI SELECT 直接用它
          * 过滤（减少 MAIN 侧从磁盘拉回的行数）。
-         * 回退策略：deparse 报错、包含不可反编译节点（Param 等）或
-         * 结果为空串 → has_general_where=false，Main 保持原查询。 */
+         * 回退策略：deparse 报错、包含不可反编译节点或结果为空串
+         * → has_general_where=false，Main 保持原查询。
+         *
+         * 关联引用（correlated PARAM_EXEC / 外层 Var）在进入 deparse 之前
+         * 就被剔除：见 ob_expr_has_outer_ref()。这类节点既无法反编译成
+         * 独立 SQL 片段，又会让 ruleutils 以 NULL plan 解引用 dpns->plan
+         * 而崩溃；剔掉后由 scan.plan.qual 逐行复筛。 */
         if (rel->baserestrictinfo != NIL)
         {
             List       *remain = NIL;
@@ -1258,39 +1471,15 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
                 if (!IsA(rinfo, RestrictInfo)) continue;
                 clause = (Node *) rinfo->clause;
 
-                if (has_pk_pred && IsA(clause, OpExpr))
-                {
-                    OpExpr *ope = (OpExpr *) clause;
-                    if (list_length(ope->args) == 2 &&
-                        pk_attno != 0 && pk_colname != NULL)
-                    {
-                        Node       *ln = (Node *) linitial(ope->args);
-                        Node       *rn = (Node *) lsecond(ope->args);
-                        Var        *v = NULL;
-
-                        if (IsA(ln, Var) && IsA(rn, Const))
-                            v = (Var *) ln;
-                        else if (IsA(ln, Const) && IsA(rn, Var))
-                            v = (Var *) rn;
-                        if (v != NULL &&
-                            v->varno == rti &&
-                            v->varattno == pk_attno &&
-                            v->varlevelsup == 0)
-                        {
-                            TypeCacheEntry *tc;
-                            Oid            eqop;
-                            tc = lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR);
-                            eqop = tc ? tc->eq_opr : InvalidOid;
-                            if (OidIsValid(eqop) &&
-                                (ope->opno == eqop ||
-                                 get_commutator(ope->opno) == eqop))
-                            {
-                                is_pk_clause = true;
-                            }
-                        }
-                    }
-                }
-                if (!is_pk_clause)
+                /* A PK clause already folded into pk_where_sql must not be
+                 * pushed a second time through general_where.  Skip it ONLY
+                 * when P0 actually consumed it (has_pk_pred); if P0's
+                 * deparse failed, the clause must be re-collected here so
+                 * the MAIN filter is not silently lost. */
+                if (has_pk_pred && pk_attno != 0 &&
+                    ob_is_pk_pushable_clause(clause, rti, pk_attno))
+                    is_pk_clause = true;
+                if (!is_pk_clause && !ob_expr_has_outer_ref(clause, NULL))
                     remain = lappend(remain, clause);
             }
             if (remain != NIL)
@@ -1554,6 +1743,33 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
             if (newlist != NIL)
                 rel->pathlist = newlist;
         }
+
+        /* =================================================================
+         * MF-2/MF-3: parallel paths MUST be pruned too.
+         * ---------------------------------------------------------------
+         * The prune above only rewrites rel->pathlist.  Core PG then calls
+         * generate_useful_gather_paths() *after* this hook returns, which
+         * turns whatever is left in rel->partial_pathlist into a Gather
+         * path appended to rel->pathlist.  A partial path is always a bare
+         * MAIN heap scan (seqscan/index scan) — CustomScan has no parallel
+         * variant — so letting it through means the planner can pick
+         * "Gather → Parallel Seq Scan on <MAIN>" and the whole delta merge
+         * is silently skipped (reads return pre-branch data).
+         *
+         * Clearing partial_pathlist is enough to stop that: the core's
+         * generate_gather_paths() bails out immediately on an empty list.
+         * consider_parallel=false additionally keeps join-level partial
+         * paths from being built (joinrel->consider_parallel is AND-ed
+         * from its inputs), so no parallel plan of any shape can survive.
+         *
+         * Side benefit: no parallel worker is ever launched for a branch
+         * read, so no worker hits RestoreGUCState() on
+         * overlay_branch.current — which used to fail with "cannot execute
+         * SQL without an outer snapshot or portal" (MF-3).
+         * ================================================================= */
+        rel->partial_pathlist = NIL;
+        rel->consider_parallel = false;
+
         table_close(reln, NoLock);
     }
 }
@@ -1646,12 +1862,91 @@ ob_branchscan_create_custom_scan_state(CustomScan *cscan)
     return (Node *) ebs;
 }
 
-List *
-ob_compute_overlay_slots(Oid relid, int32 branch_id)
+/* ================================================================
+ * SRF-facing streaming wrapper.
+ *
+ * overlay_main_plus_delta() has no executor qual to push down, so it drives
+ * the same iterator with qual = NULL / has_pk_pred = false.  The relation is
+ * opened here and must stay open for the whole scan (the iterator borrows it),
+ * so the handle is allocated in result_cxt together with a reset callback that
+ * closes the relation and releases the delta payload even when the caller stops
+ * early (LIMIT above the SRF) and never reaches the drained state.
+ * ================================================================ */
+typedef struct ObSrfScanHandle
 {
-    return ob_compute_overlay_slots_internal(relid, branch_id, NULL,
-                                             false, NULL, NULL,
-                                             false, NULL);
+    Relation                rel;      /* opened here, closed by release() */
+    OverlayScanState       *st;       /* borrowed from result_cxt */
+    MemoryContextCallback   cb;       /* in result_cxt; fires on reset/delete */
+    bool                    closed;
+} ObSrfScanHandle;
+
+static void
+ob_srf_scan_release(ObSrfScanHandle *h)
+{
+    if (h == NULL || h->closed)
+        return;
+    h->closed = true;
+    if (h->st != NULL)
+    {
+        overlay_scan_close(h->st);
+        h->st = NULL;
+    }
+    if (h->rel != NULL)
+    {
+        table_close(h->rel, AccessShareLock);
+        h->rel = NULL;
+    }
+}
+
+static void
+ob_srf_scan_reset_cb(void *arg)
+{
+    ob_srf_scan_release((ObSrfScanHandle *) arg);
+}
+
+void *
+ob_overlay_srf_open(Oid relid, int32 branch_id, MemoryContext result_cxt)
+{
+    MemoryContext    oldcxt;
+    ObSrfScanHandle *h;
+
+    oldcxt = MemoryContextSwitchTo(result_cxt != NULL ? result_cxt
+                                                      : CurrentMemoryContext);
+
+    h = (ObSrfScanHandle *) palloc0(sizeof(ObSrfScanHandle));
+    h->rel = table_open(relid, AccessShareLock);
+    h->st  = overlay_scan_open(h->rel, branch_id,
+                               false, NULL, NULL, false, NULL,
+                               NULL, NULL, result_cxt);
+
+    h->cb.func = ob_srf_scan_reset_cb;
+    h->cb.arg  = h;
+    MemoryContextRegisterResetCallback(CurrentMemoryContext, &h->cb);
+
+    MemoryContextSwitchTo(oldcxt);
+    return h;
+}
+
+TupleTableSlot *
+ob_overlay_srf_next(void *handle)
+{
+    ObSrfScanHandle *h = (ObSrfScanHandle *) handle;
+
+    if (h == NULL)
+        return NULL;
+    {
+        TupleTableSlot *slot = overlay_scan_next(h->st);
+
+        if (slot == NULL)
+            ob_srf_scan_release(h);   /* drained; release is idempotent */
+        return slot;
+    }
+}
+
+void
+ob_overlay_srf_close(void *handle)
+{
+    ob_srf_scan_release((ObSrfScanHandle *) handle);
 }
 
 static void
@@ -1666,7 +1961,6 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
     int              flag;
 
     (void) eflags;
-    (void) estate;
 
     /* P0: custom_private 4 元素协议解包。
      * OID 不再从 custom_private[0] 解析（字符串易出错），
@@ -1709,15 +2003,19 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
         const char *kstr = (n_k != NULL && IsA(n_k, String))
                                ? strVal(n_k) : NULL;
 
-        if (wstr != NULL && *wstr != '\0' && kstr != NULL && *kstr != '\0')
+        /* pk_where_sql ALONE decides the pushdown: IN / range / OR carry no
+         * single key, so an empty pk_serialized_key must NOT disable it — it
+         * only sends the delta side to the full (branch_id, relid) list (see
+         * overlay_scan_open).  An empty pk_where_sql is still a hard
+         * fallback (never run MAIN with a blank WHERE). */
+        if (wstr != NULL && *wstr != '\0')
         {
             ebs->pk_where_sql = pstrdup(wstr);
-            ebs->pk_serialized_key = pstrdup(kstr);
+            if (kstr != NULL && *kstr != '\0')
+                ebs->pk_serialized_key = pstrdup(kstr);
         }
         else
         {
-            /* 任一缺失 → 任一已分配都要 pfree 后回退（不过这里上面
-             * 还没分配，直接清零 flag 就行） */
             ebs->pk_where_sql = NULL;
             ebs->pk_serialized_key = NULL;
             ebs->has_pk_pred = false;
@@ -1756,12 +2054,12 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
 
     branch_id = overlay_branch_get_current_id();
 
-    /* ----- LAZY MATERIALIZATION -----
+    /* ----- LAZY OPEN -----
      * PG 17's ExecInitCustomScan calls BeginCustomScan unconditionally
      * even for plain EXPLAIN (without ANALYZE) because ExplainState
      * needs every plan node's state structure fully initialized.
-     * If we called ob_compute_overlay_slots_internal here, its SPI
-     * Pass1 SELECT would re-enter the Planner hook and (despite the
+     * If we called overlay_scan_open here, its SPI Pass1 SELECT
+     * would re-enter the Planner hook and (despite the
      * B1.5 guard) could still cause stack overflow in some edge
      * cases.  The safe fix is *never* to do heavy work in
      * BeginCustomScan: just open the relation and hold the lock so
@@ -1779,13 +2077,13 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
      * to a fully-initialized TTSOpsVirtual slot with the correct
      * tupdesc.  We MUST NOT overwrite it with ExecAllocTableSlot
      * here — double-init leaks resources and breaks ownership. */
-    ebs->result_slots = NIL;
-    ebs->cursor       = NULL;
+    ebs->scan         = NULL;
+    ebs->scan_cxt     = AllocSetContextCreate(estate->es_query_cxt,
+                                              "overlay_branch BranchScan",
+                                              ALLOCSET_DEFAULT_SIZES);
     ebs->rel          = rel;
-    ebs->rel_desc     = RelationGetDescr(rel);
     ebs->relid        = relid;
     ebs->branch_id    = branch_id;
-    ebs->materialized = false;
 
     /* custom_ps (PG-owned field) = NIL: no child PlanState subtrees.
      * Never set custom_ps = private pointer; walker in
@@ -1804,38 +2102,29 @@ ob_branchscan_exec(CustomScanState *node)
 
     econtext = node->ss.ps.ps_ExprContext;
 
-    /* ----- First-tuple lazy materialization -----
-     * Do the 2-pass overlay merge here, not in BeginCustomScan.
+    /* ----- First-tuple lazy open -----
+     * Open the streaming iterator here, not in BeginCustomScan.
      * This guarantees that plain EXPLAIN (without ANALYZE) — which
      * calls BeginCustomScan but NEVER ExecCustomScan — cannot
      * trigger any SPI or Planner recursion. */
-    if (!ebs->materialized)
-    {
-        TupleDesc  helper_tdesc = NULL;
-        List      *slots;
-
-        slots = ob_compute_overlay_slots_internal(ebs->relid,
-                                                   ebs->branch_id,
-                                                   &helper_tdesc,
-                                                   ebs->has_pk_pred,
-                                                   ebs->pk_where_sql,
-                                                   ebs->pk_serialized_key,
-                                                   ebs->has_general_where,
-                                                   ebs->general_where_sql);
-        ebs->result_slots = slots;
-    ebs->cursor       = list_head(slots);
-    ebs->mark_cursor  = NULL;
-    if (helper_tdesc != NULL)
-        FreeTupleDesc(helper_tdesc);
-    ebs->materialized = true;
-}
+    if (ebs->scan == NULL)
+        ebs->scan = overlay_scan_open(ebs->rel,
+                                      ebs->branch_id,
+                                      ebs->has_pk_pred,
+                                      ebs->pk_where_sql,
+                                      ebs->pk_serialized_key,
+                                      ebs->has_general_where,
+                                      ebs->general_where_sql,
+                                      node->ss.ps.qual,
+                                      node->ss.ps.ps_ExprContext,
+                                      ebs->scan_cxt);
 
 next_tuple:
-    if (ebs->cursor == NULL)
+    /* Streaming: pull exactly ONE merged row per Exec call, so an upper
+     * Limit / cursor can stop early without paying for the whole overlay. */
+    src = overlay_scan_next(ebs->scan);
+    if (src == NULL)
         return NULL;
-
-    src = (TupleTableSlot *) lfirst(ebs->cursor);
-    ebs->cursor = lnext(ebs->result_slots, ebs->cursor);
 
     /* Copy src -> ss.ss_ScanTupleSlot.  dst is already initialized by
      * PG ExecInitCustomScan with the scan relation's physical tupdesc
@@ -1850,8 +2139,6 @@ next_tuple:
         bool                sisnull;
         Datum               sd;
         Form_pg_attribute   dstatt;
-        int16               typlen;
-        bool                typbyval;
 
         if (a >= src->tts_tupleDescriptor->natts)
         {
@@ -1862,9 +2149,11 @@ next_tuple:
         dst->tts_isnull[a] = sisnull;
         if (!sisnull)
         {
+            /* RD-3: use the attribute's own attlen/attbyval (kept in sync
+             * with pg_type) instead of a per-column get_typlenbyval()
+             * syscache round trip on every emitted row. */
             dstatt = TupleDescAttr(dst->tts_tupleDescriptor, a);
-            get_typlenbyval(dstatt->atttypid, &typlen, &typbyval);
-            sd = datumCopy(sd, typbyval, typlen);
+            sd = datumCopy(sd, dstatt->attbyval, dstatt->attlen);
             dst->tts_values[a] = sd;
         }
         else
@@ -1905,19 +2194,25 @@ static void
 ob_branchscan_end(CustomScanState *node)
 {
     ExtendedCustomScanState *ebs = CSS2BS(node);
-    ListCell           *lc;
 
-    /* If we never materialized (plain EXPLAIN without ANALYZE:
-     * BeginCustomScan ran but ExecCustomScan never did), then
-     * result_slots is NIL and there are no slots to free. */
-    if (ebs->materialized)
+    /* Release the iterator's transient resources (heap scan descriptor, probe
+     * slot, delta payload in TopMemoryContext) BEFORE dropping scan_cxt, where
+     * the iterator state itself lives.  Idempotent for the plain-EXPLAIN case
+     * where Begin ran but ExecCustomScan never opened anything. */
+    if (ebs->scan != NULL)
     {
-        foreach(lc, ebs->result_slots)
-        {
-            TupleTableSlot *s = (TupleTableSlot *) lfirst(lc);
-            ExecDropSingleTupleTableSlot(s);
-        }
-        list_free(ebs->result_slots);
+        overlay_scan_close(ebs->scan);
+        ebs->scan = NULL;
+    }
+
+    /* Every emitted slot, its shared tupdesc and the iterator state live in
+     * scan_cxt (see ob_branchscan_begin).  Dropping the context reclaims them
+     * in one shot — no per-slot ExecDrop needed, and the slots must NOT be
+     * touched afterwards. */
+    if (ebs->scan_cxt != NULL)
+    {
+        MemoryContextDelete(ebs->scan_cxt);
+        ebs->scan_cxt = NULL;
     }
 
     /* P0 PK-IndexScan MVP: 释放 Begin 阶段 pstrdup 的字符串 */
@@ -1938,9 +2233,8 @@ ob_branchscan_end(CustomScanState *node)
         ebs->general_where_sql = NULL;
     }
 
-    /* IMPORTANT: ebs->rel_desc was obtained via RelationGetDescr()
-     * in BeginCustomScan — it is owned by relcache, NOT by us, so we
-     * MUST NOT call FreeTupleDesc on it (it would double-free). */
+    /* The relation was opened in Begin and is borrowed by the iterator; the
+     * iterator has already released everything that referenced it. */
     if (ebs->rel != NULL)
         table_close(ebs->rel, AccessShareLock);
     /* ebs itself lives inside ExtendedCustomScanState allocated by
@@ -1953,54 +2247,25 @@ ob_branchscan_end(CustomScanState *node)
 }
 
 static void
-ob_branchscan_mark_pos(CustomScanState *node)
-{
-    ExtendedCustomScanState *ebs = CSS2BS(node);
-
-    ebs->mark_cursor = ebs->cursor;
-}
-
-static void
-ob_branchscan_rest_pos(CustomScanState *node)
-{
-    ExtendedCustomScanState *ebs = CSS2BS(node);
-
-    if (ebs->mark_cursor != NULL)
-        ebs->cursor = ebs->mark_cursor;
-    else
-        ebs->cursor = list_head(ebs->result_slots);
-}
-
-static void
 ob_branchscan_rescan(CustomScanState *node)
 {
     ExtendedCustomScanState *ebs = CSS2BS(node);
 
     (void) ob_invalidate_check_throttled(/*for_dml=*/ false);
 
-    if (!ebs->materialized)
+    /* Rewind = discard the exhausted iterator and rebuild it on the next Exec:
+     * overlay_scan_open() re-reads the delta list and restarts the MAIN heap
+     * scan, so a fresh materialization happens lazily (FR6).  Releasing the
+     * iterator first frees the heap scan descriptor, the probe slot and the
+     * delta payload (TopMemoryContext); the emitted slots and the iterator
+     * state itself die with the scan_cxt reset.  Do NOT ExecDrop the already
+     * emitted slots — their memory is gone after the reset. */
+    if (ebs->scan != NULL)
     {
-        Assert(ebs->result_slots == NIL);
-        ebs->cursor = NULL;
-        ebs->mark_cursor = NULL;
-        return;
+        overlay_scan_close(ebs->scan);
+        ebs->scan = NULL;
     }
-
-    {
-        ListCell *lc;
-
-        foreach(lc, ebs->result_slots)
-        {
-            TupleTableSlot *slot = (TupleTableSlot *) lfirst(lc);
-            ExecDropSingleTupleTableSlot(slot);
-        }
-        list_free(ebs->result_slots);
-        ebs->result_slots = NIL;
-    }
-
-    ebs->materialized  = false;
-    ebs->cursor        = NULL;
-    ebs->mark_cursor   = NULL;
+    MemoryContextReset(ebs->scan_cxt);
 }
 
 /* ================================================================
