@@ -81,6 +81,12 @@ make -C ../../src/test/isolation pg_isolation_regress \
 - **L2** — `pgbench` stress harness under `test/bench/`, run manually; see
   `test/bench/README.md`.
 
+**Locale prerequisite for `make check` / `make installcheck`.** The temp
+`initdb` needs a *real, installed* UTF-8 locale. A `LANG`/`LC_*` naming a missing
+locale (e.g. `zh_CN.UTF-8` on a bare host) aborts with `invalid locale settings`;
+forcing `LANG=C` instead mis-measures multibyte widths and yields bogus
+column-width diffs in `mvcc_review` / `rentry`. Use `LC_ALL=C.utf8`.
+
 **Changing or adding a test → baseline management**
 
 1. First run FAILs when you add lines; `cat test_output/regression.diffs` and

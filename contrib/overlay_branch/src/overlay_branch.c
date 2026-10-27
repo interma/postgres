@@ -706,22 +706,33 @@ static const char *ob_guard_hint_tmpl =
 
 void
 overlay_guard_ereport_fail(const char *operation, const char *relname,
-						   const char *reason)
+						   const char *branch_name, const char *reason)
 {
 	const char *cur = overlay_branch_get_current_name();
+	bool		in_branch_mode = (cur != NULL && *cur != '\0');
+	const char *brname;
 	char		hintbuf[1024];
 
+	/* apply/discard run OUTSIDE branch mode (they are the very statements
+	 * that leave it), so the GUC-based current name is empty there.  Those
+	 * callers pass the target branch explicitly, otherwise a conflict error
+	 * would name "<unknown>" instead of the branch it belongs to. */
+	brname = (branch_name != NULL && *branch_name != '\0') ? branch_name :
+		(in_branch_mode ? cur : "<unknown>");
+
 	snprintf(hintbuf, sizeof(hintbuf), ob_guard_hint_tmpl,
-			 (cur && *cur) ? cur : "");
+			 in_branch_mode ? cur : "");
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("overlay_branch: cannot %s%s inside active branch \"%s\": %s",
 					operation,
-					relname ? " relation " : "",
-					(cur && *cur) ? cur : "<unknown>",
+					relname ? psprintf(" relation \"%s\"", relname) : "",
+					brname,
 					reason ? reason : "operation is not supported in branch mode V1"),
 			 relname ? errdetail("Target relation: %s.", relname) : 0,
-			 errhint("%s", hintbuf)));
+			 /* The "switch back to MAIN" hint only makes sense when the
+			  * failing statement actually ran INSIDE branch mode. */
+			 in_branch_mode ? errhint("%s", hintbuf) : 0));
 }
 
 bool
@@ -1270,7 +1281,7 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 													  &fail_reason))
 				{
 					overlay_guard_ereport_fail(op_name ? op_name : "execute utility/DDL",
-											   obj_name, fail_reason);
+											   obj_name, NULL, fail_reason);
 				}
 				break;
 		}

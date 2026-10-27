@@ -143,23 +143,23 @@ pure-delta 后处理（[write_redirect.c:1053-1708](file:///home/ubuntu/work/pos
 |------|------|------------------------|----------|
 | 并发 UPDATE 锚定行 | 新版本落在**新 ctid**，旧 ctid 变死元组 | 旧 ctid 不再被 seqscan 看见 → delta 不匹配 → **静默丢 delta**（Pass 2 丢弃孤儿 `A:*`） | 定位 ctid 无可见行 → `0A000`（`MAIN row missing`） |
 | 并发 DELETE 锚定行 | ctid 不可见 | 同上 | 同上 |
-| **ctid 复用**（VACUUM 回收旧槽位后被新 INSERT 占用） | 旧槽位置 `LP_UNUSED` → 新行落在**同一 ctid** | 新行与旧 delta **误匹配** → 把旧行改动套在新行上 = **静默错读** | `old_version` 的 `xmin` 分量不匹配 → `0A000`（`conflict ... old_version expected=...`） |
+| **ctid 复用**（VACUUM 回收旧槽位后被新 INSERT 占用） | 旧槽位置 `LP_UNUSED` → 新行落在**同一 ctid** | ctid 等值匹配会命中新行，但 anchor `xmin` 校验判定过期 → delta 被丢弃 = **静默丢 delta**（不再误读新行） | `old_version` 的 `xmin` 分量不匹配 → `0A000`（`conflict ... old_version expected=...`） |
 | 表整体 rewrite（`VACUUM FULL` / `CLUSTER` / 重建型 `REINDEX` / `TRUNCATE` 后重填） | 全表元组获得新 ctid | 全表 anchor 一并失配 → **静默丢 delta** | 逐行 `0A000` |
 
-> **读侧没有 `xmin` 校验**：[branch_scan.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L568-L596) 仅由 `tts_tid` 生成 `A:<blk>:<off>` 并做**等值匹配**，不解 `old_version`。因此第 3 行（ctid 复用）在读侧表现为**静默错读**，只有 apply 的 `old_version` 比对能发现它。前两行与第 4 行是"静默丢 delta"，第 3 行是"静默错读"。
+> **读侧已补 `xmin` 校验**：[branch_scan.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L121-L162) Pass 1 在 ctid 等值匹配命中后，解析 `old_version` 的 `-x<xmin>` 后缀并与 MAIN 元组的 `HeapTupleHeaderGetRawXmin` 比对（`ob_anchor_is_stale`）；不一致即判定锚点过期，令匹配失败并落入 Pass 2 孤儿规则丢弃。因此第 3 行（ctid 复用）在读侧**不再误读新行**，退化为与其余各行一致的"静默丢 delta"。非正常 xid（frozen）或非 `A:` 锚点跳过校验，保持保守。
 
 活动分支期间，rewrite 类操作被 §A7 DDL 门禁拦截（[internals.md §4.3](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/internals.md#L235)）；但分支**非活跃窗口**（`use_branch(NULL)` 之后、`apply` 之前）无法拦截，只能靠 apply 的 `old_version` 兜底。
 
 因此本特性必须：
 1. 进入分支时输出 §2.3 的 WARNING；
 2. apply 时能**确定性报错**（锚点行定位失败或 `old_version` 不匹配 → 走 [overlay_guard_ereport_fail](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/overlay_branch.c#L708)，SQLSTATE `0A000`）；
-3. 读侧检测"孤儿 anchored delta"：**已实现**——Pass 2 丢弃未匹配的 `A:*` 锚点（`op='U'/'D'` 孤儿不复活），见 [branch_scan.c Pass 2](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L745)。**不额外发 WARNING**（避免读放大）。
+3. 读侧检测"孤儿 anchored delta"：**已实现**——Pass 1 的 anchor `xmin` 新鲜度校验（`ob_anchor_is_stale`）剔除被复用 ctid 的误匹配，Pass 2 丢弃未匹配的 `A:*` 锚点（`op='U'/'D'` 孤儿不复活），见 [branch_scan.c Pass 2](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L745)。**不额外发 WARNING**（避免读放大）。
 
 ### 3.7 能否降低"偶然"锚点失效的概率？（以 autovacuum 为例）
 
 **普通 VACUUM / autovacuum 本身不会让锚点失效。** 它不移动活元组——只要锚定的 MAIN 行未被其它会话改动，其 ctid 恒定，anchor 继续有效。autovacuum 的唯一作用是**回收死元组的 line pointer（置 `LP_UNUSED`）**，从而使后续 INSERT 能复用该 ctid（§3.6 第 3 行）。故：
 
-> 失效的**根因是"其它会话的并发 DML"**；autovacuum 只是把"并发 DML 已造成的静默丢失"进一步升级为"可能的静默错读"。没有并发 DML 时，VACUUM 刷多少遍都不影响已锚定且未改动的行。
+> 失效的**根因是"其它会话的并发 DML"**；autovacuum 只是把"并发 DML 已造成的静默丢失"进一步升级为"ctid 复用"。当前读侧已用 anchor `xmin` 校验兜住复用导致的误读（§3.6），故复用仍退化为静默丢 delta。没有并发 DML 时，VACUUM 刷多少遍都不影响已锚定且未改动的行。
 
 （实现补充：`INSERT` 复用某个 ctid 的前提是该 line pointer 已是 `LP_UNUSED`，而 `LP_UNUSED` **只由 VACUUM 设置**；HOT 剪枝只把根 line pointer 标记为 `LP_DEAD`，不释放偏移量。所以"ctid 复用"必然经过一次 VACUUM。）
 
@@ -171,11 +171,11 @@ pure-delta 后处理（[write_redirect.c:1053-1708](file:///home/ubuntu/work/pos
 | 缩短分支生命周期（尽早 apply/discard） | 线性降低命中并发写的概率（blast radius ∝ 存活时间 × 表写入速率） | 使用方式约束 |
 | 分支存续期间避免其它会话写该表（业务串行化，或手动 `LOCK TABLE ... IN SHARE MODE` 阻塞写者） | 消除"并发写"这一根因 | 牺牲写并发 |
 | 该表 `ALTER TABLE ... SET (autovacuum_enabled = off)` | **只**掐断 §3.6 第 3 行的 ctid 复用路径 → 消除"静默错读" | 该表死元组持续累积（膨胀）；挡不住手动 `VACUUM`；**不改善**静默丢 delta |
-| （可选代码增强）读侧 Pass 1 补 `old_version` 的 `xmin` 校验 | 把"ctid 复用 → 静默错读"变为"丢弃/报错" | 需改 `branch_scan.c`（当前无 xmin 校验，§8 未决） |
+| 读侧 Pass 1 补 `old_version` 的 `xmin` 校验（**已实现**） | 把"ctid 复用 → 静默误读"变为"丢弃"（退化为静默丢 delta） | 已完成（`branch_scan.c` `ob_anchor_is_stale`） |
 
 **不可行/已否决**：用 persistent replication slot 钉住 `OldestXmin` 可**物理阻止**死元组被回收，从根上消除 ctid 复用（方案 B），但代价是全集群 VACUUM 抑制 / HOT 失效 / 写放大（§4.3、§4.4），本版本不实现。
 
-> 结论：autovacuum 不是"偶然失效"的根因，因此**不存在"关掉 autovacuum 就能保护锚点"的通用解法**——只能靠缩短窗口、串行化写入或加 PK 来降低概率；若要读侧也杜绝"静默错读"，唯一干净的做法是给读路径补 `xmin` 校验（可选增强）。
+> 结论：autovacuum 不是"偶然失效"的根因，因此**不存在"关掉 autovacuum 就能保护锚点"的通用解法**——只能靠缩短窗口、串行化写入或加 PK 来降低概率。读路径已补 anchor `xmin` 校验（§3.6），ctid 复用不再导致误读，仅表现为静默丢 delta。
 
 ---
 
@@ -194,7 +194,7 @@ ctid 锚点要跨越分支生命周期有效，需要保证两点：
 不引入任何保留机制，接受 §3.6 的脆弱性：并发 MAIN 写可能使锚点失效，**在 apply 时以冲突错误（`0A000`）干净报错**。分支生命周期通常很短，blast radius 可控，且**不引入集群级副作用**。
 
 - 优点：改动面小、无集群级代价、默认关闭时对现网零影响。
-- 缺点：并发 MAIN 写下可能静默丢 delta（读侧），仅 apply 报错兜底。
+- 缺点：并发 MAIN 写下可能静默丢 delta（读侧，含 ctid 复用被 anchor `xmin` 校验否决的情形），仅 apply 报错兜底。
 
 **apply 报错示例**（无 PK 表；锚点行被并发改写）：
 
@@ -214,17 +214,13 @@ SELECT overlay_branch.apply_branch('b1');
 ```
 
 ```
-ERROR:  overlay_branch: cannot apply_branch (conflict) relation  inside active branch "<unknown>": UPDATE pk=A:0:1 MAIN row missing at apply time (concurrent DELETE)
+ERROR:  overlay_branch: cannot apply_branch (conflict) relation "kl" inside active branch "b1": UPDATE pk=A:0:1 MAIN row missing at apply time (concurrent UPDATE/DELETE or table rewrite)
 DETAIL:  Target relation: kl.
-HINT:  Switch back to the MAIN database before running this statement:
-    SELECT overlay_branch.discard_branch('');
-  or
-    RESET overlay_branch.current;
 ```
 
 `SQLSTATE = 0A000`（`ERRCODE_FEATURE_NOT_SUPPORTED`）。apply 失败后分支仍为 `state='active'`，s2 已提交的 MAIN 值（`RACE-MAIN`）原样保留——**报错而非静默写错**。
 
-> 注：`relation ` 后为空、分支名为 `<unknown>` 是当前 `overlay_guard_ereport_fail` 的措辞——目标关系名由 `DETAIL` 行给出，且 apply 在分支模式外执行，故 `overlay_branch_get_current_name()` 返回空；`pk=A:0:1` 即失效的 ctid 锚点。`(concurrent DELETE)` 是固定文案，覆盖 UPDATE 移位 / DELETE 两类失效。
+> 注：`relation "kl"` 为目标关系，`"b1"` 为分支名（apply 在分支模式外执行，分支名由调用方显式传入，不再显示 `<unknown>`）；`pk=A:0:1` 即失效的 ctid 锚点。`(concurrent UPDATE/DELETE or table rewrite)` 覆盖并发 UPDATE 移位、DELETE 以及 `VACUUM FULL`/`CLUSTER`/`REINDEX` 重写三类失效。apply/discard 在分支模式外执行，不输出无意义的 HINT。
 
 ### 4.3 方案 B：persistent replication slot 保留（gammadb 原型）
 
@@ -288,8 +284,7 @@ HINT:  Switch back to the MAIN database before running this statement:
 **不支持（复用现有 `0A000` 报错风格）**：
 - keyless + `INSERT ... ON CONFLICT`（UPSERT 4-way 依赖 PK）→ `0A000`。
 - keyless + 分区表 / 外键 / MERGE / COPY FROM / DML-CTE（沿用现有 MVP 限制）。
-- keyless + 并发 MAIN 写的一致性保证（仅 apply 报错兜底，§3.6）。
-- 读侧 `xmin` 校验（ctid 复用导致的"静默错读"不被读路径发现，仅 apply 兜底，§3.6/§3.7）。
+- keyless + 并发 MAIN 写的一致性保证（读侧 anchor `xmin` 校验已兜住误读，仅退化为静默丢 delta；apply 报错兜底，§3.6）。
 - 陈旧 ctid 的版本链解析（`heap_get_latest_tid`）→ 列为后续增强。
 
 ---
@@ -314,12 +309,13 @@ HINT:  Switch back to the MAIN database before running this statement:
 3. **读侧孤儿检测**：**已实现**——BranchScan Pass 2 丢弃未匹配的 `A:*` 锚点（静默丢弃，不报 WARNING）。
 4. **GUC 名称**：采用 `overlay_branch.keyless_tables`。
 5. **key 前缀**：采用 `A:` / `S:` tag（与 PK JSON 数组不冲突）。
+6. **读侧 `xmin` 校验**：**已实现**——Pass 1 `ob_anchor_is_stale` 比对 anchor `xmin` 与 MAIN 元组 `xmin`，ctid 复用不再误读（§3.6/§3.7）。
+7. **guard 报错文案**：apply/discard 显式传入分支名并插值关系名，`(concurrent UPDATE/DELETE or table rewrite)` 统一描述锚点失效原因（§4.2）。
 
 > **未决（后续）**：
 > 1. 是否引入 `heap_get_latest_tid`（gammadb 做法）解析陈旧 ctid 版本链，以缓解 §3.6 的"静默丢 delta"。
-> 2. 是否给读侧 Pass 1 补 `old_version` 的 `xmin` 校验，以消除 ctid 复用导致的"静默错读"（§3.6/§3.7）。
 >
-> 两者本版本均不做。
+> 本版本不做。
 
 ---
 

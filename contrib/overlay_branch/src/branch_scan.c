@@ -119,6 +119,49 @@ typedef struct ExtendedCustomScanState
 
 
 /* ================================================================
+ * KEYLESS anchor freshness (doc/keyless_ctid_design.md §3.6/§3.7)
+ * ================================================================
+ * A keyless delta is matched to a MAIN row by ctid ALONE (Pass 1 below),
+ * but dt->old_version also records the physical version the branch first
+ * anchored: overlay_tuple_version() renders it as "<blk>:<off>-x<xmin>".
+ *
+ * If VACUUM recycled the anchored line pointer (LP_UNUSED) and a later
+ * INSERT reused that very ctid, the ctid-only match would silently graft
+ * the branch edit onto a completely unrelated row — the "silent misread"
+ * case.  The xmin half of the token detects that: a tuple still living at
+ * the anchored ctid but written by a different transaction is a DIFFERENT
+ * logical row.
+ *
+ * Returns true when the anchor is provably stale (delta must NOT be
+ * matched; the Pass 2 orphan rule then drops it, exactly like the
+ * concurrently-UPDATEd case).  A frozen tuple is accepted as-is: VACUUM
+ * can freeze a tuple in place, so a non-normal xmin proves nothing.
+ * ================================================================ */
+static bool
+ob_anchor_is_stale(const DeltaTuple *dt, HeapTuple htup)
+{
+    const char   *dash;
+    unsigned long anchor_xmin;
+
+    if (dt == NULL || dt->key == NULL || dt->old_version == NULL ||
+        htup == NULL || htup->t_data == NULL)
+        return false;
+    if (!(dt->key[0] == 'A' && dt->key[1] == ':'))
+        return false;
+
+    dash = strrchr(dt->old_version, '-');
+    if (dash == NULL || dash[1] != 'x')
+        return false;
+    if (sscanf(dash + 2, "%lu", &anchor_xmin) != 1)
+        return false;
+
+    if (!TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(htup->t_data)))
+        return false;
+
+    return ((TransactionId) anchor_xmin) != HeapTupleHeaderGetRawXmin(htup->t_data);
+}
+
+/* ================================================================
  * SHARED 2-pass helper (called by BOTH SRF and CustomScan Executor)
  *
  *   PK-predicate fast-path (P0 MVP):
@@ -594,6 +637,15 @@ ob_compute_overlay_slots_internal(Oid relid, int32 branch_id, TupleDesc *out_tup
                                                 cmp_searchkey_vs_dtp);
                 if (found != NULL) match = *found;
             }
+
+            /* keyless: a ctid-only match can hit a RECYCLED line pointer
+             * (VACUUM freed it, a later INSERT reused it).  Reject the
+             * anchor in that case so the branch edit is not grafted onto
+             * an unrelated row; the delta then falls to the Pass 2 orphan
+             * rule below and is dropped. */
+            if (!rel_has_pk_ && match != NULL &&
+                ob_anchor_is_stale(match, htup))
+                match = NULL;
 
             if (match == NULL)
             {

@@ -215,7 +215,7 @@ UPDATE bs_pu SET v = 'x' WHERE id = NULL;   -- 0 row (dummy baserel + newlist=NI
 ## A.5 Validation（每片必过）
 | 片 | 验证 |
 |---|---|
-| 通用 | `make install prefix=/tmp/pg17-writable 2>&1 \| tail -3` → 0 warning、0 error |
+| 通用 | `make install 2>&1 \| tail -3` → 0 warning、0 error |
 | Slice1 | 见 Slice1 末尾 EXPLAIN 验收；MAIN 下 Seq Scan；branch 下 CustomScan |
 | Slice2 | 见 Slice2 末尾 string_agg 完全相等；RESET 后 baseline 3 行 |
 | Slice3 | `pg_regress --use-existing --host=/tmp --port=15433 overlay_branch_user overlay_branch_basic` → All 2 passed；cat regression.diffs → 空 |

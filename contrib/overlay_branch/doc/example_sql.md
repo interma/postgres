@@ -995,9 +995,7 @@ INSERT INTO logs VALUES ('boot');
 SELECT create_branch('b_logs');
 SELECT use_branch('b_logs');
 INSERT INTO logs VALUES ('x');
-ERROR:  overlay_branch: cannot INSERT relation  inside active branch "b_logs":
-        table must have a PRIMARY KEY for branch-mode DML (V1 constraint;
-        enable overlay_branch.keyless_tables for the experimental ctid fallback)
+ERROR:  overlay_branch: cannot INSERT relation "logs" inside active branch "b_logs": table must have a PRIMARY KEY for branch-mode DML (V1 constraint; enable overlay_branch.keyless_tables for the experimental ctid fallback)
 DETAIL:  Target relation: logs.
 ```
 

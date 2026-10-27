@@ -460,7 +460,11 @@ extern void overlay_typed_pk_free(TypedKey *pk, int n_pk);
  */
 extern bool overlay_guard_rel_ok(Relation rel, char **reason);
 extern void overlay_guard_ensure_branch_or_main_active(void); /* prerequisite */
-extern void overlay_guard_ereport_fail(const char *operation, const char *relname, const char *reason);
+/* branch_name: the branch this failure belongs to.  Callers that run
+ * OUTSIDE branch mode (apply/discard) must pass it explicitly; callers
+ * running INSIDE branch mode pass NULL and the active branch is used. */
+extern void overlay_guard_ereport_fail(const char *operation, const char *relname,
+									   const char *branch_name, const char *reason);
 
 /* Step7 ProcessUtility guard: T_TruncateStmt / T_DropStmt / T_AlterTable /
  * T_CreateStmt / T_IndexStmt / T_VacuumStmt / T_ClusterStmt / T_RenameStmt etc.

@@ -742,7 +742,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				if (!overlay_guard_rel_ok(rel, &gr))
 					overlay_guard_ereport_fail(opstr,
-											   RelationGetRelationName(rel), gr);
+											   RelationGetRelationName(rel), NULL, gr);
 			}
 
 			if (estate != NULL)
@@ -781,7 +781,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								cmd == CMD_DELETE ? "DELETE" : "DML";
 						if (!overlay_guard_rel_ok(rel, &gr))
 							overlay_guard_ereport_fail(opstr,
-													   RelationGetRelationName(rel), gr);
+													   RelationGetRelationName(rel), NULL, gr);
 					}
 				}
 			}

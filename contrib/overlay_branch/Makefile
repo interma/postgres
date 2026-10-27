@@ -50,17 +50,6 @@ ISOLATION_OPTS = \
 ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan keyless_basic keyless_pure_delta_repeat keyless_apply_conflict
 EXTRA_CLEAN += test_output output_iso tmp_check_iso
 
-# Handy helper: sync the just-built extension bits (so/sql/control) out of the
-# writable /tmp/pg17-writable install tree into the user's "home" PG install at
-# $${HOME}/pg17 (which is what most bare `pg_regress` / `psql` invocations pick up
-# via $PATH).  Use this once after each `make install prefix=/tmp/pg17-writable`
-# if your default pg_config points at $${HOME}/pg17.
-HOME_PG_PREFIX ?= $(HOME)/pg17
-.PHONY: install-home
-install-home:
-	@echo "--- overlay_branch: syncing installed bits to $(HOME_PG_PREFIX) ---"
-	@$(MAKE) install prefix=$(HOME_PG_PREFIX)
-
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

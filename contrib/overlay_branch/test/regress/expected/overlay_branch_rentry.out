@@ -1509,12 +1509,8 @@ SELECT public.use_branch(NULL);
 
 RESET overlay_branch.current;
 SELECT apply_branch('br_a7_z');
-ERROR:  overlay_branch: cannot apply_branch (conflict) relation  inside active branch "<unknown>": conflict pk=["1"]: old_version expected=(null) MAIN latest=(null)
+ERROR:  overlay_branch: cannot apply_branch (conflict) relation "a7_users" inside active branch "br_a7_z": conflict pk=["1"]: old_version expected=(null) MAIN latest=(null)
 DETAIL:  Target relation: a7_users.
-HINT:  Switch back to the MAIN database before running this statement:
-    SELECT overlay_branch.discard_branch('');
-  or
-    RESET overlay_branch.current;
 CONTEXT:  SQL statement "SELECT overlay_branch.apply_branch(_name)"
 PL/pgSQL function public.apply_branch(name) line 54 at PERFORM
 SELECT public.discard_branch('br_a7_z');

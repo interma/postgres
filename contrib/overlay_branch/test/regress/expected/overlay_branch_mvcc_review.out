@@ -27,7 +27,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make install-home + make check), '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -333,7 +333,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make install-home + make check), '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -596,7 +596,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make install-home + make check), '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;

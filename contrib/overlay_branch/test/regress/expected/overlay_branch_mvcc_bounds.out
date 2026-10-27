@@ -27,7 +27,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make install-home + make check), '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -1311,12 +1311,7 @@ ERROR:  FAIL:q2_expected_kickout_but_got_rows_cnt=2
 CONTEXT:  PL/pgSQL function inline_code_block line 7 at RAISE
 /* Teardown Q-2 fixture */
 SELECT discard_branch('bs_t8_q2');
-ERROR:  overlay_branch: cannot discard_branch relation  inside active branch "<unknown>": branch "bs_t8_q2" is not active (already discarded or applied); discard cannot be called twice on the same branch
-DETAIL:  Target relation: bs_t8_q2.
-HINT:  Switch back to the MAIN database before running this statement:
-    SELECT overlay_branch.discard_branch('');
-  or
-    RESET overlay_branch.current;
+ERROR:  overlay_branch: cannot discard_branch inside active branch "bs_t8_q2": branch "bs_t8_q2" is not active (already discarded or applied); discard cannot be called twice on the same branch
 CONTEXT:  SQL statement "SELECT overlay_branch.discard_branch(_name)"
 PL/pgSQL function public.discard_branch(name) line 36 at PERFORM
 DROP TABLE public.q2_t;

@@ -606,10 +606,17 @@ ob_mode_cache_remove(int32 bid)
 static char *ob_build_pk_where_clause(Relation rel, const char *pk_json_array);
 static char *ob_build_identity_where_clause(Relation rel, const char *key);
 static TupleTableSlot *ob_fetch_main_current_slot(Relation rel, const char *where_clause);
-static void apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_clause);
-static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt);
-static void apply_relation_update_pass(Relation rel, DeltaTuple *dt);
-static void apply_relation_insert_pass(Relation rel, DeltaTuple *dt);
+/* branch_name is threaded down so apply-time conflict errors name the branch
+ * being applied (apply runs outside branch mode — see overlay_guard_ereport_fail). */
+static void apply_check_base_image_match(Relation rel, DeltaTuple *dt,
+										 const char *where_clause,
+										 const char *branch_name);
+static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
+									   const char *branch_name);
+static void apply_relation_update_pass(Relation rel, DeltaTuple *dt,
+									   const char *branch_name);
+static void apply_relation_insert_pass(Relation rel, DeltaTuple *dt,
+									   const char *branch_name);
 
 /* ================================================================
  * §G06 最小防泄漏：检测当前数据库是否存在任何 publication
@@ -2360,7 +2367,7 @@ overlay_branch_apply_internal(const char *branch_name)
 		if (state)
 			pfree(state);
 		pfree(esc_name);
-		overlay_guard_ereport_fail("apply_branch", branch_name, reason);
+		overlay_guard_ereport_fail("apply_branch", NULL, branch_name, reason);
 	}
 
 	/* V3 FR3: CAS transition to transient state='applying' BEFORE any 3-pass writes, to
@@ -2518,7 +2525,7 @@ overlay_branch_apply_internal(const char *branch_name)
 					if (dt->op == DELTA_OP_DELETE)
 					{
 						elog(DEBUG1, "apply[dbg] DELETE pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_delete_pass(rel, dt);
+						apply_relation_delete_pass(rel, dt, branch_name);
 						elog(DEBUG1, "apply[dbg] DELETE pass DONE");
 					}
 				}
@@ -2528,7 +2535,7 @@ overlay_branch_apply_internal(const char *branch_name)
 					if (dt->op == DELTA_OP_UPDATE)
 					{
 						elog(DEBUG1, "apply[dbg] UPDATE pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_update_pass(rel, dt);
+						apply_relation_update_pass(rel, dt, branch_name);
 						elog(DEBUG1, "apply[dbg] UPDATE pass DONE");
 					}
 				}
@@ -2538,7 +2545,7 @@ overlay_branch_apply_internal(const char *branch_name)
 					if (dt->op == DELTA_OP_INSERT)
 					{
 						elog(DEBUG1, "apply[dbg] INSERT pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_insert_pass(rel, dt);
+						apply_relation_insert_pass(rel, dt, branch_name);
 						elog(DEBUG1, "apply[dbg] INSERT pass DONE");
 					}
 				}
@@ -2724,6 +2731,7 @@ overlay_branch_discard_internal(const char *branch_name)
 	{
 		SPI_finish();
 		overlay_guard_ereport_fail("discard_branch",
+								   NULL,
 								   branch_name,
 								   psprintf("branch \"%s\" is not active (already discarded or applied); "
 											"discard cannot be called twice on the same branch",
@@ -3249,7 +3257,8 @@ ob_fetch_main_current_slot(Relation rel, const char *where_clause)
  * whole branch apply.
  * ================================================================ */
 static void
-apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_clause)
+apply_check_base_image_match(Relation rel, DeltaTuple *dt,
+							 const char *where_clause, const char *branch_name)
 {
 	Oid			bytea_out_func;
 	bool		bytea_out_varlena;
@@ -3351,6 +3360,7 @@ apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_cla
 		SPI_finish();
 		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 	{
@@ -3383,6 +3393,7 @@ apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_cla
 			dt->key ? dt->key : "(null)");
 		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 }
@@ -3392,7 +3403,8 @@ apply_check_base_image_match(Relation rel, DeltaTuple *dt, const char *where_cla
  * ================================================================ */
 
 static void
-apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
+apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
+						   const char *branch_name)
 {
 	char	   *where_clause;
 	TupleTableSlot *main_slot;
@@ -3436,6 +3448,7 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 
@@ -3455,6 +3468,7 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 	elog(DEBUG1, "delpass[dbg] D pfree main_ver");
@@ -3462,7 +3476,7 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 	elog(DEBUG1, "delpass[dbg] D2 drop main_slot");
 	ExecDropSingleTupleTableSlot(main_slot);
 	elog(DEBUG1, "delpass[dbg] D3 base_image vs MAIN lock check");
-	apply_check_base_image_match(rel, dt, where_clause);
+	apply_check_base_image_match(rel, dt, where_clause, branch_name);
 	elog(DEBUG1, "delpass[dbg] E build DELETE sql");
 
 	{
@@ -3494,7 +3508,8 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt)
 }
 
 static void
-apply_relation_update_pass(Relation rel, DeltaTuple *dt)
+apply_relation_update_pass(Relation rel, DeltaTuple *dt,
+						   const char *branch_name)
 {
 	char	   *where_clause;
 	TupleTableSlot *main_slot;
@@ -3530,14 +3545,16 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 		if (dt->old_version == NULL)
 		{
 			if (where_clause) pfree(where_clause);
-			apply_relation_insert_pass(rel, dt);
+			apply_relation_insert_pass(rel, dt, branch_name);
 			return;
 		}
-		reason = psprintf("UPDATE pk=%s MAIN row missing at apply time (concurrent DELETE)",
+		reason = psprintf("UPDATE pk=%s MAIN row missing at apply time "
+						  "(concurrent UPDATE/DELETE or table rewrite)",
 						  dt->key);
 		if (where_clause) pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 
@@ -3554,11 +3571,12 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
 								   RelationGetRelationName(rel),
+								   branch_name,
 								   reason);
 	}
 	if (main_ver) pfree(main_ver);
 	ExecDropSingleTupleTableSlot(main_slot);
-	apply_check_base_image_match(rel, dt, where_clause);
+	apply_check_base_image_match(rel, dt, where_clause, branch_name);
 
 	{
 		TupleDesc	reldesc = RelationGetDescr(rel);
@@ -3641,7 +3659,8 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt)
 }
 
 static void
-apply_relation_insert_pass(Relation rel, DeltaTuple *dt)
+apply_relation_insert_pass(Relation rel, DeltaTuple *dt,
+						   const char *branch_name)
 {
 	char	   *q_relname;
 	int			ret;
@@ -3681,6 +3700,7 @@ apply_relation_insert_pass(Relation rel, DeltaTuple *dt)
 			pfree(where_clause);
 			overlay_guard_ereport_fail("apply_branch (conflict)",
 									   RelationGetRelationName(rel),
+									   branch_name,
 									   reason);
 		}
 		if (where_clause) pfree(where_clause);

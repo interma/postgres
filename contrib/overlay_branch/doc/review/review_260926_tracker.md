@@ -143,7 +143,7 @@
 ## 通过门禁（每个 Issue 关闭条件）
 
 1. 对应 L3/L1 case 在两个从零初始化的 `tmp_check` 集群各通过一次（见 AGENTS.md clean rebuild 命令）
-2. `make -j4 install prefix=/tmp/pg17-writable` 编译零 warning/error
+2. `make -C contrib/overlay_branch -j`（in-tree，prefix=`$(HOME)/pg17`）编译零 warning/error
 3. 若改了 .h 接口签名：在 `multi_session_mvcc.md` 追加 1 节设计说明
 4. tracker 本表 status 翻转 ⬜→✅，附测试 Section 链接
 

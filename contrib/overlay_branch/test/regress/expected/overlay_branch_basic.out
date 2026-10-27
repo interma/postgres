@@ -64,8 +64,8 @@
 --
 --   (b) The postmaster's $libdir/postgresql/overlay_branch.so must be the copy
 --       you just built (not a stale skeleton from a previous checkout).  If
---       your default `pg_config --pkglibdir` points at a read-only install
---       (e.g. ~/pg17) run `make install-home` from contrib/overlay_branch first.
+--       your default `pg_config --pkglibdir` points elsewhere, rebuild and
+--       run `make install` from contrib/overlay_branch first.
 --
 -- HOW TO RUN THESE TESTS (pick ONE, never run `cd test && pg_regress …`):
 --

@@ -23,11 +23,11 @@
 | 分类二 MVP 加固：G01/G02 | ✅ **2/6 FIXED MVP subset** | G02 ACL double-defense / G01 scope preflight（详见下方 V4 章节） |
 | 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；A2 ✅ (Read/Write View Unification)；**A8 ✅ (MVP cost_branchscan cost model + planner correctness)**；**A9 ✅ (pg_branch identity & restore metadata: schema_hash/creation_snapshot_xmin/tablespace_list/col_signature, new get_branch_identity helper, 13+9 2x green)**；**A4 ✅ (SQL-layer empty-branch apply/discard fast-return wrapper, 10K-row 3-op 5 PASS markers, 13+9 2x green)**；A1/A6 ⚡ DEFER (M4+)；A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
 | 产品 P01–P03 / G03–G06 | ✅ P01/P02/P03 FIXED by 2026-10-11 trial run (10 PR 10/10 PASS: editor 100% / reviewer 10/10 pure-read / apply 100% / 0 silent-merge / 10 non-empty apply / 0 hidden catalog UPDATE; P02 weighted support 100% ≥80%). G03/G04/G06 remain 📌 MANIFEST (need real FAIL-case drill / M4+ owner fill / DBA live drill). G05 S28 ⚡ OPEN (100-concurrency baseline pending). | [example_sql §0.1 P01](example_sql.md#L68) / [§9.2 P02](example_sql.md#L870) / [agent_workflow §4 P03](agent_workflow.md#L151) / [ops_runbook G03-G06](ops_runbook.md) |
-| 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make USE_PGXS=1 PG_CONFIG=/tmp/pg17-writable/bin/pg_config -j` |
+| 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make -C contrib/overlay_branch -j`（in-tree，prefix=$(HOME)/pg17） |
 | L3 单会话 pg_regress （14 files） | ✅ **14/14 PASS**，`diff -r results expected` = **0 lines** | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) / **keyless** (B6 no-PK ctid identity: GUC off 0A000 / on WARNING+overlay / apply / conflict / PK path / UPSERT 0A000) |
 | L1 isolationtester 多会话（12 specs） | ✅ **12/12 PASS**（2× consecutive stable 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / ob_view_unify_rescan / **keyless_basic / keyless_pure_delta_repeat / keyless_apply_conflict** (B6 keyless ctid: GUC on WARNING + 读写叠加 + pure-delta 合成键幂等 + 跨会话 apply 冲突 0A000) |
 | 标签唯一性（G01_SCOPE_* × 11 + G02_* × 10 PASS） | ✅ 每个 label grep count = 2（1 SQL CASE WHEN token + 1 output row = 完美唯一） | rentry L3 out |
-| Shared-preload + extension script 重启闭环 | ✅ 每次 PG_CONFIG=/tmp/pg17-writable make install 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
+| Shared-preload + extension script 重启闭环 | ✅ 每次 `make install` 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
 
 ### 关键交付批次（V3 之后）
 
@@ -40,6 +40,7 @@
 5. **A9 身份元数据 + A4 空分支 fast-return**：schema_hash / creation_snapshot_xmin 等 identity helper；SQL 层 empty-branch apply/discard wrapper
 6. **D-6/D-7 产品化 manifest + 真实试用**：P01–P03 试用闭环 + G03/G04/G06 manifest 归档
 7. **V5 B6 keyless（实验）**：无 PK 表 ctid 锚点身份 + GUC `overlay_branch.keyless_tables`（默认 off）
+8. **V5 keyless 加固**：guard 报错文案修正（插值关系名 / 显式分支名 / `concurrent UPDATE/DELETE or table rewrite`）+ 读侧 anchor `xmin` 新鲜度校验（消除 ctid 复用误读）
 
 ---
 
@@ -111,7 +112,7 @@ Pass 2 (Pure delta INSERT):
 ### Step 7 — Hard Guard 16 场景零静默穿透
 - **6 级 guard order（从最便宜到最贵）**：G0 catalog schema 白名单 → G1 overlay_branch meta 表递归透传 → G2 relkind 仅 RELATION → G3 拒 partition 根/叶 → G4 拒非 internal trigger → G5 SPI `pg_constraint` 拒 FK 主/从 → G6 PK 非空
 - **双接入 Belt-and-braces**：① `overlay_ExecutorRun` per result-rel + 全 RTE 扫描（防 VIEW/MATVIEW rewrite 后漏） ② `overlay_ProcessUtility` 40+ `T_*` 白名单拦截
-- 统一错误界面：`overlay_guard_ereport_fail(scope, name, reason)` → DETAIL 命中哪一级 + HINT 回 MAIN
+- 统一错误界面：`overlay_guard_ereport_fail(operation, relname, branch_name, reason)` → 插值关系名 + 分支名（apply/discard 在分支模式外执行，分支名由调用方显式传入）；仅在分支内输出 HINT 回 MAIN
 - 16 冒烟场景全 ERROR 断言：VIEW / MV / TRIGGER / FK / partition / RULE / ALTER / DROP / TRUNCATE / CLUSTER / VACUUM FULL / seq nextval / INSERT INTO view / REINDEX / REFRESH MV 等等
 - Step7 后 Step1-4 pg_regress 必须 0 diff (guard 不干扰 regular PK table)
 
@@ -848,7 +849,7 @@ Section P PASS marker 之后追加 Section Q：
 
 ### V4 关键踩坑沉淀（不再重复犯）
 
-1. **VPATH/prefix/restart triple-check 必记项**：真正 test 用 postmaster = `/tmp/pg17-writable/bin/postgres -D /tmp/ob_data -p 15433 -k /tmp`，shared_preload_libraries='overlay_branch' 加载 `/tmp/pg17-writable/lib/postgresql/overlay_branch.so`，EXTENSION script 读 `/tmp/pg17-writable/share/postgresql/extension/overlay_branch--1.0.sql`。必须 `PG_CONFIG=/tmp/.../bin/pg_config make install` + 每轮 `pg_ctl restart`（shared_preload 不能 reload，不然 .so 永远是旧版本导致 ACL/scope 行为跟代码对不上）
+1. **prefix/restart triple-check 必记项**：真正 test 用 postmaster 必须与安装前缀一致（当前 `$(HOME)/pg17`），shared_preload_libraries='overlay_branch' 加载同一前缀下的 `lib/postgresql/overlay_branch.so`，EXTENSION script 读同一前缀的 `share/postgresql/extension/overlay_branch--1.0.sql`。每次 `make install` 后必须 `pg_ctl restart`（shared_preload 不能 reload，不然 .so 永远是旧版本导致 ACL/scope 行为跟代码对不上）
 2. **SECURITY DEFINER synonyms = ACL 直通大漏洞**：同义词函数一旦标 SECURITY DEFINER，GetUserId() 返回的是 superuser owner，ob_user_is_superuser_or_mgmt 恒 true → 所有 alice/bob 的 bypass 检查虚设。一律回滚为 **SECURITY INVOKER + schema USAGE GRANT PUBLIC + catalog GRANTs 显式组合**
 3. **SPI + WITH-CTE + SPI_execute read-only=true = SILENT FAIL 返回 0 rows**：FK 场景手动 psql 跑 WITH 返回 1 行，但 C 包装器里 SPI_tuptable->nrows = 0。改 flat 7 UNION ALL scalar subqueries + readonly=false 立即好
 4. **ext-owned public objects (pg_depend deptype='e')**：public.pg_branch VIEW relkind='v' 会被 UNSUPPORTED RELKIND ord=7 误拒，每个 UNION ALL 子查询必须加 NOT EXISTS pg_depend classid=pg_class + refclassid=pg_extension + refobjid=overlay_branch oid + deptype='e'。3 sys ns + ext ns 过滤是不够的
