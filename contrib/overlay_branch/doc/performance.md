@@ -51,15 +51,15 @@
 
 | 路径 | 当前形态 | 复杂度（当前） | 目标 |
 |---|---|---|---|
-| 读：delta 加载 | `list_for_rel` 走 `pg_branch_delta_relid_idx`；P0 命中时 `lookup` 走 PK 索引 | O(M) / O(1) | 不变 |
+| 读：delta 加载 | `list_for_rel` 走 PK 索引 `(branch_id, relid)` 前缀；P0 命中时 `lookup` 走 PK 点查 | O(M) / O(1) | 不变 |
 | 读：delta 排序 | `qsort` + 逐比较重建 btree 算子 | O(M log M) × syscache | O(M log M)，算子缓存 |
 | 读：去重 | 逐 run 线性回查原始下标 | **O(M²)** | O(M)，或直接删除（结构性不可达） |
 | 读：Pass1 匹配 | `bsearch` + 每 MAIN 行重建 TypedKey | O(N log M) × relcache/syscache | 同阶但常数大幅下降 |
 | 读：Pass2 | 逐未命中 delta 全表线性扫 | **O(U × M)**，`U` = pure-delta 行数 | O(M) |
 | 读：物化 | 首次取行即整结果集物化进 per-scan 内存上下文 | O(N + M) 内存，无早期终止 | 按需/流式（视需要） |
 | 写：每 DML 行 | state 查询 + `fetch_tuple_by_ctid` + `tuple_version` + UPSERT | 3~4 次 SPI | 减少 SPI 次数 |
-| apply：每 delta 行 | fetch + version + base_image 探测 + base_image 比对 + DML | **4~5 次 SPI** | 集合式/批量化 |
-| apply：遍历次数 | D→U→I 各完整遍历一遍 delta list | 3 × O(M) | 单次分桶或批处理 |
+| apply：每 delta 行（3B 前） | fetch + version + base_image 探测 + base_image 比对 + DML | **4~5 次 SPI** | 集合式/批量化 ✅（3B） |
+| apply：遍历次数 | D→U→I 各一趟；3B 起每 `(relid, op)` 一条验证 SQL + 一条批 DML | 3 × O(M) → O(1)/op | 已达（3B） |
 
 ---
 
@@ -114,6 +114,60 @@ Pass1 **每 MAIN 行一次 `overlay_serialize_pk()`**（一次 `to_jsonb` SPI，
   修复：slot/tupdesc 迁到 per-scan 内存上下文（`begin` 建、`Rescan` reset、`EndCustomScan` 删），
   delta 侧去掉 4 处中间 `datumCopy`，并在 R13 清理补 `pfree(dt->old_version)`。
   验证：全部场景 `grew=0`（[overlay_branch_memgrow.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/regress/sql/overlay_branch_memgrow.sql)）。
+
+  **写路径同类泄漏（后续补修，WR-1 前置）。** 上面的修复只覆盖读路径；**写重定向**里同一
+  “跨 `SPI_finish` 存活对象误放 `TopMemoryContext`”又现**三处独立**对象（根因详见 §8.6.1）：
+  3. `fetch_tuple_by_ctid()` 每行重建的 pre-image slot、其 `CreateTupleDescCopy()` tupdesc 与
+     全部 `datumCopy()` 列值都落在 `TopMemoryContext` —— 每重定向 UPDATE/DELETE 行泄漏一份；
+  4. UPDATE SET-merge 的 post-image 列副本也写 `TopMemoryContext`（每行每 varchar SET 列一份）；
+  5. pure-delta UPDATE 步取 `overlay_delta_lookup()` 结果（`key`/`old_version`/`tuple_data` 按设计
+     深拷贝进 `TopMemoryContext`）后从不释放 —— 每重写行泄漏整段序列化 payload。
+  修复：`fetch_tuple_by_ctid()` 增 `MemoryContext result_cxt` 形参（镜像 `reconstruct_slot_from_delta()`），
+  3 个调用点传 `es_query_cxt`；SET-merge 与 pure-delta post-image 分配改 `es_query_cxt`；
+  pure-delta 步补齐 `dtu` 释放（对照读路径 `ob_overlay_free_delta_list()`）。
+  验证：写路径探针（`MF1_WRITE_MEM_STABLE_PASS`）全部 `grew=0`。
+
+  **错误路径的同类问题（本轮全库统一审计，已修复）。** 上述 5 处都在**成功/正向路径**；全库审计
+  又定位到 5 处**只在错误分支触发**的同类缺陷，分两类：**UAF**（`SPI_finish()` 之后仍在读 SPI
+  上下文里的指针）与**每次失败泄漏**（只服务 `ereport` 消息的副本被写进 `TopMemoryContext`，
+  而错误路径永不返回，永远没有机会释放）。cassert 构建下 UAF 实测打印 `0x7F` 垃圾：
+  6. `ob_check_branch_scope()`：`detail = SPI_getvalue(...)` → `SPI_finish()` → `errdetail("%s", detail)`
+     —— 悬垂；`create_branch` 每次因 G01 scope 预检失败都会触发（回归 Section G01 即覆盖）。
+  7. `ob_registry_check_current_schema()`：两处 `saved = pstrdup(sql.data / ins.data)`（两个
+     StringInfo 都建在 SPI proc 上下文）→ `SPI_finish()` → 拼 `errmsg` —— 悬垂；同一函数的
+     schema-drift 报错分支还把 `detail_text` 双重分配进 `TopMemoryContext`（`text_to_cstring` +
+     `pstrdup`）从不释放。
+  8. `ob_build_pk_where_clause()`：`SPI_getvalue()` 在 `TopMemoryContext` switch **内**调用 →
+     返回值本身即落在 TopMC，随后又 `pstrdup` 一份，只释放了后者 —— 每 PK 列每次调用泄漏一份，
+     在 per-row apply（`apply_batch=off`）下按行累积。
+  9. `ob_batch_report_conflict()`：`c->key/old_version/main_ver` 是 `ob_batch_validate()` 按设计
+     放进 TopMC 的，冲突 abort 路径消费后从不释放 —— 每次冲突泄漏 3 个串。
+  10. `overlay_delta_insert()`：`state != ACTIVE` 错误分支的 `st`（TopMC）从不释放 —— 每次被拒写泄漏。
+  修复原则：错误路径一律**在 `SPI_finish()` 之前**把要进消息的字符串拷进**调用方内存上下文**
+  （`CurrentMemoryContext`，在 `SPI_connect()` 前捕获）；`ereport` 会立即展开 `%s`，因此副本只需在
+  finish 前有效，**不需要**更长的生命周期，更**不该**用 `TopMemoryContext`。
+  第 8 处改为直接接管 `SPI_getvalue()` 的返回值（它本就属于当前上下文）。验证：§8.7 错误路径探针。
+
+  **成功路径补充（本轮全库审计新增一处）。** 另定位到 1 处**正向路径**的逐行泄漏：
+  11. `write_redirect.c` pure-delta Phase D 的 `raw_rows` 收集循环在
+      `MemoryContextSwitchTo(es_query_cxt)` 内调用 `SPI_getvalue()`，`pkstr`/`ov` 本就分配在
+      `es_query_cxt`，旧代码却又各 `pstrdup` 一份存进 `WR_PDR1` —— 原串无人释放，纯 delta 多行
+      UPDATE 每行泄漏 2 个串；`continue` 分支同样泄漏。修复：直接接管 `SPI_getvalue()` 返回串
+      （与它们替掉的 `pstrdup` 同属 `es_query_cxt`，生命周期一致），并在 `continue` 前 `pfree`。
+
+  **SRF 读路径的语句内瞬态峰值（本轮审计新增，非 `TopMemoryContext` 泄漏）。** 上面 11 处都是
+  **跨语句存活**的泄漏，`TopMemoryContext` 前后断言即可观测。另有两处**语句内瞬态**增长，
+  语句结束即释放、TopMC 断言看不见，只能靠**进程峰值 RSS**（`test/bench/srf_peak_rss.sh`）判定：
+  - `overlay_branch.c : overlay_main_plus_delta()` 把每行 scratch（`values[]`/`isnulls[]` 与结果
+    tuple）分配在 `funcctx->multi_call_memory_ctx`（SRF 结束才删除）——整表扫描随行数线性增长。
+    修复：per-call **不再**切 multi-call ctx，scratch 落 executor 的 `ecxt_per_tuple_memory`
+    （value-per-call 循环每次 `ResetExprContext`），返回 tuple 在下次 reset 前已被拷进 tuplestore。
+  - `branch_scan.c : overlay_scan_next()` 每行重建的 result slot 及其 `datumCopy` 落在
+    `result_cxt`（SRF 路径即 multi-call ctx，扫描期不 reset）——同样随行数线性增长。
+    修复：新增 child `row_cxt`，每次调用入口 `MemoryContextReset`，slot/`datumCopy` 落 `row_cxt`。
+  验证：`srf_peak_rss.sh` 300k 行 → **首次**扫描 VmHWM +32 MB，**第二次**仅 +0.4 MB
+  （带缺陷时每次约 +80 MB）。重复扫描**平台化**即证明无泄漏：首次增长是 allocator（glibc）
+  保留已释放页造成的**高水位**，语句结束后 `VmRSS` 仍偏高但**不再**随扫描次数增长。
 - **MF-2｜并行路径绕过 overlay（潜在静默错读）— 已修复。**
   分支模式下只要 `max_parallel_workers_per_gather>0` 且表足够大，计划就变成
   `Parallel Seq Scan on ob_perf_base` —— **完全不含 BranchScan，delta 被忽略**。
@@ -310,8 +364,14 @@ harness 输出重定向到 `test/bench/perf_baseline_<N>_<M>.log`。
 - **`MF-1`（已完成）**：物化分配离开 `TopMemoryContext`（迁到 per-scan 上下文，
   `begin` 建 / `Rescan` reset / `EndCustomScan` 删），并去掉 delta 侧 4 处
   `TextDatumGetCString(datumCopy(...))` 的中间副本（真正的量级主因，见 §2.1）。
+  后续补修**写路径**同类的三处泄漏（pre-image slot/tupdesc、UPDATE SET-merge post-image、
+  pure-delta `overlay_delta_lookup()` 结果），见 §2.1 与 §8.6.1。
+  再补修 **SRF 读路径**两处**语句内瞬态峰值**（`overlay_main_plus_delta()` 的 per-row scratch
+  误落 multi-call ctx；`overlay_scan_next()` 的 per-row slot 落 `result_cxt`），见 §2.1。
   已补会话级内存用例
-  [overlay_branch_memgrow.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/regress/sql/overlay_branch_memgrow.sql)。
+  [overlay_branch_memgrow.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/regress/sql/overlay_branch_memgrow.sql)
+  （读路径 + 写路径两组探针；SRF 瞬态峰值由
+  [srf_peak_rss.sh](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/bench/srf_peak_rss.sh) 兜底）。
 - **`MF-5`（已完成）**：非 PK 下推反而更慢，不是独立缺陷，而是 **RD-2** 在
   “下推缩小 Pass1 命中集、逼大 Pass2 孤儿集 `U`”下的放大表现（见 §2.1 MF-5 实测表）。
   随 `RD-1`/`RD-2` 的删除一并消掉（`grp=7` 14303 → 479 ms，约 30×），下推逻辑未改。
@@ -411,6 +471,8 @@ Section G（PK / 列值含 `"` 与 `\` 时的 JSON 转义 + 叠加正确性）�
 
 ### 阶段 3 —— apply（中高风险）
 
+> 详细设计见 §6。**3A**（每行合并，语义不变）已落地；**3B**（集合式批处理）设计见 §6.4，待评审。
+
 - `AP-1`：集合式 apply —— 按 op 分桶，用一条批处理 SQL 处理多行
   （如 `INSERT ... SELECT ... FROM jsonb_populate_record(NULL::t, ...)` 的数组展开），
   base_image 校验合并进同一次 fetch，减少每行 SPI 次数。
@@ -423,9 +485,291 @@ Section G（PK / 列值含 `"` 与 `\` 时的 JSON 转义 + 叠加正确性）�
 - 落地 §3.3 的 `pg_branch_delta_stats` 视图 + throttled WARNING。
 - 视需要在 `apply` 前给出规模提示（仍是可观测，不是硬限制）。
 
+### 阶段 5 —— 写路径 WR-1（中风险）
+
+> 详细设计见 §8。目标：降低 DML 重定向到 delta 时的**每行** SPI 与 planning 成本
+> （当前 UPDATE/DELETE 4 次、INSERT 2 次 SPI，且每行重建 SQL 文本）。
+
+- `WR-1a`：把每行 SQL 改为**参数化 prepared plan**（消除每行 parse/plan）。
+- `WR-1b`：减少 SPI 次数（合并 ctid fetch + version；缓存 branch state）。
+- `WR-1c`：集合式批写（架构级，MVP 暂不做）。
+- 前置：先把写路径纳入基线（M10），无数字不动手（§0 原则 2）。
+
 ---
 
-## 6. 度量陷阱
+## 6. 阶段 3 设计：apply 批量化（AP-1）
+
+> Conv-2 设计先行。目标：把 `apply_branch()` 的**每 delta 行** SPI 次数从 8 降到 4（3A），
+> 再进一步降到「每 `(relation, op)` 一条集合式 SQL」（3B）。
+> **状态：3A 与 3B 均已落地**（含 §6.3.1 的两处修正）；3B 设计见 §6.4。
+
+### 6.1 现状：每 delta 行的 SPI 预算（3A 前）
+
+`overlay_branch_apply_internal()` 先按 `relid` 分桶，再对每个 relation 做 D→U→I 三趟。
+单列 PK 表、DELETE/UPDATE 行的实测链路：
+
+| 环节 | 调用点 | SPI/行 |
+|---|---|---|
+| 键 → WHERE | `ob_build_identity_where_clause` → `ob_build_pk_where_clause`：`jsonb_array_length` + 逐 PK 列 `#>> '{}'` + `string_agg` | 3 |
+| 取 MAIN 行 | `ob_fetch_main_current_slot`（整行逐列 `datumCopy`） | 1 |
+| 版本 token | `overlay_tuple_version`（**又发一次** `SELECT ctid::text, xmin::text`） | 1 |
+| `_base` 探测 | `apply_check_base_image_match` 的 `? '_base'` | 1 |
+| `_base` 比对 | 同上的 jsonb 规范化 + `FOR UPDATE` | 1 |
+| 实际 DML | DELETE / UPDATE / INSERT | 1 |
+| **DELETE / UPDATE 合计** | | **8** |
+| **INSERT 合计**（无 base 比对） | | **4** |
+
+两处**纯浪费**：`ob_fetch_main_current_slot` 按列物化整行，调用方只取 ctid + xmin；
+`overlay_tuple_version` 为拿这两个值再查一次堆。
+
+### 6.2 必须保持的不变量
+
+1. **3 趟顺序**：同 relation 内 D→U→I；每趟只处理对应 `op` 的 delta。
+2. **逐行乐观冲突语义**：MAIN 行缺失 / `old_version` 不匹配 / R15·R18 base_image 分歧，
+   一律 `55000` 中止整个 apply（`overlay_guard_ereport_fail`）。
+3. **纯 delta 特例**：`old_version IS NULL` 的 DELETE = NOP；UPDATE 无 MAIN 锚点时
+   回退 `apply_relation_insert_pass`。
+4. **keyless 身份**：`A:<blk>:<off>` → `ctid` 定位；`S:<seq>` → 无 MAIN 锚点。
+5. **锁序**：`FOR UPDATE` 先于 DML，同事务持锁到语句结束。
+6. **CAS / 状态机**：`active→applying→applied` 与 xact-scoped EXCLUSIVE advisory 锁不变（AP-2）。
+
+### 6.3 阶段 3A：每行合并（低风险，语义不变）✅ 已落地
+
+- **3A.1 键 → WHERE 去 SPI**：`ob_build_pk_where_clause` 由 3 次 SPI 压成 1 次。
+  该唯一 SPI 只做「取长度 + 逐 PK 列取文本」的裸 targetlist
+  （`SELECT jsonb_array_length($1::jsonb), ($1::jsonb)->>0, ...`），
+  WHERE 字符串在 C 层用 `quote_identifier` + `quote_literal_cstr` + 缓存的
+  `format_type_with_typemod()` 拼装。列名/类型清单按 rel 记忆（3A.4）。
+  PK 键是 JSON **字符串数组**（`["10"]`，NULL → JSON `null`），与 `overlay_serialize_pk`
+  的产出格式一致；`->>` 取其文本内容。keyless 的 `A:`/`S:` 分支本就是纯 C，不变。
+- **3A.2 取行 + 取版本合并**：D/U 不再物化整行，改为单条轻量 SELECT
+  `SELECT ctid::text, xmin::text FROM <rel> WHERE <where> FOR UPDATE LIMIT 1`
+  → 一次同时得到「存在性 + 版本 token」；`overlay_tuple_version()` 不再参与 apply 路径。
+- **3A.3 `_base` 探测**：见 §6.3.1 —— **不在 SQL 里探测**，改在 C 层扫描
+  `tuple_data` 原始字节，无 `"_base"` 时直接返回，永不发起该次 SPI。
+- **3A.4 per-rel 元数据记忆**：带引号 relname、列名清单、PK 列名/类型、bytea 输出函数句柄，
+  在 rel 循环内算一次并传给三趟 pass（现每行重算）。
+- INSERT：存在性检查改 `SELECT 1`，4 → 3。
+
+落地后 D/U 每行 **3** 次 SPI（键→WHERE 1 + 取行/版本 1 + DML 1），I 每行 **2** 次。
+
+### 6.3.1 实现期修正：规划成本 ≫ SPI 次数
+
+3A 初版把「`_base` 探测」与「比对」合并成**一条**复杂 SQL（`? '_base'` + 两侧
+`jsonb_object_agg` 规范化 + `LEFT JOIN LATERAL`）。实测发现这是净负优化：
+
+- 该 SQL 每行的字面量都不同 → **计划无法复用**，每条语句都要全量 parse+plan；
+  `pg_stat_statements(track_planning=on)` 显示其 plan 约 **55 µs/行**，
+  而 HEAD 那条廉价的 `? '_base'` 探测仅约 4 µs/行。同理 3A 初版的 `VALUES`+`string_agg`
+  键→WHERE 查询 plan 约 17 µs/行（HEAD 的等价三条只约 3 µs/行）。
+- 结论：**在 apply 逐行路径上，SPI 调用次数不是主要成本，计划时间才是。**
+
+据此修正两处：
+
+1. **`apply_check_base_image_match`**：先在 C 层扫描 `tuple_data` 原始字节是否含
+   `"_base"` 键；不含（当前写重定向路径的**全部** delta 都不含）即直接返回，
+   该次 SPI 变为 0。只有真带 base_image 的 delta 才走原来的规范化比对 SQL。
+2. **键 → WHERE**：见 3A.1，把 SQL 退化为裸 targetlist，拼装搬到 C 层。
+
+修正后（同机、同 harness、`N=200000 M=20000`，M8 = `apply_branch()`）：
+
+| 版本 | M8 |
+|---|---|
+| HEAD（3A 前） | ~1301–1319 ms |
+| 3A 初版 | **3293.7 ms**（回归 +150%） |
+| 3A 修正版 | **1310.5 ms**（回归消除，与 HEAD 持平） |
+| 3B（集合式批处理，默认 on） | **~180 ms**（192.4 / 165.9 ms 两次采样） |
+
+3A 修正版的 SPI 次数已低于 HEAD（D/U 6→3、I 5→2），墙钟持平；3B 把 planning 与 exec
+都压到「每 `(relid, op)` O(1)」，M8 再降 **~7×**（同机 A/B：`apply_batch=off` 1260.8 ms
+vs `on` ~180 ms），见 §6.4.13。
+
+### 6.4 阶段 3B：集合式批处理 ✅ 已落地
+
+> **状态：已落地**（设计先行稿 → 评审通过 → 实现 → 门禁全绿；决策记录见 §6.4.14）。
+> 3B 为目标命名（AP-1），中高风险。
+
+#### 6.4.1 目标与非目标
+
+- **目标**：把 apply 的 SPI 次数从「每 delta 行 O(1)」降到「每 `(relation, op)` O(1)」。
+  这同时消除 §6.3.1 暴露的**逐行 planning 主成本**（3 次/行 `SPI_execute` 的 parse+plan），
+  并收窄持锁窗口（AP-2 受益）。
+- **非目标**：不做并行 apply / 分块 apply；不改 `pg_branch_delta` schema；**不改** CAS /
+  状态机 / advisory 锁语义（§6.2 全部不变量保持）；不追求与 PK 方案的功能对等。
+
+#### 6.4.2 动因（来自 3A 修正版的度量）
+
+M8(`M=20000`) ≈ **1310 ms** ⇒ ~65 µs/行，而每行只有 3 次 SPI。SPI 次数已不是瓶颈
+（§6.3.1 已证明**规划时间**才是），因此 3B 的收益全部来自「把 planning 从 O(M) 降到 O(1)」。
+
+#### 6.4.3 两种候选（评审决策点）
+
+| 方案 | 形态 | 风险 | 预期收益 |
+|---|---|---|---|
+| **3B-1 参数化 prepared plan** | 保留逐行循环，改用 `SPI_prepare` + `SPI_execute_plan($n)`，计划跨行复用 | 极低（语义逐字不变） | planning → ~1×；仍 O(M) 次 SPI exec |
+| **3B-2 集合式批处理（AP-1，推荐）** | 每 `(relid, op)` 一条**验证** SQL + 一条**批 DML** | 中高 | planning 与 exec 都 → O(1)/op |
+
+推荐 **3B-2**；3B-1 可作为低风险前置或 3B-2 的回退路径（见 6.4.10）。
+
+#### 6.4.4 结构原则：验证与变更分离、谓词同源
+
+每个 `(relid, op)` 执行 **2 条 SQL**（happy path）：
+
+1. **验证 SELECT**：用批 DML **完全相同**的合法性谓词，只返回**首个冲突行**
+   （`ORDER BY key LIMIT 1`，附冲突种类与 C 端格式化所需字段）；无冲突返回 0 行。
+2. **批 DML**：一次处理该 op 的全部合法行。
+
+- **谓词同源**：批 DML 的 `WHERE`/`NOT EXISTS` 复刻验证谓词，故「验证通过 ⇒ DML 恰好命中全部
+  预期行」。以 `SPI_processed` 与 C 端预期值（C 已加载 delta 列表，可直接计数）比对做**兜底断言**；
+  失配（仅在异常并发下理论可达）报内部错误。
+- **原子性**：整个 apply 在同一事务内，任一冲突 `ereport(ERROR)` 即回滚全部已做的批 DML——
+  与现行「任一冲突中止整个 apply」等价（净效果相同，不需要子事务）。
+- **锁**：批 DML 语句自身的行锁替代逐行 `FOR UPDATE`；因为它把
+  「token 相等」写进同一语句的 `WHERE`，**加锁与校验在同一语句内原子完成**，等价于现行
+  `SELECT ... FOR UPDATE` → 比对 → DML（见 6.4.9）。
+
+#### 6.4.5 三条批 DML 的形态
+
+记号：`@delta` = `@extschema@.pg_branch_delta`；`j` = `jsonb_populate_record(NULL::<rel>, convert_from(d.tuple_data,'UTF8')::jsonb)`；
+`TOKEN(m)` = `replace(translate(m.ctid::text,'()',''),',',':') || '-x' || m.xmin::text`
+（逐字匹配 `ob_fetch_main_version` 的 `"%u:%u-x%s"` 产出，可 `strcmp` 级别对齐）；
+`PKJOIN(d,m)` = 逐 PK 列 `m."c" = ((d.key::jsonb)->>(i-1))::<pktype_i>` 用 `AND` 串起
+（n=1 时即 `(d.key::jsonb->>0)::<pktype>`）。
+
+- **D**（`old_version IS NOT NULL`；NULL 者 = 纯 delta NOP，跳过）：
+  ```sql
+  DELETE FROM <rel> m USING @delta d
+   WHERE d.branch_id=$1 AND d.relid=$2 AND d.op='D' AND d.old_version IS NOT NULL
+     AND PKJOIN(d,m) AND d.old_version = TOKEN(m);
+  ```
+- **U**（`old_version IS NOT NULL`）：
+  ```sql
+  UPDATE <rel> m
+     SET (<cols>) = (SELECT <cols_parens> FROM jsonb_populate_record(NULL::<rel>, s.tj) AS j)
+    FROM (SELECT convert_from(d.tuple_data,'UTF8')::jsonb AS tj, d.key, d.old_version
+            FROM @delta d
+           WHERE d.branch_id=$1 AND d.relid=$2 AND d.op='U' AND d.old_version IS NOT NULL) s
+   WHERE PKJOIN(s,m) AND s.old_version = TOKEN(m);
+  ```
+- **I**（`op='I'` ∪ **orphan-U**`= op='U' AND old_version IS NULL`；均要求 MAIN 无锚点）：
+  ```sql
+  INSERT INTO <rel> (<cols>)
+  SELECT <cols_parens> FROM @delta d
+    CROSS JOIN LATERAL jsonb_populate_record(NULL::<rel>, convert_from(d.tuple_data,'UTF8')::jsonb) AS j
+   WHERE d.branch_id=$1 AND d.relid=$2
+     AND ( d.op='I' OR (d.op='U' AND d.old_version IS NULL) )
+     AND NOT EXISTS (SELECT 1 FROM <rel> m WHERE PKJOIN(d,m));
+  ```
+  orphan-U 的 INSERT 归属 **U 步**（等价于现行 `apply_relation_update_pass` 内联调用
+  `apply_relation_insert_pass`），以保持 D→U→I 的错误优先级顺序。
+
+> 直读 `d.tuple_data` 后 `convert_from(...,'UTF8')` 即可，**不再**走现行逐行
+> `substring(%s from 3)` hex 往返（省一次 `decode`）。
+
+#### 6.4.6 冲突检测与错误消息保持
+
+验证 SELECT 只取**首个冲突行**（`ORDER BY key`，与现行 delta 遍历顺序一致），
+把 `(key, old_version, main_missing, main_ver)` 回传 C，由 C **沿用现有措辞**调用
+`overlay_guard_ereport_fail()`（保持 `mvcc_review` / `rentry` 基线逐字不变）：
+
+| op | 触发条件 | 消息分支（现状一致） |
+|---|---|---|
+| D | `m.ctid IS NULL` | `DELETE delta pk=%s: MAIN row no longer present ...`（含 "Resolve manually"） |
+| D | token 不等 | `conflict pk=%s: old_version expected=%s but MAIN latest=%s`（含 "but"） |
+| U | `old_version IS NULL AND m.ctid IS NOT NULL` | `conflict pk=%s: old_version expected=(null) MAIN latest=(null)` |
+| U | `old_version IS NOT NULL AND m.ctid IS NULL` | `UPDATE pk=%s MAIN row missing at apply time ...` |
+| U | token 不等 | `conflict pk=%s: old_version expected=%s MAIN latest=%s`（**无** "but"） |
+| I | MAIN 已有同 PK | `INSERT pk=%s MAIN row already present ...` |
+
+保留 D→U→I 的**错误优先级**：先 D 后 U 再 I 各跑一遍验证，故「同时存在 D 冲突与 I 冲突」
+时仍先报 D（与现状一致）。
+
+#### 6.4.7 纯 delta / keyless 分区
+
+- **纯 delta**：`old_version IS NULL` 的 D = NOP（验证与 DML 都天然排除）；`old_version IS NULL`
+  的 U = 有 MAIN 锚点则冲突、无锚点则并入 I 批。
+- **keyless**（`A:<blk>:<off>` / `S:<seq>`）：`A:` 的 `PKJOIN` 换成
+  `m.ctid = ('(' || replace(substring(d.key from 3),':',',') || ')')::tid`；`S:` 无 MAIN 锚点。
+  **3B 范围决策：keyless relation 一律回退 3A 逐行路径**（降风险；如评审要求再纳入批处理）。
+
+#### 6.4.8 `_base` 比对（R15/R18）
+
+`_base` 规范化比对依赖 `to_jsonb(main_row) - 系统列` + `jsonb_object_agg`，集合式下 SQL 复杂且
+**当前写重定向路径从不写 `_base`**（3A 已确认为死路径）。
+**3B 范围决策：任一 delta 行含 `_base` 的 `(relid, op)` 一律回退 3A 逐行路径**——
+用已有的 C 层字节扫描 `ob_delta_has_base_key()` 对已加载的 delta 列表在内存判定，**零新增 SPI**。
+
+#### 6.4.9 锁与不变量（AP-2）
+
+- advisory 锁顺序不变：`Advisory → (catalog + user RowExclusiveLock)（§6.2.6）`。
+- 逐行 `FOR UPDATE` → 批 DML 自带行锁 + 同语句 token 谓词；**加锁即校验**，
+  与现行「先锁后改」在语义上等价（并发写要么在 DML 前已提交 → token 失配被检出，
+  要么被 DML 行锁阻塞）。
+- 不变量 §6.2.1–6.2.6 **全部保持**；3 趟顺序因「同一 key 在 delta 中结构性唯一 ⇒ 各 op 的 key 集合互斥」
+  而与集合式天然兼容，保留顺序仅为错误优先级与可观测一致性。
+
+#### 6.4.10 GUC 与回退
+
+- GUC `overlay_branch.apply_batch`（`bool`，`PGC_SUSET`，**默认 `on`**）控制启用；
+  便于逐会话关闭以灰度/回退与 A/B 对照。
+- 逐 `(relid, op)` 自动回退 3A 逐行路径的判据：GUC off / keyless rel（`n_pk=0`）/ 含 `_base`
+  （见 6.4.14 #4）。
+- 回退路径 = 现行 3A 代码，**不改动**，保证随时可用。
+
+#### 6.4.11 等价性论证（评审要点）
+
+1. **key 结构性唯一**（§1.2）：同一 `(branch, relid, key)` 只会有一个 op ⇒ 三趟作用于互斥 key 集。
+2. **纯 delta 特例**：见 6.4.7，验证与 DML 谓词一致地排除/并入。
+3. **冲突即回滚**：单事务内批 DML 先行提交的部分由 ERROR 回滚，净效果与逐行一致。
+4. **消息与优先级**：见 6.4.6 表，逐字对齐现有基线。
+5. **锁**：见 6.4.9。
+
+#### 6.4.12 测试计划
+
+- **差分等价（最强证据）**：同一 branch 在 MAIN 的两个克隆上各 apply 一次，
+  一次 `apply_batch=off`、一次 `on`，比对结果表逐字节一致（含冲突场景的错误码/文案一致）。
+- **L3**：`overlay_branch_mvcc_review.sql` 新增 `SECTION AP2 (milestone 3B)`：
+  D+U+I 正路径；6 类冲突负向（见 6.4.6 表）；orphan-U→INSERT；keyless 回退；`off`/`on` 双跑一致。
+- **L1**：现有 12 specs 在默认 `on` 下全绿（即 3A 逐行语义被集合式路径保持），
+  无需新增 spec；`ob_apply_mutex` / `ob_applying_freeze` / `pure_delta_*` /
+  `keyless_apply_conflict` 均照常通过。
+- **门禁**：沿用 AGENTS.md §3 Green-Bar（两次 clean rebuild + L3 17/17 + L1 12/12 + 双 `diff -r` 0）。
+
+#### 6.4.13 度量
+
+复用 M8（`perf_baseline.sql`），对比 3A 修正版（`off`）/ 3B-2 集合式（`on`）；记录 transcript。
+诊断同 §7：`pg_stat_statements.track_planning=on`，同会话交替 A/B。
+
+**结果（N=200000 / M=20000，同机 A/B）**：`on` **192.4 / 165.9 ms**，`off` **1260.8 ms**，
+⇒ **~7×** 提速。数字见 §6.3.1 表。
+
+#### 6.4.14 决策记录（评审 2026-10-28）
+
+1. **方案取舍**：**直接实施 3B-2 集合式**（不做 3B-1 前置）。
+2. **GUC 默认值**：`on`（开箱即用）。
+3. **keyless**：3B **回退** 3A 逐行。
+4. **`_base`**：3B **回退** 3A 逐行。
+5. **多列 PK**：3B 验收**仅单列 PK**；多列仅在 6.4.5 生成器层面支持。
+6. **分块（AP-2）**：本轮不做；仅在 6.4.13 取「批 DML 持锁窗口 vs M」观测数据。
+
+### 6.5 验证
+
+- **不变量回归**：L3 `upsert` / `mvcc_review` / `puredelta` / `puredelta_mix` / `user`；
+  L1 `ob_apply_mutex` / `ob_applying_freeze` / `pure_delta_upsert|update|delete` /
+  `keyless_apply_conflict`。
+- **3A 断言**：`test/regress/sql/overlay_branch_mvcc_review.sql` 的 `SECTION AP1`
+  覆盖 D+U+I 单次回放正路径与三条 `0A000` 冲突分支（DELETE/UPDATE 锚点消失、
+  INSERT 主键已存在），以及冲突后的恢复 apply。
+- **3B 断言**：见 §6.4.12（`SECTION AP2` + 差分等价 + L1 on/off 双跑）。
+- **性能**：复用 M8，`perf_baseline.sql` 前后对照（见 §6.3.1 表）。
+
+### 6.6 本里程碑范围
+
+3A、3B 均已落地（语义不变）；**3B 集合式批处理**见 §6.4（含决策记录 §6.4.14）。
+
+---
+
+## 7. 度量陷阱
 
 - **必须用 `LC_ALL=C.utf8`** 起临时实例（见 AGENTS.md §3），否则 `make check` 基线会因
   多字节列宽产生假 diff。
@@ -441,3 +785,183 @@ Section G（PK / 列值含 `"` 与 `\` 时的 JSON 转义 + 叠加正确性）�
 - **autovacuum 噪声**：delta 表在 apply/discard 后只做 `DELETE`，空间靠 autovacuum 回收；
   连续多轮基线之间应留出 vacuum 窗口或显式 `VACUUM`，否则 `pg_total_relation_size` 不可比。
 - **不要用 pgbench 的 tps 直接比较**：现有 L2 fixture 面向正确性竞态，语句构成不同，不可与本文基线混用。
+- **逐行 SPI 路径看计划时间，不看 SPI 次数**：`SPI_execute` 每次都要全量 parse+plan；
+  字面量内联使计划无法复用，因此「合并 SQL」可能反而更慢（§6.3.1）。诊断时开
+  `pg_stat_statements.track_planning=on`，并**在同一会话内**交替测 A/B —— 跨会话、
+  跨 `shared_preload_libraries` 配置的历史数字不可直接对照（同一份 HEAD 曾出现
+  1301 ms 与 2185 ms 两个值）。
+
+---
+
+## 8. 阶段 5 设计：写路径 WR-1
+
+> Conv-2 设计先行稿 → **已评审（2026-10-28）**。目标：降低一条 DML 语句在分支内**每行**的
+> SPI 次数与 planning 成本。语义（delta 内容、冲突语义、状态 guard）必须不变。
+
+### 8.1 目标与非目标
+
+- **目标**：把写路径从「每行 2~4 次 `SPI_execute`（每次 parse+plan）」降到
+  「每行（或每语句）复用计划」；在不改变 delta 行内容的前提下降低 CPU 与延迟。
+- **非目标**：不改 `pg_branch_delta` schema；不引入批量/异步提交；不改 keyless 与
+  `_base` 语义；不动 apply 与读路径。
+
+### 8.2 现状：每 DML 行的 SPI 预算
+
+`overlay_executor_run_intercept()`（[write_redirect.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/write_redirect.c#L392)）
+对单目标 DML 逐行拦截，每行按需发起以下 `SPI_connect/execute/finish`：
+
+| op | SPI 调用（每行） | 次数 |
+|---|---|---|
+| INSERT | `overlay_delta_insert` = state 查询 + UPSERT（[delta_store.c:98-103](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L98-L103) / [L250](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L250)） | **2** |
+| UPDATE | `fetch_tuple_by_ctid`（[L655](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L655)）+ `overlay_tuple_version`（[L1530](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1530)）+ delta_insert 2 次 | **4** |
+| DELETE | 同 UPDATE | **4** |
+| INSERT…ON CONFLICT→UPDATE（推广） | 上述 + delta 探测 + MAIN 探测 | **6~7** |
+
+共同点：**每条 SQL 都在行循环内用字面量内联重建**，`SPI_execute` 每次全量
+parse+plan。已缓存者仅 per-relation 的 PK 元数据（`ob_pk_rel_meta`）与比较算子。
+
+### 8.3 动因
+
+§6.3.1 已证：**planning 成本 ≫ SPI 调用次数**（apply 3A 初版把复杂 SQL 内联后，
+SPI 次数下降但墙钟翻倍）。写路径是同一模式：4 次调用 × 每行全量 parse+plan。
+故首要杠杆是**消除每行 planning**，其次才是减少调用次数。
+
+### 8.4 候选方案
+
+- **WR-1a 参数化 prepared plan（推荐主线）**：把 4 条每行 SQL 由字面量内联改为
+  `$1..$n` 参数，`SPI_prepare` + `SPI_keepplan` 缓存、`SPI_execute_plan` 复用；
+  计划随 relcache/plan invalidation 失效重建。**只改计划复用，不改 SQL 语义**。
+- **WR-1b 减少调用次数（可与 1a 叠加）**：
+  - 合并 `fetch_tuple_by_ctid` + `overlay_tuple_version` 为一次
+    `SELECT *, xmin::text FROM t WHERE ctid = $1::tid`（UPDATE/DELETE 4→3）。
+  - 缓存 branch state：`overlay_delta_insert` 的状态查询按「会话内已确认 ACTIVE、
+    且分支失效计数未变」短路（与 FR1/FR4 的失效节流同源），需保证 apply/discard
+    并发时仍能及时察觉（正确性硬约束，见 8.5）。
+- **WR-1c 集合式批写**：像 3B 那样把整语句的行先物化、再以集合式 DML 回放。
+  拦截点内嵌在 executor 行循环里，改动面大、风险高，**MVP 暂不做**，仅存档。
+
+### 8.5 必须保持的不变量
+
+1. **delta 行内容逐字节不变**：`(branch_id, relid, key, op, old_version, tuple_data)`
+   与现行路径一致（含 `tuple_data` 的 `'\x..'::bytea` 十六进制编码）。
+2. **state guard 语义不变**：非 ACTIVE（applying/applied/discarded）时写入必须报
+   与现行完全相同的错误（`overlay_delta_insert` 的 55000 / 0A000 文案）。
+   任何 state 缓存都不得放宽「apply 进行中不得写 delta」。
+3. **keyless / `_base` / 纯 delta 语义不变**；R03 PK-mutation guard、R20 SET NULL
+   处理、R21 INSERT 前置检查等负向行为逐字不变。
+4. **SPI 结果遍历**：沿用 `SPI_processed` 判定，不引入「只取第一行」的假设。
+5. **内存所有权**：跨 `SPI_finish()` 存活的字符串必须在 **finish 之前**拷出 SPI 上下文
+   （MF-1 教训），缓存本身也要有明确生命周期与失效回调。两条反向纪律同样不可破：
+   - **finish 之后不得再读** SPI 返回的任何指针（tuptable / `SPI_getvalue` / `SPI_getbinval`
+     派生值），否则 use-after-free（cassert 下 `0x7F`）；
+   - 只服务 `ereport` 消息的临时副本落**调用方上下文**，不得落 `TopMemoryContext`
+     —— 错误路径永不返回，TopMC 分配等于每次失败泄漏；
+   - `SPI_getvalue()` 的结果归属于**调用时的当前上下文**，因此禁止在
+     `MemoryContextSwitchTo(TopMemoryContext)` 内调用。
+
+### 8.6 前置基线（M10）
+
+写路径当前**无度量**（harness 构 delta 时 `\timing off`）。先加 **M10**：
+`perf_baseline.sql` 的 build-delta 步骤拆为三段分别计时（`UPDATE m/2` / `DELETE m/4` /
+`INSERT m/4`），产出可复现的「每行 µs」基线，作为 WR-1a/b 的优化前对照。
+
+M10 首跑即暴露一个**接受范围外的异常**：INSERT 每行 ~1686 µs，比 UPDATE/DELETE 慢
+**约 20×**（见 8.6.1）。该异常不是 planning 也不是内存问题，而是 `pg_branch_delta`
+上一次退化扫描；它必须在 WR-1a 之前先修掉，否则 M10c 的「优化前」基线被污染、
+WR-1a 的收益无法归因。
+
+### 8.6.1 前置修复：删除冗余索引 `pg_branch_delta_relid_idx`
+
+**现象（M10c）**：plain INSERT 的每行耗时随 delta 行数**线性增长**——正是 §8.4 要消除
+的模式，但成因不在 planning。
+
+**证据**：
+
+- 三段计时显示 INSERT 单行成本是 UPDATE/DELETE 的 ~20×。
+- freshness 探针（fresh 分支、`max_parallel_workers_per_gather=0`）：
+  C1 INSERT 5000 行 = 1344 ms → C3（叠加两次 BranchScan 后）= 3762 ms →
+  C4 = 6133 ms；**`pg_backend_memory_contexts` 的 TopMemoryContext 恒为 2112 kB**。
+  ⇒ 排除「每行 parse+plan 复杂 SQL」与「内存上下文膨胀」两个假说；真因是扫描退化。
+- 对写路径 delta 存在性探测 SQL 直接 EXPLAIN（真实 `pg_branch_delta`，delta=15000）：
+
+  | 统计状态 | 计划 | key 谓词 | 耗时 |
+  |---|---|---|---|
+  | `reltuples = -1`（统计缺失） | `Index Scan using pg_branch_delta_relid_idx` | **Filter**，`Rows Removed by Filter: 5000` | 0.722 ms |
+  | `ANALYZE` 后 | `Index Scan using pg_branch_delta_pkey` | Index Cond | 0.024 ms |
+
+**根因**：`pg_branch_delta_relid_idx (branch_id, relid)` 是 PK
+`(branch_id, relid, key)` 的**严格前缀**，本身完全冗余；`pg_branch_delta` 是内部表，
+autovacuum 几乎不 ANALYZE 它，`reltuples = -1` 长期存在。统计缺失时 planner 会优先
+选更窄的冗余索引，把 `key = $n` 降级为 **Filter**。于是 plain INSERT 每行的 delta
+存在性探测退化成 **O(delta)**，构成 M10c 的 20× 慢。
+
+**修复**：删除该冗余索引（[overlay_branch--1.0.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/overlay_branch--1.0.sql#L41-L64)）。
+`delta_store.c` 的 4 处 delta 访问（点查 `overlay_delta_lookup`、前缀读 `list_for_rel`、
+`overlay_delta_count`、`overlay_delta_delete_all`）全部只用到 `(branch_id, relid)`
+前缀，PK 索引恒可覆盖，与统计无关。已在 pkey-only 的临时表上复现验证：`reltuples = -1`
+时前缀读与点查**均走 pkey**。副作用是顺带降低每行 delta 的写放大（少维护一棵索引）。
+
+**修复后（M10 重跑，N=200000 / M=20000，全新库、无冗余索引）**：
+M10c INSERT 5000 行 **8429.8 ms → 422.6 ms**（每行 1686 µs → 84.5 µs，**约 20×**），
+与 M10a UPDATE（825.3 ms / 10000 行 = 82.5 µs/行）、M10b DELETE（399.5 ms / 5000 行 =
+80.0 µs/行）回到同一量级——写入不再随 delta 规模线性恶化。
+
+> 注：上述写路径 TopMemoryContext 泄漏（UPDATE/DELETE 每行 ~0.8–1.6 KB）是**真实但独立**于
+> INSERT 退化扫描的问题（MF-1 家族），已随 WR-1 前置一并修复——`fetch_tuple_by_ctid()` 参数化
+> `result_cxt`、SET-merge / pure-delta post-image 改 `es_query_cxt`、pure-delta 步补 `dtu` 释放
+> （见 §2.1）。写路径探针 `MF1_WRITE_MEM_STABLE_PASS` 全 `grew=0`。
+
+### 8.7 测试计划
+
+- **L3**：新增写路径用例（`overlay_branch_scan_pk.sql` 或新文件，视体量）——
+  覆盖 INSERT/UPDATE/DELETE 多行 set-based DML 的正确 delta 内容、PK 不可变、
+  SET NULL、含 `"`/`\` 的值（十六进制编码回归）；prepared-plan 复用下**跨语句**
+  结果一致（含计划失效后重建：ALTER TABLE / `DISCARD PLANS` 后重跑）。
+- **L1**：`ob_apply_mutex` / `ob_applying_freeze` 必须继续通过，验证 state guard
+  在缓存路径下未被放宽。
+- **错误路径 / 二次审计探针**（[overlay_branch_memgrow.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/regress/sql/overlay_branch_memgrow.sql)
+  Section 2–4）：纯 delta 多行 UPDATE（`MF1_PD_MULTIROW_MEM_STABLE_PASS`）、
+  反复失败 `create_branch()` 的错误路径（`MF1_ERRPATH_MEM_STABLE_PASS`）、
+  `apply_batch=off` per-row apply 回放（`MF1_APPLYPR_MEM_STABLE_PASS` +
+  `MF1_APPLYPR_RESULT_CORRECT_PASS`），三者 `grew=0`。
+- **门禁**：AGENTS.md §3 Green-Bar（两次 clean rebuild + L3 18/18 + L1 12/12 + 双 `diff -r` 0）。
+
+### 8.8 度量
+
+复用 M10 + M8（apply），对比 WR-1a / WR-1a+1b；`pg_stat_statements.track_planning=on`
+看 planning 时间占比；同会话交替 A/B。
+
+### 8.9 决策记录（评审 2026-10-28）
+
+1. 主线：**WR-1a（参数化 prepared plan）**——本轮只做计划复用，不做 1b 减调用。
+2. branch state 缓存：**不纳入本轮**（正确性敏感，state guard 保持每行校验）。
+3. WR-1c（集合式批写）：确认 MVP 不做。
+4. 验收范围：仅单列 PK 表（同 3B）。
+5. 基线：**先落 M10**（build-delta 三段计时）再动手优化（§0 原则 2）。
+
+### 8.10 实现与验收（2026-10-28）✅ 已落地
+
+**新机制**：新增 [src/plan_cache.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/plan_cache.c)
+——`TopMemoryContext` 子 context + `HASH_STRINGS` 缓存（键 = SQL 文本，含内联关系名）；
+`ob_spi_exec_params()` 契约与 `ob_spi_one_shot()` 相同（`SPI_connect()` + 执行，**留 SPI
+连接给调用方 `SPI_finish()`**）。`SPI_prepare_cursor(CURSOR_OPT_GENERIC_PLAN)` +
+`SPI_keepplan()` 只 prepare 一次，`SPI_execute_plan()` 复用。失效**不自建回调**：完全交给
+常规 plancache 机制（`ResetPlanCache()` 遍历 `saved_plan_list`，由 relcache/syscache 回调
+与 `DISCARD PLANS` 驱动），branch 切换的 `CacheInvalidateRelcacheAll()` 同样命中。
+
+**改造面**：`delta_store.c` 4 处（`overlay_delta_insert` / `overlay_delta_lookup` /
+`fetch_tuple_by_ctid` / `overlay_tuple_version`）+ `write_redirect.c` 4 处（R21 delta 探测 /
+R21 MAIN 冲突 / UPSERT Phase I 纯 delta / Phase II MAIN ctid）。行数据一律 `$n` 绑定；
+`tuple_data` 由 `'\x..'` 文本字面量改为 `BYTEAOID` datum。每条 SQL 之后显式 `pfree` 参 datum，
+保持写路径在语句生命周期 context 内 allocation-neutral（§8.5 第 5 条，MF-1 写探针不回归）。
+
+**连带修复（沿用 use-after-free 根因）**：`r21_check_insert_preconditions()` 曾在 SPI 上下文内
+`pstrdup(pkval_txt)`，`SPI_finish()` 后 `ereport` 再读——cassert 构建 (`CLOBBER_FREED_MEMORY`)
+下打印 `0x7F` 垃圾，`overlay_branch_upsert` 的 DETAIL 行为此被 bless 成脏数据。删除该
+`pstrdup` / `pfree`，`ereport` 直接引用调用方上下文的 `pkval_txt`（delta / MAIN 两处）。
+
+**验收**：Green-Bar 全绿——两次独立 clean rebuild 均 0 warning/error；重建 #2 后 L3 **18/18**、
+L1 **12/12**；`diff -r test_output/results test/regress/expected` 与
+`diff -r output_iso/results test/isolation/expected` 均 0 行。新增 L3
+`overlay_branch_plancache.sql`：跨语句计划复用结果一致 / 含 `"` `\` `'` 换行与非 UTF8 bytea
+的 delta durability / `DISCARD PLANS` 与 `ALTER TABLE` 后重跑正确。

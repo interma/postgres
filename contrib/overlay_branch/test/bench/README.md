@@ -14,10 +14,24 @@
 | `apply_contention_fixture.sql` | **一次性初始化脚本**：CREATE EXTENSION / pgbench_accounts 10000 行 baseline rows / 8 branches `bs_pgbench_{1..8}` | 首次压测前，**只跑 1 次**（idempotent） |
 | `apply_contention.sql` | **pgbench custom script**：每连接按 `CLIENT_ID mod 10` 分配 4 种角色（60% WR writer / 20% branch switcher / 10% applyer / 10% discarder），随机 DML / apply / discard / live↔snapshot rotate | 每次压测持续执行，由 `pgbench -T 60` 控时间 |
 | `run_perf_baseline.sh` | **性能基线驱动脚本**：`run_perf_baseline.sh [N] [M]`（默认 200000/20000）→ `LC_ALL=C.utf8 psql -f perf_baseline.sql`，并把全量 transcript `tee` 到 `perf_baseline_<N>_<M>.log` | 想取某组 (N,M) 规模的可比对 wall-clock 数字时手动跑（非门禁） |
-| `perf_baseline.sql` | **可复现性能基线**：自建/自清 `public.ob_perf_base`（可控 set-based delta），按 performance.md 成本中心依次量 M1 MAIN seqscan / M2 M=0 叠加 / M3 全量叠加 / M4 PK 等值(P0) / M5 非 PK(P2) / M6 EXPLAIN / M7 delta 体积放大 / M8 apply 计时 / M9 apply 后 MAIN；每步夹 `pg_backend_memory_contexts` 泄漏观测 | 性能优化前后取对照、或验证 MF-1/MF-4/MF-5 修复效果时手动跑 |
+| `perf_baseline.sql` | **可复现性能基线**：自建/自清 `public.ob_perf_base`（可控 set-based delta），按 performance.md 成本中心依次量 M1 MAIN seqscan / M2 M=0 叠加 / M3 全量叠加 / M4 PK 等值(P0) / M5 非 PK(P2) / M6 EXPLAIN / M7 delta 体积放大 / **M10a/b/c 写路径计时（UPDATE/DELETE/INSERT 各一段，§8.6 WR-1 基线）** / M8 apply 计时 / M9 apply 后 MAIN；每步夹 `pg_backend_memory_contexts` 泄漏观测 | 性能优化前后取对照、或验证 MF-1/MF-4/MF-5 修复效果时手动跑 |
 | `perf_baseline_<N>_<M>.log` | **运行产物**（非手工编辑）：上一条脚本 `tee` 出的完整 psql transcript，留档做前后对照 | 由 `run_perf_baseline.sh` 自动生成；入库存档用于对照（不入库可忽略） |
+| `srf_peak_rss.sh` | **内存峰值探针**：`srf_peak_rss.sh [rows] [max_growth_kb]`（默认 300000/16384）。跑两次 `overlay_main_plus_delta()` 全表扫描，只依据**第二次**扫描的 VmHWM 增量判 PASS/FAIL | 验证 MF-1 leak 9（SRF per-row scratch 落在 multi-call ctx）不回归时手动跑（非门禁） |
 
-> 目录内分两类：`apply_contention*` = **并发正确性** L2 压测（本文其余章节）；`perf_baseline*` = **性能基线** L2 fixture（对照 [performance.md](../../doc/performance.md) 成本中心，只出数字不做 PASS/FAIL）。
+> 目录内分三类：`apply_contention*` = **并发正确性** L2 压测（本文其余章节）；`perf_baseline*` = **性能基线** L2 fixture（对照 [performance.md](../../doc/performance.md) 成本中心，只出数字不做 PASS/FAIL）；`srf_peak_rss.sh` = **内存峰值探针**（唯一带 PASS/FAIL 判定的 L2 脚本）。
+
+### srf_peak_rss.sh（MF-1 leak 9）
+
+`overlay_main_plus_delta()` 是 FROM 子句 SRF；leak 9 曾把每行 scratch（`values[]`/`isnulls[]`）分配在 SRF 的 multi-call ctx（SRF 结束才删除），使整表扫描随行数线性增长。该增长是**语句内瞬态峰值**，语句结束后即释放，所以 `test/regress` 里的 `TopMemoryContext` 前后断言看不到它——只能看进程峰值 RSS。
+
+**为何跑两次**：即便修复后，**首次**全表扫描仍会把 VmHWM 抬高 O(rows)（executor per-tuple ctx、SRF tuplestore、堆页在 allocator 里 churn，glibc 把已释放页留在进程堆不回吐给 OS——RSS 在语句结束后仍偏高）。这是**一次性 warm-up，有界，不是泄漏**。泄漏的签名不同：**每次**扫描都增长同一份内存。因此本探针以**第二次**扫描的 VmHWM 增量判定，阈值默认 16 MB（实测 second-scan growth ≈ 0.4 MB；带 leak 时每次约 80 MB）。
+
+```bash
+PGDATABASE=ob_bench ./test/bench/srf_peak_rss.sh 300000 16384
+#   SRF_PEAK_RSS_PASS  (second-scan growth ≈ 0.4 MB)
+```
+
+> 目标库需能 `create_branch`（G01 支持矩阵：库内不得有视图等非 `r`/`S`/`i` relkind）。默认 `ubuntu` 库含 `pg_buffercache` 视图会报错，故示例用干净库 `ob_bench`。
 
 ---
 
@@ -139,8 +153,8 @@ SELECT count(*) AS sessions_in_branch FROM pg_stat_activity
 [L1 pg_isolation 12 specs] —— "所有并发关键拓扑精确调度"
          │  (FR2/FR3/FR4/FR5/FR6 逐条语义 verify)
          ▼
-[L3 pg_regress 17 suites] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
-         │  (本扩展 make check 默认门禁 = L1 + L3 合计 29/29 zero-diff 2×)
+[L3 pg_regress 18 suites] —— "L1 外的功能 + FR4 LISTEN 单连接路径"
+         │  (本扩展 make check 默认门禁 = L1 + L3 合计 30/30 zero-diff 2×)
          ▼
 [L2 pgbench (本目录, 手动)] —— "高并发真实负载下的正确性兜底 sanity check"
          │  (NOT 门禁。用于性能探索 / 触发 L1/L3 没测到的边缘 race)

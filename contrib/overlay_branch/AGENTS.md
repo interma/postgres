@@ -66,9 +66,9 @@ make -j4 install prefix=/home/ubuntu/pg17
 Three layers — do **not** force cross-session races into L3.
 
 ```bash
-# L3 — single-session deterministic sanity (pg_regress, 17 files)
+# L3 — single-session deterministic sanity (pg_regress, 18 files)
 make check prefix=/home/ubuntu/pg17
-#   accept: ok 1..17  +  "# All 17 tests passed."
+#   accept: ok 1..18  +  "# All 18 tests passed."
 
 # L1 — exact scheduled cross-session waits (pg_isolation_regress, 12 specs)
 make -C ../../src/test/isolation pg_isolation_regress \
@@ -98,7 +98,7 @@ column-width diffs in `mvcc_review` / `rentry`. Use `LC_ALL=C.utf8`.
    files behind.
 
 **Green-Bar = definition of "delivered"** — ALL of: 0-warning build,
-**two independent clean rebuilds**, and after rebuild #2 L3 17/17 + L1 12/12
+**two independent clean rebuilds**, and after rebuild #2 L3 18/18 + L1 12/12
 with both `diff -r` = 0 lines.
 
 ---

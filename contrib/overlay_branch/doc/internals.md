@@ -269,7 +269,9 @@ UPDATE/DELETE 子计划的 slot 包含 junk attrs（ctid、tableoid 等），列
 
 ### 4.8 memory context 纪律
 
-所有跨 SPI 边界返回的字符串/bytea/TypedKey 都 `datumCopy`/`pstrdup` 到 `TopMemoryContext`，因为 `SPI_finish` 会销毁 SPI proc 上下文。BranchScan 的迭代器状态与所有对外 slot 归属 `scan_cxt`（SRF 侧为 `multi_call_memory_ctx`），由 `End` / `ReScan` 释放。
+所有跨 SPI 边界返回的字符串/bytea/TypedKey 都 `datumCopy`/`pstrdup` 到 `TopMemoryContext`，因为 `SPI_finish` 会销毁 SPI proc 上下文。BranchScan 的**迭代器状态**（含 P0 预物化行）归属 `scan_cxt`（SRF 侧为 `multi_call_memory_ctx`），由 `End` / `ReScan` 释放；**每行产出的 slot 及其 `datumCopy` 归属其 child `row_cxt`**，在每次 `overlay_scan_next()` 入口 `MemoryContextReset`——否则 slot 会落进扫描期不 reset 的 `scan_cxt`，使长扫描随行数线性增长（MF-1，见 [performance.md §2.1](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/performance.md)）。
+
+反向纪律（违反即 UAF 或每次失败泄漏）：`SPI_finish()` **之后**不得再读 SPI 返回的指针（tuptable / `SPI_getvalue` / `SPI_getbinval` 派生值），必须先在 finish 前拷出；只服务 `ereport` 消息的临时副本落**调用方上下文**而非 `TopMemoryContext`（错误路径永不返回，TopMC 分配等于每次失败泄漏）；`SPI_getvalue()` 在**当前**上下文分配结果，禁止在 `MemoryContextSwitchTo(TopMemoryContext)` 内调用。
 
 ### 4.9 快照纪律
 
@@ -320,6 +322,6 @@ create_branch 时 throttled 检测是否有 FOR ALL TABLES / 含 overlay_branch 
 3. **planner hook 预检查顺序不可颠倒** — B0 → B1 → R16 → B2 → is_active
 4. **GUC check hook 无副作用** — assign hook 才做真实操作
 5. **递归 guard 必须 PG_TRY 保护** — 异常路径也要清
-6. **跨 SPI 内存必须进 TopMemoryContext** — 防止 SPI_finish 后悬垂
+6. **跨 SPI 内存必须进 TopMemoryContext** — 防止 SPI_finish 后悬垂；且必须在 finish **之前**拷出，错误路径消息副本改用调用方上下文（见 §4.8）
 7. **use 不加锁，apply/discard 用 CAS** — 死锁自由
 8. **观察者不做破坏性清理** — kickout 只在 DML 路径执行

@@ -21,6 +21,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "parser/parsetree.h"
 #include "executor/spi.h"
@@ -234,7 +235,6 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 		Oid			pk_out_func;
 		bool		pk_is_varlena;
 		char	   *pkval_txt;
-		char	   *pkval_esc;
 		const char *pk_colname;
 
 		pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
@@ -260,24 +260,25 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 
 		getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
 		pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
-		pkval_esc = quote_literal_cstr(pkval_txt);
 
 		{
-			StringInfoData spiq_delta;
-			char	   *pk_esc;
+			Datum		vals_delta[3];
+			static const Oid argtypes_delta[3] = {INT4OID, OIDOID, TEXTOID};
 			int			ret_delta;
 			char		delta_latest_op = 0; /* 0 = no entry; 'I'/'U'/'D' otherwise */
 
-			pk_esc = quote_literal_cstr(pk ? pk : "");
-			initStringInfo(&spiq_delta);
-			appendStringInfo(&spiq_delta,
-							 "SELECT d.op FROM %s d WHERE d.branch_id = %u AND d.relid = %u AND d.key = %s LIMIT 1",
-							 OBTABLE_DELTA, (unsigned) bid, (unsigned) relid, pk_esc);
-			pfree(pk_esc);
+			/* WR-1a: branch_id/relid/key bound as $1..$3. */
+			vals_delta[0] = Int32GetDatum(bid);
+			vals_delta[1] = ObjectIdGetDatum(relid);
+			vals_delta[2] = CStringGetTextDatum(pk ? pk : "");
 
 			overlay_overlay_helper_enter();
 			overlay_write_redirect_exit();
-			ret_delta = ob_spi_one_shot(spiq_delta.data, true, 1);
+			ret_delta = ob_spi_exec_params(
+				"SELECT d.op FROM " OBTABLE_DELTA " d "
+				"WHERE d.branch_id = $1 AND d.relid = $2 AND d.key = $3 LIMIT 1",
+				true, 1, 3, argtypes_delta, vals_delta, NULL);
+			pfree(DatumGetPointer(vals_delta[2]));
 
 			if (ret_delta == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1)
 			{
@@ -290,11 +291,12 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 
 			if (delta_latest_op == 'I' || delta_latest_op == 'U')
 			{
-				char *saved_pkval = pstrdup(pkval_txt);
+				/* pkval_txt lives in the caller's memory context, not in the
+				 * SPI procedure context, so it survives SPI_finish() below.
+				 * (Copying it with pstrdup() here would place the copy in the
+				 * SPI context, which SPI_finish() then frees -- the ereport
+				 * would read freed memory.) */
 				SPI_finish();
-				pfree(spiq_delta.data);
-				pfree(pkval_esc);
-				pfree(pkval_txt);
 				overlay_write_redirect_enter();
 				overlay_overlay_helper_exit();
 				ereport(ERROR,
@@ -302,12 +304,11 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 						 errmsg("duplicate key value violates unique constraint on relation \"%s\"",
 								RelationGetRelationName(rel)),
 						 errdetail("Key (%s)=(%s) already exists in branch delta (R21 pre-check).",
-								   pk_colname, saved_pkval)));
+								   pk_colname, pkval_txt)));
 			}
 
 			overlay_write_redirect_enter();
 			overlay_overlay_helper_exit();
-			pfree(spiq_delta.data);
 			SPI_finish();
 
 			/* ---------- MAIN-side conflict check: only if delta has NO
@@ -317,30 +318,33 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 			 * allowed. ---------- */
 			if (delta_latest_op != 'D')
 			{
-				StringInfoData spiq_main;
+				Datum		vals_main[1];
+				static const Oid argtypes_main[1] = {TEXTOID};
+				char	   *sql_main;
 				int			ret_main;
 
-				initStringInfo(&spiq_main);
-				appendStringInfo(&spiq_main,
-								 "SELECT 1 FROM %s WHERE (%s) = %s::text::%s LIMIT 1",
-								 quote_qualified_identifier(
-									 get_namespace_name(RelationGetNamespace(rel)),
-									 RelationGetRelationName(rel)),
-								 quote_identifier(pk_colname),
-								 pkval_esc,
-								 format_type_be(pk_type));
+				/* WR-1a: PK value bound as $1; relname/colname/type inline. */
+				sql_main = psprintf("SELECT 1 FROM %s WHERE (%s) = $1::text::%s LIMIT 1",
+									quote_qualified_identifier(
+										get_namespace_name(RelationGetNamespace(rel)),
+										RelationGetRelationName(rel)),
+									quote_identifier(pk_colname),
+									format_type_be(pk_type));
+				vals_main[0] = CStringGetTextDatum(pkval_txt);
 
 				overlay_overlay_helper_enter();
 				overlay_write_redirect_exit();
-				ret_main = ob_spi_one_shot(spiq_main.data, true, 1);
+				ret_main = ob_spi_exec_params(sql_main, true, 1, 1,
+											  argtypes_main, vals_main, NULL);
+				pfree(sql_main);
+				pfree(DatumGetPointer(vals_main[0]));
 
 				if (ret_main == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1)
 				{
-					char *saved_pkval = pstrdup(pkval_txt);
+					/* See the delta branch above: pkval_txt is allocated
+					 * outside the SPI context and stays valid after
+					 * SPI_finish(). */
 					SPI_finish();
-					pfree(spiq_main.data);
-					pfree(pkval_esc);
-					pfree(pkval_txt);
 					overlay_write_redirect_enter();
 					overlay_overlay_helper_exit();
 					ereport(ERROR,
@@ -348,16 +352,14 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 							 errmsg("duplicate key value violates unique constraint on relation \"%s\"",
 									RelationGetRelationName(rel)),
 							 errdetail("Key (%s)=(%s) already exists in MAIN heap (R21 pre-check).",
-									   pk_colname, saved_pkval)));
+									   pk_colname, pkval_txt)));
 				}
 				overlay_write_redirect_enter();
 				overlay_overlay_helper_exit();
-				pfree(spiq_main.data);
 				SPI_finish();
 			}
 		}
 
-		pfree(pkval_esc);
 		pfree(pkval_txt);
 	}
 }
@@ -399,7 +401,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 	ModifyTable      *plan = NULL;
 	bool		handled = false;
 	extern char *slot_get_ctid_cstr(TupleTableSlot *slot);
-	extern TupleTableSlot *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr);
+	extern TupleTableSlot *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
+											   MemoryContext result_cxt);
 
 	/* V3 Layer1 + FR4: DML path MUST raise ERROR if the branch has been
 	 * applied/discarded in another session — DQL path gets NOTICE + MAIN
@@ -876,7 +879,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					else
 					{
 						elog(DEBUG2, "UD[dbg] B ctid=%s", ctid_cstr);
-						old_clean_slot = fetch_tuple_by_ctid(rel, ctid_cstr);
+						old_clean_slot = fetch_tuple_by_ctid(rel, ctid_cstr,
+															 queryDesc->estate->es_query_cxt);
 						pfree(ctid_cstr);
 						elog(DEBUG2, "UD[dbg] C fetched old row from MAIN heap");
 						oldver = overlay_tuple_version(rel, old_clean_slot);
@@ -893,7 +897,12 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						elog(DEBUG2, "UD[dbg] D UPDATE set-merge: reldesc_natts=%d junk_natts=%d",
 							 reldesc->natts, junkdesc->natts);
 
-						oldmc = MemoryContextSwitchTo(TopMemoryContext);
+						/* SET-merge copies belong to the same lifetime as
+						 * old_clean_slot (fetched into es_query_cxt above), so
+						 * allocate them there too.  TopMemoryContext leaked one
+						 * datum per redirected row per varchar SET column
+						 * (MF-1). */
+						oldmc = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
 						for (r = 0; r < reldesc->natts; r++)
 						{
 							Form_pg_attribute ratt = TupleDescAttr(reldesc, r);
@@ -1173,7 +1182,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							for (i = 0; i < SPI_processed; i++)
 							{
 								bool isn_td;
-								bool isn_ov;
 								char *pkstr = SPI_getvalue(SPI_tuptable->vals[i],
 								                           SPI_tuptable->tupdesc, 1);
 								bytea *td = (bytea*) SPI_getbinval(
@@ -1181,19 +1189,25 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									SPI_tuptable->tupdesc, 2, &isn_td);
 								char *ov = SPI_getvalue(SPI_tuptable->vals[i],
 								                        SPI_tuptable->tupdesc, 3);
-								isn_ov = (ov == NULL);
 								if (pkstr == NULL || isn_td || td == NULL)
+								{
+									if (pkstr) pfree(pkstr);
+									if (ov) pfree(ov);
 									continue;
+								}
 								{
 									struct WR_PDR1 *r;
+									int sz = VARSIZE_ANY(td);
+
 									r = (struct WR_PDR1*) palloc0(sizeof(struct WR_PDR1));
-									r->s = pstrdup(pkstr);
-									r->ov = isn_ov ? NULL : pstrdup(ov);
-									{
-										int sz = VARSIZE_ANY(td);
-										r->t = (bytea*) palloc(sz);
-										memcpy(r->t, td, sz);
-									}
+									/* Hand the SPI_getvalue() strings straight to
+									 * the row (same es_query_cxt lifetime as the
+									 * pstrdup()s they replace) so no per-row
+									 * intermediate is left behind. */
+									r->s = pkstr;
+									r->ov = ov;
+									r->t = (bytea*) palloc(sz);
+									memcpy(r->t, td, sz);
 									raw_rows = lappend(raw_rows, r);
 								}
 							}
@@ -1245,6 +1259,24 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									c1_->key = pstrdup(r->s);
 									cand_inserts = lappend(cand_inserts, c1_);
 								}
+							}
+							/* overlay_delta_lookup() deep-copies key /
+							 * old_version / tuple_data into TopMemoryContext so
+							 * they outlive its SPI_finish().  They are consumed
+							 * above (reconstruct_slot_from_delta copies what it
+							 * needs), so release them here — otherwise every
+							 * pure-delta rewritten row leaks its whole
+							 * serialized payload for the backend lifetime
+							 * (MF-1).  Mirrors ob_overlay_free_delta_list()
+							 * on the read path. */
+							if (rc)
+							{
+								if (dtu.key != NULL)
+									pfree(dtu.key);
+								if (dtu.old_version != NULL)
+									pfree(dtu.old_version);
+								if (dtu.tuple_data != NULL)
+									pfree(dtu.tuple_data);
 							}
 						}
 						list_free(seen);
@@ -1515,7 +1547,12 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									&TTSOpsHeapTuple);
 								{
 									MemoryContext oldmc;
-									oldmc = MemoryContextSwitchTo(TopMemoryContext);
+									/* The post-image copies are consumed by
+									 * heap_form_tuple() immediately below and only
+									 * need statement lifetime; TopMemoryContext
+									 * leaked one datum per pure-delta rewritten row
+									 * (MF-1). */
+									oldmc = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
 									for (k = 0; k < natts; k++)
 									{
 										Datum		d;
@@ -1851,30 +1888,29 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				/* ---------- Phase I: Pure delta conflict lookup ---------- */
 				if (oc_action != ONCONFLICT_NONE)
 				{
-					StringInfoData spiq;
+					Datum		vals_pure[3];
+					static const Oid argtypes_pure[3] = {INT4OID, OIDOID, TEXTOID};
 					int			ret2;
 					bool		in_pure_delta = false;
-					char	   *pk_esc;
 					MemoryContext oldmc;
 
 					oldmc = NULL;
-					initStringInfo(&spiq);
-					pk_esc = quote_literal_cstr(pk);
-					appendStringInfo(&spiq,
-						"SELECT d.op, d.old_version, d.tuple_data FROM %s d "
-						"WHERE d.branch_id = %u AND d.relid = %u AND d.key = %s "
-						"AND (d.op = %s OR d.op = %s) LIMIT 1",
-						OBTABLE_DELTA, (unsigned) bid, (unsigned) relid, pk_esc,
-						quote_literal_cstr("I"), quote_literal_cstr("U"));
-					pfree(pk_esc);
+					/* WR-1a: branch_id/relid/key bound as $1..$3. */
+					vals_pure[0] = Int32GetDatum(bid);
+					vals_pure[1] = ObjectIdGetDatum(relid);
+					vals_pure[2] = CStringGetTextDatum(pk);
 
 					overlay_overlay_helper_enter();
 					overlay_write_redirect_exit();
-					ret2 = ob_spi_one_shot(spiq.data, true, 0);
+					ret2 = ob_spi_exec_params(
+						"SELECT d.op, d.old_version, d.tuple_data FROM " OBTABLE_DELTA " d "
+						"WHERE d.branch_id = $1 AND d.relid = $2 AND d.key = $3 "
+						"AND (d.op = 'I' OR d.op = 'U') LIMIT 1",
+						true, 0, 3, argtypes_pure, vals_pure, NULL);
+					pfree(DatumGetPointer(vals_pure[2]));
 					in_pure_delta = (ret2 == SPI_OK_SELECT);
 					overlay_write_redirect_enter();
 					overlay_overlay_helper_exit();
-					pfree(spiq.data);
 
 					if (in_pure_delta && SPI_tuptable != NULL && SPI_processed >= 1)
 					{
@@ -1968,14 +2004,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				/* ---------- Phase II: MAIN heap ctid lookup (MAIN-FIRST) --- */
 				if (oc_action != ONCONFLICT_NONE && pk_attno > 0)
 				{
-					StringInfoData spiq2;
 					TupleDesc	reldesc;
 					int			pk_attidx = pk_attno - 1;
 					Oid			pk_type;
 					int			ret3;
-					char	   *pkval_esc;
+					char	   *sql2;
 					bool		pk_isnull = false;
 					Datum		pkdatum;
+					Datum		vals_main2[1];
+					static const Oid argtypes_main2[1] = {TEXTOID};
 					MemoryContext oldmc;
 
 					reldesc = RelationGetDescr(rel);
@@ -2017,27 +2054,26 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						char   *pkval_txt;
 						getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
 						pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
-						pkval_esc = quote_literal_cstr(pkval_txt);
-						pfree(pkval_txt);
 
-						initStringInfo(&spiq2);
-						appendStringInfo(&spiq2,
-							"SELECT ctid FROM %s WHERE (%s) = %s::text::%s LIMIT 1",
-							quote_qualified_identifier(
-								get_namespace_name(RelationGetNamespace(rel)),
-								RelationGetRelationName(rel)),
-							quote_identifier(NameStr(
-								TupleDescAttr(reldesc, pk_attidx)->attname)),
-							pkval_esc,
-							format_type_be(pk_type));
-						pfree(pkval_esc);
+						/* WR-1a: PK value bound as $1; relname/colname/type inline. */
+						sql2 = psprintf("SELECT ctid FROM %s WHERE (%s) = $1::text::%s LIMIT 1",
+										quote_qualified_identifier(
+											get_namespace_name(RelationGetNamespace(rel)),
+											RelationGetRelationName(rel)),
+										quote_identifier(NameStr(
+											TupleDescAttr(reldesc, pk_attidx)->attname)),
+										format_type_be(pk_type));
+						vals_main2[0] = CStringGetTextDatum(pkval_txt);
+						pfree(pkval_txt);
 
 						overlay_overlay_helper_enter();
 						overlay_write_redirect_exit();
-						ret3 = ob_spi_one_shot(spiq2.data, true, 0);
+						ret3 = ob_spi_exec_params(sql2, true, 0, 1,
+												  argtypes_main2, vals_main2, NULL);
 						overlay_write_redirect_enter();
 						overlay_overlay_helper_exit();
-						pfree(spiq2.data);
+						pfree(sql2);
+						pfree(DatumGetPointer(vals_main2[0]));
 
 						if (ret3 == SPI_OK_SELECT && SPI_tuptable != NULL &&
 							SPI_processed >= 1)
@@ -2117,7 +2153,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								ExecClearTuple(ecx->ecxt_innertuple);
 							if (main_hit)
 							{
-								t_where_scan = fetch_tuple_by_ctid(rel, main_ctid);
+								t_where_scan = fetch_tuple_by_ctid(rel, main_ctid,
+																   queryDesc->estate->es_query_cxt);
 								main_where_fetched = true;
 							}
 							else
@@ -2180,7 +2217,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					if (promotion == 2)
 					{
 						/* promo=2: MAIN row → fetch by ctid */
-						pre_image_slot = fetch_tuple_by_ctid(rel, main_ctid);
+						pre_image_slot = fetch_tuple_by_ctid(rel, main_ctid,
+															 queryDesc->estate->es_query_cxt);
 						if (old_version == NULL)
 							old_version = overlay_tuple_version(rel, pre_image_slot);
 					}

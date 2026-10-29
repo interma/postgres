@@ -13,6 +13,10 @@
  *               校验 UPSERT 不丢行/不重行
  *   Section U — discard_branch(bs_U_disc)：T 已 apply 9 行 MAIN 保持完整，
  *               bs_U_disc 回滚 0 行 MAIN；sum MAIN=1424，sum bs_U 纯 del=0
+ *   Section V — pg_branch_delta 索引布局不变式（WR-1 前置）：内部 delta 表只应有
+ *               PK (branch_id, relid, key)，不得有 (branch_id, relid) 冗余索引；
+ *               并在 M=2000 delta 行下验证写路径存在性探测（冲突检测）的
+ *               命中/未命中两条路径仍正确。
  *
  * ⚠️ S→T→U 之间绝对不 DISCARD ALL / RESET：三段共享 branch bs_S_br 与 bs_U_disc 的
  * catalog 状态；若打断则 Section T 找不到 "bs_S_br"（已在不同 session 丢弃）。
@@ -181,4 +185,84 @@ FROM public.bs_S_up WHERE id = 99;
 
 RESET client_min_messages;
 DROP TABLE public.bs_S_up;
+
+
+/* =========================================================== Section V */
+-- =====================================================================
+-- ===== Section V: pg_branch_delta index layout invariant (WR-1 prereq)
+-- =====   V.1 catalog: the internal delta table must expose exactly one
+-- =====       index -- the PRIMARY KEY (branch_id, relid, key).  A
+-- =====       separate (branch_id, relid) index is a strict prefix of the
+-- =====       pkey: redundant, and harmful under stale planner stats
+-- =====       (reltuples = -1, the norm for this internal table), where
+-- =====       the planner prefers the narrower index and demotes
+-- =====       `key = ...` to a Filter.  That turns the per-row write-path
+-- =====       delta existence probe from an O(1) pkey lookup into an
+-- =====       O(delta) scan (the M10c INSERT regression).
+-- =====   V.2 behavior: with M = 2000 delta rows the write-path probe
+-- =====       (conflict detection) still resolves both ways -- probe hit
+-- =====       (UPDATE an existing delta key) and conflict (duplicate PK
+-- =====       inside the branch -> 23505).
+-- =====================================================================
+
+SET client_min_messages = warning;
+
+-- ----- V.1 index layout invariant -----
+SELECT indexrelid::regclass::text AS delta_index
+  FROM pg_index
+ WHERE indrelid = 'overlay_branch.pg_branch_delta'::regclass
+ ORDER BY 1;
+
+SELECT CASE WHEN count(*) = 1 AND bool_and(indisprimary)
+            THEN 'PASS:V1_DELTA_ONLY_PKEY'
+            ELSE 'FAIL:V1 index_count=' || count(*) END AS v1
+  FROM pg_index
+ WHERE indrelid = 'overlay_branch.pg_branch_delta'::regclass;
+
+-- no 2-column (branch_id, relid) index may exist (name-independent)
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:V1_NO_REDUNDANT_RELID_IDX'
+            ELSE 'FAIL:V1 redundant=' || string_agg(i.indexrelid::regclass::text, ',')
+       END AS v2
+  FROM pg_index i
+  JOIN pg_attribute a1 ON a1.attrelid = i.indrelid AND a1.attnum = i.indkey[0]
+  JOIN pg_attribute a2 ON a2.attrelid = i.indrelid AND a2.attnum = i.indkey[1]
+ WHERE i.indrelid = 'overlay_branch.pg_branch_delta'::regclass
+   AND i.indnatts = 2
+   AND a1.attname = 'branch_id' AND a2.attname = 'relid';
+
+-- ----- V.2 probe correctness at scale -----
+DROP TABLE IF EXISTS public.bs_V_t;
+CREATE TABLE public.bs_V_t (id INT4 PRIMARY KEY, v INT4 NOT NULL);
+INSERT INTO public.bs_V_t SELECT g, g FROM generate_series(1,100) g;
+SELECT overlay_branch.create_branch('bs_V_br');
+SELECT overlay_branch.use_branch('bs_V_br');
+
+-- one set-based INSERT builds 2000 delta rows => 2000 per-row probes
+INSERT INTO public.bs_V_t SELECT 1000 + g, g FROM generate_series(1,2000) g;
+
+SELECT CASE WHEN count(*) = 2100 THEN 'PASS:V2_OVERLAY_COUNT_2100'
+            ELSE 'FAIL:V2 count=' || count(*) END AS v3
+  FROM public.bs_V_t;
+SELECT CASE WHEN v = 500 THEN 'PASS:V2_PURE_ROW_VISIBLE'
+            ELSE 'FAIL:V2 v=' || COALESCE(v::text,'NULL') END AS v4
+  FROM public.bs_V_t WHERE id = 1500;
+
+-- probe hit: UPDATE an existing delta key keeps exactly one delta row
+UPDATE public.bs_V_t SET v = 1501 WHERE id = 1500;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 1501
+            THEN 'PASS:V2_DELTA_UPDATE_ONE_ROW'
+            ELSE 'FAIL:V2 rows=' || count(*) END AS v5
+  FROM public.bs_V_t WHERE id = 1500;
+
+-- probe conflict: duplicate PK inside the branch must still ERROR 23505
+INSERT INTO public.bs_V_t VALUES (1500, 1);
+
+SELECT overlay_branch.use_branch(NULL);
+SELECT CASE WHEN count(*) = 100 THEN 'PASS:V2_MAIN_PRISTINE_100'
+            ELSE 'FAIL:V2 count=' || count(*) END AS v6
+  FROM public.bs_V_t;
+
+SELECT overlay_branch.discard_branch('bs_V_br');
+RESET client_min_messages;
+DROP TABLE public.bs_V_t;
 

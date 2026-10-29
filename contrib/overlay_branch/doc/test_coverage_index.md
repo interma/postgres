@@ -1,6 +1,6 @@
-# Overlay Branch 测试覆盖索引 (29 entries: 17 L3 + 12 L1)
+# Overlay Branch 测试覆盖索引 (30 entries: 18 L3 + 12 L1)
 
-> L3 = pg_regress 单会话 SQL 文件 (17 个)；L1 = isolationtester 多会话隔离测试 (12 个 specs)。
+> L3 = pg_regress 单会话 SQL 文件 (18 个)；L1 = isolationtester 多会话隔离测试 (12 个 specs)。
 
 | 文件名 (去掉前缀/后缀) | 中文覆盖范围 (30-60 字) | 对应 Rxx / Gxx / Bxx 编号 |
 |----------|-------------------------|------------------------|
@@ -10,17 +10,18 @@
 | scan_type (L3) | 多列类型覆盖：int/bigint/text/numeric/timestamptz/date 的 PK 序列化 + BranchScan 类型 dispatch | R07 (PK serialize 多类型) |
 | mvcc_bounds (L3) | Live Mode 下 MAIN 已提交写入的可见性边界；分支内对 MAIN 新版本 RC 级可见性；**§D-5 A4 5 subcases (empty apply/discard <500ms + 10K I/U/D apply <60s)** | R10 (MAIN write → Branch visible) + S05 MVCC + **A4 5 PASS markers / R26** |
 | mvcc_usage (L3) | 典型 Live Mode 使用流：并发 MAIN 写入 → Branch 叠加读一致；含未提交 vs 已提交分界 | S05 Live MVCC § |
-| mvcc_review (L3) | MVCC 历史 bug 回归；多 session 并发 apply/discard + state 机 correctness | S05 MVCC review § + S12 |
+| mvcc_review (L3) | MVCC 历史 bug 回归；多 session 并发 apply/discard + state 机 correctness；**SECTION AP1 = 阶段 3A apply 每行合并语义等价**（D+U+I 正路径 + 3 条 `0A000` 冲突负向：DEL/UPD 锚点消失、INS 主键已存在）；**SECTION AP2 = 阶段 3B 集合式批处理**（D+U+I 批回放正路径 + 6 类冲突负向：D/U 各 锚点消失 + token 失配、orphan-U 冲突、INS 主键已存在 + orphan-U→INSERT + keyless 回退 + `apply_batch` off/on 差分等价） | S05 MVCC review § + S12 + **阶段 3A（§6.3）** + **阶段 3B（§6.4）** |
 | puredelta (L3) | Pure-delta (主表空) + 仅 INSERT 路径；UPSERT 纯 delta 两阶段 (无 MAIN) | B1 (pure-delta path) + R04 INSERT |
 | puredelta_mix (L3) | 混合 Pure-delta (主表有行) + INSERT promotion 4-phase + MAIN key 冲突预检 | B1 promotion rules + R21 INSERT pre-check |
 | rentry (L3) | R03/R05/R06/R16/R19 入口漂移写负向 + R21 INSERT 约束 5 子用例 + §G02 ACL 10 子用例 (A1..E) + §G01 SCOPE 10+1 负向/基线 (A..Z) + Section 12 **A7 schema epoch registry × 12 subcases (D1-D12)**: D2 bool_or 存在性 / D5 CREATE→增量→DROP→55000 drift / D6 DROP+recreate→discard→fresh / D11 exit-before-discard / D12 UPDATE-exit+re-apply + **R23** schema drift 55000 / **R24** DDL restricted §A7 0A000 + **§D4 A9 pg_branch identity & restore metadata × 8 subcases**: A9_1 4 cols NOT NULL / A9_2 list_branches 暴露 11 col / A9_3 MD5 宽 16B / A9_4 creation xmin 同 tx / A9_5 get_branch_identity() 7-tuple match / A9_6 registry_current_match TRUE / A9_7 count≥3 / A9_8 old ABI NULL compat | R03/R05/R06/R16/R19/R21 + §G02 S13 全矩阵 + §G01 MVP RESTRICTED 7 categories + **R23 (A7 schema epoch registry drift)** + **R24 (A7 DDL restricted 0A000)** + **R25 (A9 identity & restore metadata drift-guard)** |
-| upsert (L3) | 完整 B2 UPSERT：INSERT ON CONFLICT DO NOTHING / DO UPDATE 针对 PK 的 2-phase 23505 双侧冲突检测 | B2 (upsert impl) |
+| upsert (L3) | 完整 B2 UPSERT：INSERT ON CONFLICT DO NOTHING / DO UPDATE 针对 PK 的 2-phase 23505 双侧冲突检测；**Section V = pg_branch_delta 索引布局不变式（WR-1 前置）**：内部表只应有 PK、无 (branch_id, relid) 冗余索引 + M=2000 delta 行下写路径探测命中/冲突两路径正确 | B2 (upsert impl) + **WR-1 前置（§8.6.1）** |
 | **view_unify (L3)** | D-2 review_260926 A2 Read/Write View Unification：A2.1 self-join (SJ1 12-pair / SJ2 baseline-EXCEPT-0 / SJ3 visual) / A2.3 SAME-CSS ReScan 3×14 deterministic proof / A2.4 non-lateral NL no-crash / A2.2 DECLARE/FETCH/MOVE cursor overlay-only 3 assertions (CUR1 14rows / CUR2 id=3 NOT EXISTS / CUR3 amt=111,112) | §A2 architecture (OPEN → ✅) |
 | **planner_cost (L3)** | D-3 review_260926 A8 MVP cost_branchscan cost model：A8.1 SEQ scan cost != 0.00 / A8.2 PK scan cost << seq / A8.3 SELF-JOIN 2× BranchScan 节点 + SJ correctness 210 pairs；standalone 验证 add_path→lappend 关键根因修复（real cost 静默 reject 旁路 delta merge） | §A8 architecture (OPEN → ✅) + R11/R12 complexity estimate proof |
 | **keyless (L3)** | B6 无 PK 表 ctid 实验特性：GUC off 拒绝 0A000 / on 一行 WARNING + 正确叠加读写 / apply 落地 + 二次 apply 阻止 / 并发 MAIN 改写锚点行 → apply 冲突且保留 MAIN / PK 表路径不受 GUC 影响 / keyless UPSERT 0A000 | B6 (keyless ctid identity) + §R8 G5 例外 |
 | **parallel (L3)** | MF-2/MF-3 分支内禁止并行：活跃分支下 planner hook 清空 partial_pathlist，EXPLAIN 只出现单一 CustomScan 且无 Gather（堵住静默读 MAIN 的旧数据） | MF-2/MF-3 + §3 并行盲点 |
-| **memgrow (L3)** | MF-1 会话级内存稳定：单会话内连续 200 次全量叠加 chunk，`pg_backend_memory_contexts` 增量 = 0（堵住 TopMemoryContext 泄漏 + delta 侧中间副本） | MF-1 + §3 内存所有权 |
+| **memgrow (L3)** | MF-1 会话级内存稳定：单会话内连续 200 次全量叠加 chunk，`pg_backend_memory_contexts` 增量 = 0（堵住 TopMemoryContext 泄漏 + delta 侧中间副本）；**写路径探针**覆盖重定向 UPDATE/DELETE + pure-delta UPDATE 三处同源泄漏（`fetch_tuple_by_ctid` / SET-merge / `overlay_delta_lookup` 结果未释放），阈值 1 MB → `grew=0`；**Section 1b** 钉住 SRF 读路径（`overlay_main_plus_delta`）结果与 BranchScan 逐行等价，其语句内瞬态峰值由 L2 `test/bench/srf_peak_rss.sh` 兜底 | MF-1 + §3 内存所有权 |
 | **pushdown (L3)** | RD-1/RD-2 (MF-5) 非 PK 下推 + Pass2 孤儿路径：四种 op 形状下 `grp=7` 结果集正确（含 Pass1 零命中、每个 delta 都成孤儿的极端），无重复行，并断言 delta key 结构性唯一 | RD-1/RD-2/MF-5 + §2.1 读路径 |
+| **plancache (L3)** | 阶段 5 WR-1a 写路径参数化 prepared plan：同一 statement 文本重复执行（含 pure-delta UPSERT）计划复用后结果一致、delta 行数幂等；`"` `\` `'` 换行文本键/值与非 UTF8 bytea payload（`decode('feedface','hex')`）经参数化 key / `tuple_data` 绑定字节精确往返 + 特殊字符键上的重定向 UPDATE/DELETE；`DISCARD PLANS` 与 `ALTER TABLE`（无分支时）+ 分支重入后同一 statement 重跑仍正确 | §8.4 WR-1a / §8.5 不变量 / §8.7 测试计划 / §8.10 |
 | ob_apply_mutex (L1) | isolationtester: 2 session 并发 apply 同一 branch → CAS loser 55000, winner 成功; delta 写入期间状态 guard | S16 FR3 CAS + R17 write-set freeze |
 | ob_state_inval (L1) | isolationtester: apply/discard 后 LISTEN ob_branch_state payload `<bid>:<new_state>` 广播; 相邻 session is_active() 立即失效节流重查 | S13 FR1 NOTIFY + FR4 throttled catalog recheck |
 | ob_applying_freeze (L1) | isolationtester: APPLY 过程 MAIN 并发读/写 freeze 边界; discarded/applied 终态禁止二次 apply/discard | S04 Apply freeze § + FR1/FR5 boundary + R17 applying state guard |

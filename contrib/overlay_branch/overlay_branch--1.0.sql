@@ -51,8 +51,17 @@ CREATE TABLE @extschema@.pg_branch_delta (
     CONSTRAINT pg_branch_delta_op_check CHECK (op IN ('I', 'U', 'D'))
 );
 
-CREATE INDEX pg_branch_delta_relid_idx
-    ON @extschema@.pg_branch_delta (branch_id, relid);
+-- NOTE: no separate (branch_id, relid) index.  Every delta access is a
+-- strict prefix of the PRIMARY KEY (branch_id, relid, key) -- point
+-- lookup by full key, or prefix scan/aggregate/delete by (branch_id,
+-- relid).  The pkey already serves all of them, and a narrower
+-- (branch_id, relid) index would be redundant.  Worse, when planner
+-- statistics on this internal table are stale (reltuples = -1, common
+-- here because autovacuum rarely ANALYZEs it), the planner prefers the
+-- narrower redundant index and demotes the key equality to a Filter,
+-- turning the per-row delta existence probe on the write path from an
+-- O(1) pkey point lookup into an O(delta) scan.  See doc/performance.md
+-- WR-1 / M10c for the before/after numbers.
 
 -- ============================================================
 -- §Gx / A7 (review_260926 S18 2026-10-08): Schema-epoch registry.

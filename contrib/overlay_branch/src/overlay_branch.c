@@ -89,6 +89,10 @@ bool		overlay_keyless_tables = false;
 int			ob_invalidation_check_threshold = 32;
 int			ob_invalidation_check_interval_ms = 100;
 bool		ob_apply_strict_pins = true;
+/* V6 / phase 3B: replay each relation's deltas as one set-based batch per
+ * operation instead of one row at a time.  Semantics are unchanged; this only
+ * removes the per-row planning cost (see doc/performance.md §6.4). */
+bool		ob_apply_batch = true;
 bool		ob_use_shared_mem_pin_table = false;
 bool		ob_in_snapshot_mode_helper = false;
 
@@ -336,6 +340,21 @@ _PG_init(void)
 							 "apply_branch() fails with ERROR if other sessions still hold use_branch() pins on the branch.",
 							 "Strict mode (on) guarantees zero post-apply data drift at the cost of requiring all users to exit the branch first; relaxed mode warns and proceeds.",
 							 &ob_apply_strict_pins,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/* V6 / phase 3B: set-based apply.  On (default) replays each relation's
+	 * deltas with one SQL statement per operation instead of one per row;
+	 * Off restores the per-row 3-pass replay.  Turn off to A/B compare or
+	 * to fall back if a batch bug is suspected. */
+	DefineCustomBoolVariable("overlay_branch.apply_batch",
+							 "Replay apply_branch() deltas with set-based batch SQL (one statement per relation and operation).",
+							 "On (default): one validation SELECT plus one batch DML per (relation, operation).  Off: legacy per-row replay.  Relations without a PRIMARY KEY, or whose delta rows carry a base image, always use the per-row replay.",
+							 &ob_apply_batch,
 							 true,
 							 PGC_SUSET,
 							 0,
@@ -1627,6 +1646,17 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "overlay_branch: SPI_connect failed in list_branches");
 
+		/*
+		 * SPI_connect() switches CurrentMemoryContext to its private procCxt,
+		 * which SPI_finish() unconditionally deletes.  Everything we
+		 * materialize below (the st->values/st->nulls arrays and every
+		 * datumCopy() of a SPI result) must outlive the SPI connection, so
+		 * move back to the SRF's multi-call context, where st itself already
+		 * lives.  Without this the arrays dangle after SPI_finish() and the
+		 * SRF_PERCALL_SETUP() reads below are a use-after-free.
+		 */
+		MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
 		ret = SPI_execute("SELECT b.branch_id, b.branch_name, b.owner, "
 						  "       b.created_at, b.mode, b.state, "
 						  "       COALESCE(d.cnt, 0)::bigint AS delta_count "
@@ -1858,11 +1888,22 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 			Datum		   *values;
 			bool		   *isnulls;
 			int				exp_natts = exp_desc->natts;
-			MemoryContext	oldcxt;
 			HeapTuple		tuple;
 			Datum			result;
 
-			oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+			/*
+			 * Do NOT switch to funcctx->multi_call_memory_ctx here.  That
+			 * context is only deleted when the SRF ends, so allocating the
+			 * per-row scratch (values/isnulls and their datumCopy()s) and the
+			 * result tuple there would grow the backend's memory linearly
+			 * with the number of rows produced.  The executor already runs us
+			 * in ecxt_per_tuple_memory and resets it before every call
+			 * (execSRF.c, value-per-call loop), and it copies the returned
+			 * tuple into the tuplestore before the next reset -- so letting
+			 * these transient objects land in CurrentMemoryContext is both
+			 * correct and constant-memory.  Only the long-lived handle and
+			 * tuple_desc stay in the multi-call context.
+			 */
 			values = (Datum *) palloc0(sizeof(Datum) * exp_natts);
 			isnulls = (bool *) palloc0(sizeof(bool) * exp_natts);
 
@@ -1906,7 +1947,6 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 
 			tuple = heap_form_tuple(exp_desc, values, isnulls);
 			result = HeapTupleGetDatum(tuple);
-			MemoryContextSwitchTo(oldcxt);
 
 			SRF_RETURN_NEXT(funcctx, result);
 		}

@@ -1,0 +1,178 @@
+SET
+SET
+SET
+CREATE EXTENSION
+RESET
+SET
+SET
+SET
+DO
+DELETE 0
+DELETE 0
+DELETE 0
+DROP TABLE
+CREATE TABLE
+INSERT 0 200000
+ANALYZE
+
+============================== environment ==============================
+                                                 server_version                                                 
+----------------------------------------------------------------------------------------------------------------
+ PostgreSQL 17.11 on aarch64-unknown-linux-gnu, compiled by gcc (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0, 64-bit
+(1 row)
+
+ parallel_gather 
+-----------------
+ 0
+(1 row)
+
+ param_n_main_rows | param_m_delta_rows |        branch        
+-------------------+--------------------+----------------------
+            200000 |              20000 | ob_perf_200000_20000
+(1 row)
+
+
+=========== M1: MAIN seqscan count(*)  (plain heap baseline) ===========
+Timing is on.
+ count  
+--------
+ 200000
+(1 row)
+
+Time: 9.187 ms
+ create_branch 
+---------------
+             1
+(1 row)
+
+Time: 7.229 ms
+ use_branch 
+------------
+ 
+(1 row)
+
+Time: 1.600 ms
+
+========== M2: branch count(*) with M=0  (BranchScan, no delta) ========
+ count  
+--------
+ 200000
+(1 row)
+
+Time: 89.569 ms
+--- backend memory after M2 (leak watch, see MF-1) ---
+ backend_mem 
+-------------
+ 2339 kB
+(1 row)
+
+Time: 0.573 ms
+
+===== M10a: write path UPDATE  (m/2 rows, redirected to delta) =====
+Timing is on.
+UPDATE 10000
+Time: 825.274 ms
+===== M10b: write path DELETE  (m/4 rows, redirected to delta) =====
+DELETE 5000
+Time: 399.488 ms
+===== M10c: write path INSERT  (m/4 rows, redirected to delta) =====
+INSERT 0 5000
+Time: 422.605 ms
+Timing is off.
+
+---------------- delta shape (op -> rows) ----------------
+ op | rows  
+----+-------
+ D  |  5000
+ I  |  5000
+ U  | 10000
+(3 rows)
+
+
+=========== M3: branch count(*) full overlay  (N merged with M) ========
+Timing is on.
+ count  
+--------
+ 200000
+(1 row)
+
+Time: 526.003 ms
+--- M3 repeat (verifies run-to-run stability) ---
+ count  
+--------
+ 200000
+(1 row)
+
+Time: 524.145 ms
+--- backend memory after M3 (leak watch, see MF-1) ---
+ backend_mem 
+-------------
+ 26 MB
+(1 row)
+
+Time: 1.500 ms
+
+=========== M4: branch PK-equality read  (P0 fast path) ================
+ id | grp |                                      payload                                       
+----+-----+------------------------------------------------------------------------------------
+ 42 |  42 | xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_u
+(1 row)
+
+Time: 1.213 ms
+
+=========== M5: branch non-PK read  (P2 pushdown, grp=7) ===============
+ count 
+-------
+  1950
+(1 row)
+
+Time: 446.498 ms
+
+=========== M6: EXPLAIN ANALYZE branch full scan  (node check) =========
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=9059
+   ->  Custom Scan (overlay_branch_branchscan) on ob_perf_base (actual rows=200000 loops=1)
+         Buffers: shared hit=9059
+ Planning:
+   Buffers: shared hit=2
+ Planning Time: 0.076 ms
+ Execution Time: 521.680 ms
+(8 rows)
+
+Time: 523.125 ms
+
+=========== M7: delta size report  (logical payload, pre-apply) =========
+Timing is off.
+     rel      | delta_rows | delta_logical | main_total | amplification 
+--------------+------------+---------------+------------+---------------
+ ob_perf_base |      20000 | 2068 kB       | 28 MB      |        0.0712
+(1 row)
+
+ delta_relation_total 
+----------------------
+ 4688 kB
+(1 row)
+
+
+=========== M8: apply_branch timing  (3-pass D->U->I) ==================
+Timing is on.
+ apply_branch 
+--------------
+ 
+(1 row)
+
+Time: 180.687 ms
+
+=========== M9: MAIN mode after apply (delta drained) ==================
+ count  
+--------
+ 200000
+(1 row)
+
+Time: 11.638 ms
+Timing is off.
+
+=============================== done ===================================
+baseline finished; artifacts kept for inspection (public.ob_perf_base).

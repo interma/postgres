@@ -7,7 +7,8 @@ OBJS = \
 	src/branch_scan.o \
 	src/delta_store.o \
 	src/write_redirect.o \
-	src/branch_lifecycle.o
+	src/branch_lifecycle.o \
+	src/plan_cache.o
 
 EXTENSION = overlay_branch
 DATA = overlay_branch--1.0.sql
@@ -40,7 +41,8 @@ REGRESS = \
   overlay_branch_keyless \
   overlay_branch_parallel \
   overlay_branch_memgrow \
-  overlay_branch_pushdown
+  overlay_branch_pushdown \
+  overlay_branch_plancache
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \

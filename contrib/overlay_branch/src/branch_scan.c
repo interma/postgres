@@ -103,15 +103,20 @@ static const CustomExecMethods ob_branchscan_exec_methods = {
  * so every result set is unchanged — only *when* the work happens moves.
  *
  * The state is allocated in the caller's result context (BranchScan →
- * ebs->scan_cxt, child of es_query_cxt; SRF → multi_call_memory_ctx) so
- * its lifetime matches the slots it hands out.  close() releases the
- * delta payload (TopMemoryContext), the heap scan descriptor and the probe
- * slot; the relation and the state itself are owned by the caller (the
- * relation is borrowed, the state is reclaimed with the context).
+ * ebs->scan_cxt, child of es_query_cxt; SRF → multi_call_memory_ctx).  The
+ * single merged row handed back by next() is built in a child "row scratch"
+ * context that next() resets on entry, so a scan's footprint does NOT grow
+ * with the number of rows it emits; the caller must finish with a row before
+ * calling next() again (the plain ExecProcNode / SRF per-call contract).
+ * close() releases the delta payload (TopMemoryContext), the heap scan
+ * descriptor and the probe slot; the relation and the state itself are owned
+ * by the caller (the relation is borrowed, the state is reclaimed with the
+ * context).
  * ================================================================ */
 typedef struct OverlayScanState
 {
-    MemoryContext   result_cxt;   /* owns every emitted slot / datum copy */
+    MemoryContext   result_cxt;   /* owns the iterator + long-lived (P0) slots */
+    MemoryContext   row_cxt;      /* one row's slot + datum copy; reset per call */
     Relation        rel;          /* borrowed: the caller keeps it open */
     TupleDesc       reldesc;
     TupleDesc       slot_desc;    /* shared TTSOpsVirtual desc for emitted rows */
@@ -226,7 +231,7 @@ typedef struct ExtendedCustomScanState
     CustomScanState css;          /* MUST be first field for IsA/castNode */
     /* our private state follows */
     OverlayScanState *scan;       /* streaming iterator; NULL until first Exec */
-    MemoryContext scan_cxt;       /* owns the iterator + every emitted slot */
+    MemoryContext scan_cxt;       /* owns the iterator + its per-row scratch */
     Relation      rel;
     Oid           relid;
     int32         branch_id;
@@ -395,6 +400,13 @@ overlay_scan_open(Relation rel, int32 branch_id,
 
     st = (OverlayScanState *) palloc0(sizeof(OverlayScanState));
     st->result_cxt    = CurrentMemoryContext;
+    /* Per-row scratch, a child of result_cxt reset at the top of every
+     * overlay_scan_next() call.  Keeping the emitted slot (and its datum
+     * copies) here instead of in result_cxt is what stops a large scan from
+     * growing the backend linearly with the row count. */
+    st->row_cxt       = AllocSetContextCreate(CurrentMemoryContext,
+                                              "overlay row scratch",
+                                              ALLOCSET_SMALL_SIZES);
     st->rel           = rel;
     st->reldesc       = reldesc;
     st->natts         = natts;
@@ -655,7 +667,11 @@ overlay_scan_next(OverlayScanState *st)
     if (st == NULL)
         return NULL;
 
-    oldcxt = MemoryContextSwitchTo(st->result_cxt);
+    /* Reclaim the scratch of the row handed back by the previous call (its
+     * consumer already copied what it needed) and build the next row there,
+     * so the footprint stays constant over an arbitrarily long scan. */
+    MemoryContextReset(st->row_cxt);
+    oldcxt = MemoryContextSwitchTo(st->row_cxt);
 
     /* ---------- Pass 1: MAIN baseline row merged with its delta ---------- */
     while (!st->pass1_done)
@@ -812,7 +828,7 @@ overlay_scan_next(OverlayScanState *st)
                              errmsg("overlay_scan_next: delta op=%c key=%s has NULL tuple_data",
                                     match->op, match->key)));
                 output_slot = reconstruct_slot_from_delta(st->rel, match->tuple_data,
-                                                          st->result_cxt);
+                                                          st->row_cxt);
                 ExecDropSingleTupleTableSlot(main_slot);
                 match->emitted = true;
             }
@@ -836,6 +852,13 @@ overlay_scan_next(OverlayScanState *st)
                 MemoryContextSwitchTo(oldcxt);
                 return output_slot;
             }
+
+            /* This MAIN row was tombstoned (output_slot == NULL).  Free its
+             * scratch before building the next one, so a branch that deletes a
+             * large fraction of MAIN stays constant-memory within one call too
+             * (the slot itself was already dropped above, but its datum copies
+             * are only reclaimed by the reset). */
+            MemoryContextReset(st->row_cxt);
         }
     }
 
@@ -871,7 +894,7 @@ overlay_scan_next(OverlayScanState *st)
                 continue;   /* defensive: already guarded */
 
             new_slot = reconstruct_slot_from_delta(st->rel, dt->tuple_data,
-                                                   st->result_cxt);
+                                                   st->row_cxt);
             dt->emitted = true;
             MemoryContextSwitchTo(oldcxt);
             return new_slot;
@@ -885,10 +908,11 @@ overlay_scan_next(OverlayScanState *st)
 /*
  * Release the transient resources of an iterator: the heap scan descriptor,
  * the buffer-heap probe slot and the delta payload (TopMemoryContext).  The
- * state itself, the shared slot descriptor and every emitted slot live in
- * result_cxt and are reclaimed by whoever owns it (ebs->scan_cxt reset/delete,
- * or the SRF's multi_call context); the relation is NOT closed here — it is
- * borrowed from the caller.
+ * state itself, the shared slot descriptor and the pre-materialised P0 rows
+ * live in result_cxt and are reclaimed by whoever owns it (ebs->scan_cxt
+ * reset/delete, or the SRF's multi_call context); the per-row scratch is a
+ * child of result_cxt and dies with it.  The relation is NOT closed here — it
+ * is borrowed from the caller.
  */
 static void
 overlay_scan_close(OverlayScanState *st)
@@ -2205,10 +2229,11 @@ ob_branchscan_end(CustomScanState *node)
         ebs->scan = NULL;
     }
 
-    /* Every emitted slot, its shared tupdesc and the iterator state live in
-     * scan_cxt (see ob_branchscan_begin).  Dropping the context reclaims them
-     * in one shot — no per-slot ExecDrop needed, and the slots must NOT be
-     * touched afterwards. */
+    /* The iterator state, its shared tupdesc, the pre-materialised P0 rows and
+     * the per-row scratch context all live under scan_cxt (see
+     * ob_branchscan_begin).  Dropping the context reclaims them in one shot —
+     * no per-slot ExecDrop needed, and nothing under it may be touched
+     * afterwards. */
     if (ebs->scan_cxt != NULL)
     {
         MemoryContextDelete(ebs->scan_cxt);
@@ -2257,9 +2282,9 @@ ob_branchscan_rescan(CustomScanState *node)
      * overlay_scan_open() re-reads the delta list and restarts the MAIN heap
      * scan, so a fresh materialization happens lazily (FR6).  Releasing the
      * iterator first frees the heap scan descriptor, the probe slot and the
-     * delta payload (TopMemoryContext); the emitted slots and the iterator
-     * state itself die with the scan_cxt reset.  Do NOT ExecDrop the already
-     * emitted slots — their memory is gone after the reset. */
+     * delta payload (TopMemoryContext); the iterator state, the P0 rows and the
+     * per-row scratch die with the scan_cxt reset.  Do NOT ExecDrop anything the
+     * iterator handed out — its memory is gone after the reset. */
     if (ebs->scan != NULL)
     {
         overlay_scan_close(ebs->scan);

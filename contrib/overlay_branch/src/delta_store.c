@@ -85,35 +85,38 @@ void
 overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 					 char op, const char *old_version, const char *tuple_json_cstr)
 {
-	StringInfoData sql;
-	char	   *q_key;
-	char	   *q_oldver;
 	int			ret;
-	StringInfoData gsql;
 	int			gret;
+	bytea	   *td = NULL;
+	Datum		state_values[1];
+	Datum		values[6];
+	char		nulls[6];
+	char		opbuf[2];
+	static const Oid state_argtypes[1] = {INT4OID};
+	static const Oid upsert_argtypes[6] = {INT4OID, OIDOID, TEXTOID,
+										   TEXTOID, TEXTOID, BYTEAOID};
+	MemoryContext caller_cxt = CurrentMemoryContext;
 
 	if (branch_id <= 0)
 		elog(ERROR, "overlay_delta_insert: invalid branch_id=%d", branch_id);
 
-	initStringInfo(&gsql);
-	appendStringInfo(&gsql,
-					 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
-					 "WHERE branch_id = %d LIMIT 1",
-					 (int) branch_id);
-	gret = ob_spi_one_shot(gsql.data, true, 1);
+	state_values[0] = Int32GetDatum(branch_id);
+	gret = ob_spi_exec_params(
+							 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
+							 "WHERE branch_id = $1 LIMIT 1",
+							 true, 1, 1, state_argtypes, state_values, NULL);
 	if (gret != SPI_OK_SELECT)
 	{
 		SPI_finish();
-		pfree(gsql.data);
 		elog(ERROR, "overlay_delta_insert: bid=%d state lookup SPI ret=%d",
 			 branch_id, gret);
 	}
 	if (SPI_processed == 0)
 	{
 		const char *bn;
+
 		SPI_finish();
 		bn = overlay_branch_get_current_name();
-		pfree(gsql.data);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("overlay_delta_insert: branch_id=%d does not exist",
@@ -134,9 +137,9 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 		if (isnull)
 		{
 			SPI_finish();
-			pfree(gsql.data);
 			{
 				const char *bn2 = overlay_branch_get_current_name();
+
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
 						 errmsg("overlay_delta_insert: bid=%d has NULL state "
@@ -146,21 +149,20 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 								 bn2 ? bn2 : "<none>")));
 			}
 		}
-		/* copy detoasted text C string into a context that outlives SPI_finish
-		 * (SPI proc context is torn down by finish; TopMemoryContext is safe,
-		 * mirroring apply_branch Step0).  Otherwise the returned string
-		 * pointer becomes dangling after SPI_finish, producing empty string /
-		 * garbage compare. */
-		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		/* Copy the detoasted text C string into the caller's context, which
+		 * outlives SPI_finish() (the raw datum lives in the SPI proc context
+		 * that finish tears down).  Not TopMemoryContext: this string is used
+		 * only here (freed on success, consumed by the ereport on failure),
+		 * so a TopMC copy would leak on every rejected write. */
+		oldmc = MemoryContextSwitchTo(caller_cxt);
 		st = TextDatumGetCString(v);
 		MemoryContextSwitchTo(oldmc);
 		SPI_finish();
 		if (st == NULL || strcmp(st, BRANCH_STATE_ACTIVE) != 0)
 		{
 			const char *bn;
-			char	   *saved_st = st ? pstrdup(st) : pstrdup("<NULL>");
+			const char *saved_st = st ? st : "<NULL>";
 
-			pfree(gsql.data);
 			bn = overlay_branch_get_current_name();
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -183,87 +185,75 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 		}
 		if (st) pfree(st);
 	}
-	pfree(gsql.data);
-
 	if (key == NULL)
 		elog(ERROR, "overlay_delta_insert: key must not be NULL");
 	if (op != DELTA_OP_INSERT && op != DELTA_OP_UPDATE && op != DELTA_OP_DELETE)
 		elog(ERROR, "overlay_delta_insert: invalid op '%c'", op);
 
-	q_key = quote_literal_cstr(key);
-	if (old_version != NULL)
-		q_oldver = quote_literal_cstr(old_version);
-	else
-		q_oldver = pstrdup("NULL");
+	opbuf[0] = op;
+	opbuf[1] = '\0';
 
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "INSERT INTO " OBTABLE_DELTA " "
-					 "(branch_id, relid, key, op, old_version, tuple_data) "
-					 "VALUES (%d, %u, %s, '%c', %s, ",
-					 branch_id, relid, q_key, op, q_oldver);
-
-	if (tuple_json_cstr == NULL)
+	/* Bind tuple_data as a BYTEA parameter: the raw bytes reach the executor
+	 * verbatim and round-trip every byte.  (The previous code built a
+	 * '\x..'::bytea hex literal for exactly this reason -- a plain text
+	 * literal would be mangled by bytea's legacy escape input format, which
+	 * rejects embedded double quotes and collapses backslashes.) */
+	if (tuple_json_cstr != NULL)
 	{
-		appendStringInfoString(&sql, "NULL");
-	}
-	else
-	{
-		/* Store the raw bytes as a hex bytea literal.
-		 *
-		 * A plain `(%s)::bytea` is parsed with bytea's *legacy escape*
-		 * input format, which silently mangles any backslash — i.e.
-		 * every JSON value containing a double quote (`\"` is rejected
-		 * outright) or a backslash (`\\` collapses to one byte).
-		 * convert_to(...,'UTF8') would fix that but rejects non-UTF8
-		 * input, and overlay_debug_delta_insert() legitimately stores
-		 * arbitrary bytes (e.g. DECODE('feedface','hex')).
-		 *
-		 * The hex form round-trips every byte verbatim and mirrors the
-		 * '\x..'::bytea literal the read path already builds. */
-		const char *p = tuple_json_cstr;
-		static const char hexdig[] = "0123456789abcdef";
 		Size		n = strlen(tuple_json_cstr);
-		Size		i;
 
-		appendStringInfoString(&sql, "'\\x");
-		for (i = 0; i < n; i++)
-		{
-			unsigned char c = (unsigned char) p[i];
-
-			appendStringInfoChar(&sql, hexdig[c >> 4]);
-			appendStringInfoChar(&sql, hexdig[c & 0x0F]);
-		}
-		appendStringInfoString(&sql, "'::bytea");
+		td = (bytea *) palloc(VARHDRSZ + n);
+		SET_VARSIZE(td, VARHDRSZ + n);
+		memcpy(VARDATA(td), tuple_json_cstr, n);
 	}
 
-	appendStringInfoString(&sql,
-						   ") ON CONFLICT (branch_id, relid, key) DO UPDATE SET "
-						   "op = EXCLUDED.op, "
-						   "old_version = EXCLUDED.old_version, "
-						   "tuple_data = EXCLUDED.tuple_data, "
-						   "updated_at = now()");
+	values[0] = Int32GetDatum(branch_id);
+	values[1] = ObjectIdGetDatum(relid);
+	values[2] = CStringGetTextDatum(key);
+	values[3] = CStringGetTextDatum(opbuf);
+	values[4] = old_version ? CStringGetTextDatum(old_version) : (Datum) 0;
+	values[5] = tuple_json_cstr ? PointerGetDatum(td) : (Datum) 0;
+	nulls[0] = ' ';
+	nulls[1] = ' ';
+	nulls[2] = ' ';
+	nulls[3] = ' ';
+	nulls[4] = old_version ? ' ' : 'n';
+	nulls[5] = tuple_json_cstr ? ' ' : 'n';
+
+	ret = ob_spi_exec_params(
+							 "INSERT INTO " OBTABLE_DELTA " "
+							 "(branch_id, relid, key, op, old_version, tuple_data) "
+							 "VALUES ($1, $2, $3, ($4)::bpchar, $5, $6) "
+							 "ON CONFLICT (branch_id, relid, key) DO UPDATE SET "
+							 "op = EXCLUDED.op, "
+							 "old_version = EXCLUDED.old_version, "
+							 "tuple_data = EXCLUDED.tuple_data, "
+							 "updated_at = now()",
+							 false, 1, 6, upsert_argtypes, values, nulls);
+
+	/* WR-1a: the bound parameter datums are transient.  Free them as soon as
+	 * the plan has run so the per-row write path stays allocation-neutral in
+	 * the caller's (statement-lifetime) memory context -- the previous
+	 * literal-interpolation code free()d its StringInfo / quoted literals the
+	 * same way. */
+	if (td != NULL)
+		pfree(td);
+	pfree(DatumGetPointer(values[2]));
+	pfree(DatumGetPointer(values[3]));
+	if (old_version != NULL)
+		pfree(DatumGetPointer(values[4]));
 
 	ereport(DEBUG1,
-			(errmsg_internal("ODI[dbg] calling SPI, sql=%s", sql.data)));
-
-	ret = ob_spi_one_shot(sql.data, false, 1);
-
-	ereport(DEBUG1,
-			(errmsg_internal("ODI[dbg] SPI_execute ret=%d processed=%lu",
+			(errmsg_internal("ODI[dbg] SPI_execute_plan ret=%d processed=%lu",
 							 ret, (unsigned long) SPI_processed)));
 
 	if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
 	{
 		SPI_finish();
-		elog(ERROR, "overlay_delta_insert: SPI_execute failed ret=%d", ret);
+		elog(ERROR, "overlay_delta_insert: SPI_execute_plan failed ret=%d", ret);
 	}
 
 	SPI_finish();
-
-	pfree(sql.data);
-	pfree(q_key);
-	pfree(q_oldver);
 }
 
 void
@@ -277,22 +267,17 @@ bool
 overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 					 DeltaTuple *out_tuple)
 {
-	StringInfoData sql;
-	char	   *q_key;
+	Datum		values[3];
+	static const Oid argtypes[3] = {INT4OID, OIDOID, TEXTOID};
 	int			ret;
 	bool		found = false;
 
 	if (key == NULL || out_tuple == NULL)
 		elog(ERROR, "overlay_delta_lookup: key and out_tuple must not be NULL");
 
-	q_key = quote_literal_cstr(key);
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "SELECT branch_id, relid, key, op, old_version, tuple_data "
-					 "FROM " OBTABLE_DELTA " "
-					 "WHERE branch_id = %d AND relid = %u AND key = %s "
-					 "LIMIT 1",
-					 branch_id, relid, q_key);
+	values[0] = Int32GetDatum(branch_id);
+	values[1] = ObjectIdGetDatum(relid);
+	values[2] = CStringGetTextDatum(key);
 
 	/* The outer caller may be a cursor whose DECLARE-time snapshot freezes
 	 * snapshot->curcid before this same-txn WR INSERT ran.  Push the latest
@@ -301,14 +286,21 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 	 * Push/Pop uses FirstSnapshotSet; PopActiveSnapshot auto-frees snapshots
 	 * with zero active_count+regd_count (see snapmgr.c L743-763). */
 	PushActiveSnapshot(GetLatestSnapshot());
-	ret = ob_spi_one_shot(sql.data, true, 1);
+	ret = ob_spi_exec_params(
+							 "SELECT branch_id, relid, key, op, old_version, tuple_data "
+							 "FROM " OBTABLE_DELTA " "
+							 "WHERE branch_id = $1 AND relid = $2 AND key = $3 "
+							 "LIMIT 1",
+							 true, 1, 3, argtypes, values, NULL);
 	PopActiveSnapshot();
+
+	/* WR-1a: release the transient key parameter (see overlay_delta_insert). */
+	pfree(DatumGetPointer(values[2]));
+
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();
-		pfree(sql.data);
-		pfree(q_key);
-		elog(ERROR, "overlay_delta_lookup: SPI_execute failed ret=%d", ret);
+		elog(ERROR, "overlay_delta_lookup: SPI_execute_plan failed ret=%d", ret);
 	}
 
 	if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
@@ -392,8 +384,6 @@ overlay_delta_lookup(int32 branch_id, Oid relid, const char *key,
 	}
 
 	SPI_finish();
-	pfree(sql.data);
-	pfree(q_key);
 	return found;
 }
 
@@ -629,31 +619,42 @@ slot_get_ctid_cstr(TupleTableSlot *slot)
 	return NULL;
 }
 
+/*
+ * Fetch a clean relation-shaped slot for the physical row at ctid_cstr.
+ *
+ * result_cxt owns the returned slot, its CreateTupleDescCopy()'d tupdesc and
+ * every datumCopy() of the fetched column values, mirroring
+ * reconstruct_slot_from_delta().  NULL means CurrentMemoryContext.  This used
+ * to allocate everything in TopMemoryContext, so every UPDATE/DELETE row
+ * redirected through the write path leaked one tupdesc + slot shell + toasted
+ * value copies for the whole backend lifetime (MF-1): ExecDropSingleTupleTableSlot()
+ * only pfree()s the slot and ReleaseTupleDesc() is a no-op for the -1-refcount
+ * copy, so nothing reclaimed those chunks.
+ */
 TupleTableSlot *
-fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
+fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
+					MemoryContext result_cxt)
 {
-	StringInfoData sql;
 	int			ret;
 	TupleTableSlot *out_slot;
 	TupleDesc	reldesc = RelationGetDescr(rel);
-	char	   *q_relname;
-	char	   *q_ctid;
+	char	   *sql;
+	Datum		values[1];
+	static const Oid argtypes[1] = {TEXTOID};
 
 	overlay_overlay_helper_enter();
 
-	initStringInfo(&sql);
-	q_relname = quote_qualified_identifier(
-		get_namespace_name(RelationGetNamespace(rel)),
-		RelationGetRelationName(rel));
-	q_ctid = quote_literal_cstr(ctid_cstr);
+	/* WR-1a: relation name stays inline (the cached plan is keyed on the
+	 * full statement text); ctid is bound as $1 rather than interpolated. */
+	sql = psprintf("SELECT * FROM %s WHERE ctid = $1::tid LIMIT 1",
+				   quote_qualified_identifier(
+					   get_namespace_name(RelationGetNamespace(rel)),
+					   RelationGetRelationName(rel)));
+	values[0] = CStringGetTextDatum(ctid_cstr);
 
-	appendStringInfo(&sql, "SELECT * FROM %s WHERE ctid = %s::tid LIMIT 1",
-					 q_relname, q_ctid);
-	pfree(q_relname);
-	pfree(q_ctid);
-
-	ret = ob_spi_one_shot(sql.data, true, 1);
-	pfree(sql.data);
+	ret = ob_spi_exec_params(sql, true, 1, 1, argtypes, values, NULL);
+	pfree(sql);
+	pfree(DatumGetPointer(values[0]));
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
 		SPI_tuptable == NULL || SPI_tuptable->vals == NULL)
@@ -671,7 +672,8 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr)
 		TupleDesc	td_spi = SPI_tuptable->tupdesc;
 		MemoryContext oldmc;
 
-		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		oldmc = MemoryContextSwitchTo(result_cxt != NULL ? result_cxt
+														 : CurrentMemoryContext);
 		{
 			TupleDesc	slot_desc = CreateTupleDescCopy(reldesc);
 
@@ -1487,13 +1489,13 @@ overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
 char *
 overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 {
-	StringInfoData sql;
 	int			ret;
-	char	   *q_relname;
-	char	   *q_ctid;
+	char	   *sql;
 	char	   *ctid_cstr;
 	char	   *result = NULL;
 	bool		ctid_cstr_allocated = false;
+	Datum		values[1];
+	static const Oid argtypes[1] = {TEXTOID};
 
 	if (rel == NULL || slot == NULL)
 		return NULL;
@@ -1516,19 +1518,16 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 
 	overlay_overlay_helper_enter();
 
-	initStringInfo(&sql);
-	q_relname = quote_qualified_identifier(
-		get_namespace_name(RelationGetNamespace(rel)),
-		RelationGetRelationName(rel));
-	q_ctid = quote_literal_cstr(ctid_cstr);
-	appendStringInfo(&sql,
-					 "SELECT ctid::text, xmin::text FROM %s WHERE ctid = %s::tid LIMIT 1",
-					 q_relname, q_ctid);
-	pfree(q_relname);
-	pfree(q_ctid);
+	/* WR-1a: ctid bound as $1; relation name stays inline (plan-cache key). */
+	sql = psprintf("SELECT ctid::text, xmin::text FROM %s WHERE ctid = $1::tid LIMIT 1",
+				   quote_qualified_identifier(
+					   get_namespace_name(RelationGetNamespace(rel)),
+					   RelationGetRelationName(rel)));
+	values[0] = CStringGetTextDatum(ctid_cstr);
 
-	ret = ob_spi_one_shot(sql.data, true, 1);
-	pfree(sql.data);
+	ret = ob_spi_exec_params(sql, true, 1, 1, argtypes, values, NULL);
+	pfree(sql);
+	pfree(DatumGetPointer(values[0]));
 
 	if (ret == SPI_OK_SELECT && SPI_processed == 1 &&
 		SPI_tuptable && SPI_tuptable->vals && SPI_tuptable->vals[0])

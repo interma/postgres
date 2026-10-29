@@ -120,17 +120,23 @@ SELECT count(*) FROM public.ob_perf_base;
 SELECT pg_size_pretty(sum(total_bytes)) AS backend_mem FROM pg_backend_memory_contexts;
 
 -- ------------------------------------------------------------ build delta
+-- M10 (write path): the three redirected DML kinds are timed separately so
+-- the per-row redirect cost (delta upsert + ctid fetch + version) is
+-- measurable.  See doc/performance.md §8.6 / stage 5 (WR-1).
 \echo ''
-\echo '=========== BUILD delta: UPDATE/DELETE/INSERT to reach M rows =========='
-\timing off
+\echo '===== M10a: write path UPDATE  (m/2 rows, redirected to delta) ====='
+\timing on
 UPDATE public.ob_perf_base
    SET payload = payload || '_u'
  WHERE id <= (:m) / 2;
+\echo '===== M10b: write path DELETE  (m/4 rows, redirected to delta) ====='
 DELETE FROM public.ob_perf_base
  WHERE id > (:n) - (:m) / 4;
+\echo '===== M10c: write path INSERT  (m/4 rows, redirected to delta) ====='
 INSERT INTO public.ob_perf_base (id, grp, payload)
 SELECT (:n) + g, 0, repeat('y', 80)
   FROM generate_series(1, (:m) / 4) AS g;
+\timing off
 
 -- delta shape sanity (rows per op must sum to m)
 \echo ''

@@ -247,6 +247,7 @@ ob_check_branch_scope(void)
 	int			ret;
 	StringInfoData sql;
 	char	   *detail;
+	MemoryContext caller_cxt = CurrentMemoryContext;
 
 	initStringInfo(&sql);
 	appendStringInfoString(&sql,
@@ -379,7 +380,15 @@ ob_check_branch_scope(void)
 		return;
 	}
 
+	/* SPI_getvalue() returns a pointer into the SPI proc context, which
+	 * SPI_finish() destroys.  Copy it into the caller's context first: the
+	 * ereport below expands its %s immediately, so the copy only has to
+	 * outlive SPI_finish() and must not be parked in TopMemoryContext (this
+	 * error path never returns, so a TopMC copy would leak on every rejected
+	 * create_branch()). */
 	detail = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	if (detail != NULL)
+		detail = MemoryContextStrdup(caller_cxt, detail);
 	SPI_finish();
 	if (detail != NULL && *detail != '\0')
 	{
@@ -603,20 +612,48 @@ ob_mode_cache_remove(int32 bid)
 
 /* ============ Internal apply helpers (static to this TU) ============ */
 
-static char *ob_build_pk_where_clause(Relation rel, const char *pk_json_array);
-static char *ob_build_identity_where_clause(Relation rel, const char *key);
-static TupleTableSlot *ob_fetch_main_current_slot(Relation rel, const char *where_clause);
+/*
+ * ObApplyRelInfo - per-relation apply metadata, built once per relation in the
+ * apply loop so the per-delta-row path stops recomputing the qualified table
+ * name, the column lists and the PK column name/type literals.
+ */
+typedef struct ObApplyRelInfo
+{
+	Relation	rel;
+	Oid			relid;
+	char	   *q_relname;			/* schema-qualified, quoted table name */
+	int			n_pk;				/* PK column count; 0 => no PK (keyless) */
+	char	  **pk_colname;			/* per PK col: raw attribute name */
+	char	  **pk_coltype;			/* per PK col: format_type_with_typemod() */
+	char	   *colnames;			/* "a","b" (quoted identifiers) */
+	char	   *colnames_parens;	/* j."a",j."b" */
+	Oid			bytea_out_func;		/* bytea output function for tuple_data */
+	bool		bytea_out_varlena;
+} ObApplyRelInfo;
+
+static ObApplyRelInfo *ob_apply_rel_info_build(Relation rel);
+static void ob_apply_rel_info_free(ObApplyRelInfo *ri);
+static char *ob_build_pk_where_clause(ObApplyRelInfo *ri, const char *pk_json_array);
+static char *ob_build_identity_where_clause(ObApplyRelInfo *ri, const char *key);
+static bool ob_fetch_main_version(ObApplyRelInfo *ri, const char *where_clause,
+								  char **version);
 /* branch_name is threaded down so apply-time conflict errors name the branch
  * being applied (apply runs outside branch mode — see overlay_guard_ereport_fail). */
-static void apply_check_base_image_match(Relation rel, DeltaTuple *dt,
+static void apply_check_base_image_match(ObApplyRelInfo *ri, DeltaTuple *dt,
 										 const char *where_clause,
 										 const char *branch_name);
-static void apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
+static void apply_relation_delete_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 									   const char *branch_name);
-static void apply_relation_update_pass(Relation rel, DeltaTuple *dt,
+static void apply_relation_update_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 									   const char *branch_name);
-static void apply_relation_insert_pass(Relation rel, DeltaTuple *dt,
+static void apply_relation_insert_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 									   const char *branch_name);
+/* Phase 3B: set-based replay (one statement per relation and operation). */
+static void ob_apply_relation_per_row(ObApplyRelInfo *ri, List *deltas,
+									  const char *branch_name);
+static bool ob_apply_batch_can_use(ObApplyRelInfo *ri, List *deltas);
+static void ob_apply_relation_batch(ObApplyRelInfo *ri, int32 bid, List *deltas,
+									const char *branch_name);
 
 /* ================================================================
  * §G06 最小防泄漏：检测当前数据库是否存在任何 publication
@@ -830,6 +867,7 @@ ob_registry_check_current_schema(int32 bid, const char *op_name)
 	StringInfoData sql;
 	int ret;
 	bool	any_rows;
+	MemoryContext caller_cxt = CurrentMemoryContext;
 
 	if (bid <= 0)
 		return;
@@ -949,8 +987,10 @@ ob_registry_check_current_schema(int32 bid, const char *op_name)
 	ret = SPI_execute(sql.data, true, 1);
 	if (ret != SPI_OK_SELECT)
 	{
-		char *saved = pstrdup(sql.data);
-		pfree(sql.data);
+		/* sql.data lives in the SPI proc context; copy it into the caller's
+		 * context before SPI_finish() destroys it (doc/performance.md §8.5). */
+		char *saved = MemoryContextStrdup(caller_cxt, sql.data);
+
 		SPI_finish();
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -974,11 +1014,14 @@ ob_registry_check_current_schema(int32 bid, const char *op_name)
 			detail_text = "unknown schema drift";
 		else
 		{
+			/* text_to_cstring() allocates in the current (SPI proc) context;
+			 * keep only the copy in the caller's context.  TopMemoryContext
+			 * is wrong here: this error path never returns, so anything left
+			 * there leaks on every drift detection. */
 			text *t = DatumGetTextPP(d_detail);
-			MemoryContext oldmc;
-			oldmc = MemoryContextSwitchTo(TopMemoryContext);
-			detail_text = pstrdup(text_to_cstring(t));
-			MemoryContextSwitchTo(oldmc);
+
+			detail_text = MemoryContextStrdup(caller_cxt,
+											  text_to_cstring(t));
 		}
 		pfree(sql.data);
 		SPI_finish();
@@ -1013,8 +1056,10 @@ ob_registry_check_current_schema(int32 bid, const char *op_name)
 		ret = SPI_execute(ins.data, false, 0);
 		if (ret != SPI_OK_INSERT)
 		{
-			char *saved = pstrdup(ins.data);
-			pfree(ins.data);
+			/* ins.data lives in the SPI proc context; copy it out before
+			 * SPI_finish() (doc/performance.md §8.5). */
+			char *saved = MemoryContextStrdup(caller_cxt, ins.data);
+
 			SPI_finish();
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
@@ -2509,45 +2554,29 @@ overlay_branch_apply_internal(const char *branch_name)
 				Oid			relid = lfirst_oid(rlc);
 				List	   *deltas;
 				ListCell   *dlc;
+				ObApplyRelInfo *ri;
 
 				elog(DEBUG1, "apply[dbg] rel=%u table_open", (unsigned) relid);
 				if (rel != NULL)
 					table_close(rel, NoLock);
 				rel = table_open(relid, RowExclusiveLock);
+				ri = ob_apply_rel_info_build(rel);
 
 				elog(DEBUG1, "apply[dbg] overlay_delta_list_for_rel");
 				deltas = overlay_delta_list_for_rel(bid, relid);
 				elog(DEBUG1, "apply[dbg] delta count=%d", list_length(deltas));
 
-				foreach(dlc, deltas)
+				/* Phase 3B: a single set-based statement per operation when
+				 * the relation qualifies, else the legacy per-row replay. */
+				if (ob_apply_batch_can_use(ri, deltas))
 				{
-					DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-					if (dt->op == DELTA_OP_DELETE)
-					{
-						elog(DEBUG1, "apply[dbg] DELETE pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_delete_pass(rel, dt, branch_name);
-						elog(DEBUG1, "apply[dbg] DELETE pass DONE");
-					}
+					elog(DEBUG1, "apply[dbg] batch replay");
+					ob_apply_relation_batch(ri, bid, deltas, branch_name);
 				}
-				foreach(dlc, deltas)
+				else
 				{
-					DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-					if (dt->op == DELTA_OP_UPDATE)
-					{
-						elog(DEBUG1, "apply[dbg] UPDATE pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_update_pass(rel, dt, branch_name);
-						elog(DEBUG1, "apply[dbg] UPDATE pass DONE");
-					}
-				}
-				foreach(dlc, deltas)
-				{
-					DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-					if (dt->op == DELTA_OP_INSERT)
-					{
-						elog(DEBUG1, "apply[dbg] INSERT pass key=%s", dt->key ? dt->key : "NULL");
-						apply_relation_insert_pass(rel, dt, branch_name);
-						elog(DEBUG1, "apply[dbg] INSERT pass DONE");
-					}
+					elog(DEBUG1, "apply[dbg] per-row replay");
+					ob_apply_relation_per_row(ri, deltas, branch_name);
 				}
 
 				elog(DEBUG1, "apply[dbg] freeing deltas");
@@ -2560,6 +2589,7 @@ overlay_branch_apply_internal(const char *branch_name)
 					pfree(dt);
 				}
 				list_free(deltas);
+				ob_apply_rel_info_free(ri);
 				elog(DEBUG1, "apply[dbg] rel loop end");
 			}
 			if (rel != NULL)
@@ -2854,232 +2884,124 @@ overlay_branch_discard_internal(const char *branch_name)
  * ================================================================ */
 
 /*
- * ob_build_pk_where_clause — produce "pkcol1 = v1::type1 AND ..."
+ * ob_build_pk_where_clause - produce "pkcol1 = v1::type1 AND ..."
  * from a serialized JSON-array PK (DeltaTuple->key).
+ *
+ * Single SPI round-trip (3A.1): the JSON key is passed once; a bare
+ * targetlist returns jsonb_array_length() plus each array element as text.
+ * The final conjunctive WHERE clause is folded together in C from the
+ * per-relation ObApplyRelInfo cache (raw column names and format_type
+ * strings), so the per-row path performs no catalog access and the planned
+ * statement stays a trivial no-FROM select.  This matters because apply
+ * plans this statement once per delta row and planning time, not SPI call
+ * count, dominates the per-row cost.
  */
 static char *
-ob_build_pk_where_clause(Relation rel, const char *pk_json_array)
+ob_build_pk_where_clause(ObApplyRelInfo *ri, const char *pk_json_array)
 {
-	List	   *indexoids;
-	ListCell   *lc;
-	Oid			pk_index_oid = InvalidOid;
-	Relation	pk_rel = NULL;
-	TupleDesc	reldesc = RelationGetDescr(rel);
-	int			n_pk;
-	int			i;
-	StringInfoData colbuf;
 	StringInfoData sql;
+	StringInfoData where;
 	int			ret;
-	char	   *result = NULL;
+	int			json_len = 0;
+	char	   *q_pk;
+	char	  **vals;
+	char	   *result;
+	int			i;
+	MemoryContext entry_cxt = CurrentMemoryContext;
 
-	Assert(rel != NULL && pk_json_array != NULL);
+	Assert(ri != NULL && pk_json_array != NULL);
 
-	indexoids = RelationGetIndexList(rel);
-	foreach(lc, indexoids)
-	{
-		Oid			idxoid = lfirst_oid(lc);
-		Relation	idxrel;
-
-		idxrel = index_open(idxoid, AccessShareLock);
-		if (idxrel->rd_index && idxrel->rd_index->indisprimary)
-		{
-			pk_index_oid = idxoid;
-			pk_rel = idxrel;
-			break;
-		}
-		index_close(idxrel, AccessShareLock);
-	}
-	if (!OidIsValid(pk_index_oid) || pk_rel == NULL)
+	if (ri->n_pk <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("apply requires a primary key on %s",
-						RelationGetRelationName(rel))));
+						RelationGetRelationName(ri->rel))));
 
-	n_pk = pk_rel->rd_index->indnatts;
-	if (n_pk == 0)
-	{
-		index_close(pk_rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("apply requires primary key columns on %s",
-						RelationGetRelationName(rel))));
-	}
-
-	{
-		int			json_len = 0;
-		char	   *q_pk;
-		StringInfoData len_sql;
-		char	  **pk_texts;
-
-		elog(DEBUG1, "bpk[dbg] 1 json_len check, pk=%s", pk_json_array);
-		q_pk = quote_literal_cstr(pk_json_array);
-		initStringInfo(&len_sql);
-		appendStringInfo(&len_sql,
-						 "SELECT jsonb_array_length(%s::jsonb)", q_pk);
-		ret = ob_spi_one_shot(len_sql.data, true, 1);
-		pfree(len_sql.data);
-		if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
-			!SPI_tuptable || !SPI_tuptable->vals)
-		{
-			SPI_finish();
-			pfree(q_pk);
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("apply jsonb_array_length SPI call failed ret=%d", ret)));
-		}
-		{
-			bool		isnull;
-			Datum		v;
-
-			v = SPI_getbinval(SPI_tuptable->vals[0],
-							 SPI_tuptable->tupdesc, 1, &isnull);
-			if (!isnull)
-				json_len = DatumGetInt32(v);
-		}
-		SPI_finish();
-		elog(DEBUG1, "bpk[dbg] 2 json_len=%d n_pk=%d", json_len, n_pk);
-
-		if (json_len != n_pk)
-		{
-			pfree(q_pk);
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("apply pk JSON length %d differs from PK column count %d on %s",
-							json_len, n_pk, RelationGetRelationName(rel))));
-		}
-
-		pk_texts = (char **) palloc0(sizeof(char *) * n_pk);
-		elog(DEBUG1, "bpk[dbg] 3 pk_val loop n_pk=%d", n_pk);
-		for (i = 0; i < n_pk; i++)
-		{
-			StringInfoData val_sql;
-
-			elog(DEBUG1, "bpk[dbg] 3a i=%d START", i);
-			initStringInfo(&val_sql);
-			appendStringInfo(&val_sql,
-							 "SELECT (%s::jsonb)->%d #>> '{}'",
-							 q_pk, i);
-			elog(DEBUG1, "bpk[dbg] 3b i=%d sql=%s", i, val_sql.data);
-			ret = ob_spi_one_shot(val_sql.data, true, 1);
-			elog(DEBUG1, "bpk[dbg] 3c i=%d ret=%d", i, ret);
-			pfree(val_sql.data);
-			if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
-				!SPI_tuptable || !SPI_tuptable->vals)
-			{
-				int j;
-				for (j = 0; j < i; j++) if (pk_texts[j]) pfree(pk_texts[j]);
-				pfree(pk_texts);
-				SPI_finish();
-				pfree(q_pk);
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("apply pk value extract failed i=%d", i)));
-			}
-			{
-				bool		isnull;
-				char	   *txt = SPI_getvalue(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1);
-
-				elog(DEBUG1, "bpk[dbg] 3d i=%d txt=%s", i, txt ? txt : "NULL");
-				isnull = (txt == NULL);
-				if (!isnull)
-				{
-					MemoryContext oldmc;
-					oldmc = MemoryContextSwitchTo(TopMemoryContext);
-					pk_texts[i] = pstrdup(txt ? txt : "");
-					MemoryContextSwitchTo(oldmc);
-				}
-				else
-					pk_texts[i] = NULL;
-				elog(DEBUG1, "bpk[dbg] 3e i=%d pktext=%s", i, pk_texts[i] ? pk_texts[i] : "NULL");
-			}
-			elog(DEBUG1, "bpk[dbg] 3f i=%d SPI_finish", i);
-			SPI_finish();
-			elog(DEBUG1, "bpk[dbg] 3g i=%d DONE", i);
-		}
-		elog(DEBUG1, "bpk[dbg] 4 pfree q_pk");
-		pfree(q_pk);
-		elog(DEBUG1, "bpk[dbg] 5 build colbuf VALUES");
-
-		initStringInfo(&colbuf);
-		for (i = 0; i < n_pk; i++)
-		{
-			AttrNumber	attno = pk_rel->rd_index->indkey.values[i];
-			Form_pg_attribute att;
-			char	   *qname;
-			char	   *qtype;
-			char	   *qval;
-
-			elog(DEBUG1, "bpk[dbg] 5a i=%d", i);
-			if (attno == 0)
-				continue;
-			elog(DEBUG1, "bpk[dbg] 5a2 i=%d attno=%d", i, attno);
-			att = TupleDescAttr(reldesc, attno - 1);
-			elog(DEBUG1, "bpk[dbg] 5a3 i=%d attname=%s", i, NameStr(att->attname));
-			qname = quote_literal_cstr(NameStr(att->attname));
-			elog(DEBUG1, "bpk[dbg] 5a4 i=%d qname=%s", i, qname);
-			qtype = quote_literal_cstr(format_type_with_typemod(att->atttypid, att->atttypmod));
-			elog(DEBUG1, "bpk[dbg] 5a5 i=%d qtype=%s", i, qtype);
-			if (pk_texts[i] != NULL)
-				qval = quote_literal_cstr(pk_texts[i]);
-			else
-				qval = pstrdup("NULL");
-			elog(DEBUG1, "bpk[dbg] 5a6 i=%d qval=%s", i, qval);
-			if (i > 0)
-				appendStringInfoChar(&colbuf, ',');
-			appendStringInfo(&colbuf,
-							 "(%s,%s,%d,%s)",
-							 qname, qtype, i + 1, qval);
-			elog(DEBUG1, "bpk[dbg] 5a7 i=%d appended len=%d", i, (int) colbuf.len);
-			(void) qname;
-			(void) qtype;
-			(void) qval;
-			elog(DEBUG1, "bpk[dbg] 5a8 i=%d before pk_texts[i] pfree", i);
-			if (pk_texts[i]) {
-				pfree(pk_texts[i]);
-			}
-			elog(DEBUG1, "bpk[dbg] 5a9 i=%d loop end", i);
-		}
-		elog(DEBUG1, "bpk[dbg] 6 pfree pk_texts");
-		pfree(pk_texts);
-		elog(DEBUG1, "bpk[dbg] 7 index_close");
-		index_close(pk_rel, AccessShareLock);
-	}
-	elog(DEBUG1, "bpk[dbg] 8 string_agg SPI");
+	q_pk = quote_literal_cstr(pk_json_array);
 
 	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "SELECT string_agg("
-					 "quote_ident(v.colname) || ' = ' || "
-					 "CASE WHEN v.val IS NULL THEN 'NULL' ELSE quote_nullable(v.val) || '::' || v.typname END, "
-					 "' AND ' ORDER BY v.n) "
-					 "FROM (VALUES %s) AS v(colname,typname,n,val)",
-					 colbuf.data);
+	appendStringInfo(&sql, "SELECT jsonb_array_length(%s::jsonb)", q_pk);
+	for (i = 0; i < ri->n_pk; i++)
+		appendStringInfo(&sql, ", (%s::jsonb)->>%d", q_pk, i);
 
 	ret = ob_spi_one_shot(sql.data, true, 1);
 	pfree(sql.data);
-	elog(DEBUG1, "bpk[dbg] 9 copy result");
-	if (ret == SPI_OK_SELECT && SPI_processed == 1 &&
-		SPI_tuptable && SPI_tuptable->vals && SPI_tuptable->vals[0])
+	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+		!SPI_tuptable || !SPI_tuptable->vals || !SPI_tuptable->vals[0])
+	{
+		pfree(q_pk);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply pk where build SPI call failed ret=%d", ret)));
+	}
+
 	{
 		bool		isnull;
-		char	   *txt = SPI_getvalue(SPI_tuptable->vals[0],
-									   SPI_tuptable->tupdesc, 1);
+		Datum		v;
 
-		isnull = (txt == NULL);
+		v = SPI_getbinval(SPI_tuptable->vals[0],
+						  SPI_tuptable->tupdesc, 1, &isnull);
 		if (!isnull)
-		{
-			MemoryContext oldmc;
-
-			oldmc = MemoryContextSwitchTo(TopMemoryContext);
-			result = pstrdup(txt ? txt : "");
-			MemoryContextSwitchTo(oldmc);
-		}
+			json_len = DatumGetInt32(v);
 	}
-	elog(DEBUG1, "bpk[dbg] 10 SPI_finish + pfree colbuf");
+	if (json_len != ri->n_pk)
+	{
+		pfree(q_pk);
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("apply pk JSON length %d differs from PK column count %d on %s",
+						json_len, ri->n_pk, RelationGetRelationName(ri->rel))));
+	}
+
+	/* Copy the element texts out before SPI_finish() tears the result down.
+	 * SPI_getvalue() allocates in the *current* context — which here is the
+	 * SPI proc context — so switch to the caller's context first.  Going
+	 * through TopMemoryContext would leak one string per PK column per call
+	 * (these are function-local and freed below). */
+	{
+		MemoryContext oldmc;
+
+		oldmc = MemoryContextSwitchTo(entry_cxt);
+		vals = (char **) palloc0(sizeof(char *) * ri->n_pk);
+		for (i = 0; i < ri->n_pk; i++)
+			vals[i] = SPI_getvalue(SPI_tuptable->vals[0],
+								   SPI_tuptable->tupdesc, i + 2);
+		MemoryContextSwitchTo(oldmc);
+	}
 	SPI_finish();
-	pfree(colbuf.data);
-	elog(DEBUG1, "bpk[dbg] END result=%s", result ? result : "NULL");
+	pfree(q_pk);
+
+	initStringInfo(&where);
+	for (i = 0; i < ri->n_pk; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&where, " AND ");
+		appendStringInfo(&where, "%s = ",
+						 quote_identifier(ri->pk_colname[i]));
+		if (vals[i] == NULL)
+			appendStringInfoString(&where, "NULL");
+		else
+		{
+			char	   *lit = quote_literal_cstr(vals[i]);
+
+			appendStringInfo(&where, "%s::%s", lit, ri->pk_coltype[i]);
+			pfree(lit);
+		}
+		if (vals[i])
+			pfree(vals[i]);
+	}
+	pfree(vals);
+
+	{
+		MemoryContext oldmc;
+
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		result = pstrdup(where.data);
+		MemoryContextSwitchTo(oldmc);
+	}
+	pfree(where.data);
 	return result;
 }
 
@@ -3095,7 +3017,7 @@ ob_build_pk_where_clause(Relation rel, const char *pk_json_array)
  * on MAIN (callers treat NULL as "row absent").
  */
 static char *
-ob_build_identity_where_clause(Relation rel, const char *key)
+ob_build_identity_where_clause(ObApplyRelInfo *ri, const char *key)
 {
 	Assert(key != NULL);
 
@@ -3108,126 +3030,209 @@ ob_build_identity_where_clause(Relation rel, const char *key)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("apply on %s: malformed keyless anchor key \"%s\"",
-							RelationGetRelationName(rel), key)));
+							RelationGetRelationName(ri->rel), key)));
 		return psprintf("ctid = '(%u,%u)'::tid", blk, off);
 	}
 
 	if (key[0] == 'S' && key[1] == ':')
 		return NULL;			/* synthetic branch-only row: no MAIN anchor */
 
-	return ob_build_pk_where_clause(rel, key);
+	return ob_build_pk_where_clause(ri, key);
 }
 
 /*
- * ob_fetch_main_current_slot: given pk WHERE clause, fetch MAIN row
- * and return a clean TupleTableSlot (or NULL).
+ * ob_apply_rel_info_build - compute the per-relation apply metadata once per
+ * relation, so the per-delta-row path stops re-deriving the qualified table
+ * name, the column lists and the PK column name/type literals (3A.4).
  */
-static TupleTableSlot *
-ob_fetch_main_current_slot(Relation rel, const char *where_clause)
+static ObApplyRelInfo *
+ob_apply_rel_info_build(Relation rel)
 {
-	StringInfoData sql;
-	char	   *q_relname;
-	int			ret;
-	TupleTableSlot *result = NULL;
+	ObApplyRelInfo *ri;
 	TupleDesc	reldesc = RelationGetDescr(rel);
-	TupleDesc	copy_desc;
-	int			natts = reldesc->natts;
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pk_index_oid = InvalidOid;
+	Relation	pk_rel = NULL;
+	StringInfoData colnames;
+	StringInfoData colnames_parens;
+	bool		first = true;
+	int			i;
+	MemoryContext oldmc;
 
-	q_relname = quote_qualified_identifier(
+	ri = (ObApplyRelInfo *) palloc0(sizeof(ObApplyRelInfo));
+	ri->rel = rel;
+	ri->relid = RelationGetRelid(rel);
+	ri->n_pk = 0;
+
+	oldmc = MemoryContextSwitchTo(TopMemoryContext);
+
+	ri->q_relname = quote_qualified_identifier(
 		get_namespace_name(RelationGetNamespace(rel)),
 		RelationGetRelationName(rel));
 
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "SELECT * FROM %s WHERE %s LIMIT 1",
-					 q_relname, where_clause);
-	pfree(q_relname);
+	initStringInfo(&colnames);
+	initStringInfo(&colnames_parens);
+	for (i = 0; i < reldesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(reldesc, i);
 
-	ret = ob_spi_one_shot(sql.data, true, 1);
+		if (att->attisdropped)
+			continue;
+		if (!first)
+		{
+			appendStringInfoChar(&colnames, ',');
+			appendStringInfoChar(&colnames_parens, ',');
+		}
+		appendStringInfo(&colnames, "%s",
+						 quote_identifier(NameStr(att->attname)));
+		appendStringInfo(&colnames_parens, "j.%s",
+						 quote_identifier(NameStr(att->attname)));
+		first = false;
+	}
+	ri->colnames = colnames.data;
+	ri->colnames_parens = colnames_parens.data;
+
+	getTypeOutputInfo(BYTEAOID, &ri->bytea_out_func, &ri->bytea_out_varlena);
+
+	MemoryContextSwitchTo(oldmc);
+
+	/* Locate the primary key, if any (keyless tables have none). */
+	indexoids = RelationGetIndexList(rel);
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel = index_open(idxoid, AccessShareLock);
+
+		if (idxrel->rd_index && idxrel->rd_index->indisprimary)
+		{
+			pk_index_oid = idxoid;
+			pk_rel = idxrel;
+			break;
+		}
+		index_close(idxrel, AccessShareLock);
+	}
+
+	if (OidIsValid(pk_index_oid) && pk_rel != NULL)
+	{
+		int			n_pk = pk_rel->rd_index->indnatts;
+
+		if (n_pk > 0)
+		{
+			ri->n_pk = n_pk;
+			oldmc = MemoryContextSwitchTo(TopMemoryContext);
+			ri->pk_colname = (char **) palloc0(sizeof(char *) * n_pk);
+			ri->pk_coltype = (char **) palloc0(sizeof(char *) * n_pk);
+			for (i = 0; i < n_pk; i++)
+			{
+				AttrNumber	attno = pk_rel->rd_index->indkey.values[i];
+				Form_pg_attribute att;
+
+				if (attno == 0)
+				{
+					ri->pk_colname[i] = pstrdup("");
+					ri->pk_coltype[i] = pstrdup("");
+					continue;
+				}
+				att = TupleDescAttr(reldesc, attno - 1);
+				ri->pk_colname[i] = pstrdup(NameStr(att->attname));
+				ri->pk_coltype[i] =
+					pstrdup(format_type_with_typemod(att->atttypid,
+													 att->atttypmod));
+			}
+			MemoryContextSwitchTo(oldmc);
+		}
+		index_close(pk_rel, AccessShareLock);
+	}
+
+	return ri;
+}
+
+/* ob_apply_rel_info_free - release everything ob_apply_rel_info_build() made. */
+static void
+ob_apply_rel_info_free(ObApplyRelInfo *ri)
+{
+	int			i;
+
+	if (ri == NULL)
+		return;
+	if (ri->q_relname)
+		pfree(ri->q_relname);
+	if (ri->colnames)
+		pfree(ri->colnames);
+	if (ri->colnames_parens)
+		pfree(ri->colnames_parens);
+	for (i = 0; i < ri->n_pk; i++)
+	{
+		if (ri->pk_colname && ri->pk_colname[i])
+			pfree(ri->pk_colname[i]);
+		if (ri->pk_coltype && ri->pk_coltype[i])
+			pfree(ri->pk_coltype[i]);
+	}
+	if (ri->pk_colname)
+		pfree(ri->pk_colname);
+	if (ri->pk_coltype)
+		pfree(ri->pk_coltype);
+	pfree(ri);
+}
+
+/*
+ * ob_fetch_main_version - locate and FOR UPDATE-lock the MAIN row matching
+ * where_clause, returning its optimistic CAS token (3A.2).
+ *
+ * Returns true when a MAIN row exists; *version then receives a palloc'd
+ * "<blk>:<off>-x<xmin>" token (TopMemoryContext) with exactly the shape
+ * overlay_tuple_version() produces, so callers may strcmp() the two directly.
+ * Returns false when nothing matches (caller treats the row as absent).
+ *
+ * Taking the lock here replaces the previous fetch-row plus separate heap
+ * version lookup pair; the lock is what the follow-up base_image compare and
+ * DML rely on.  The statement must not be flagged read-only: the locking
+ * clause makes it non read-only and SPI would reject that combination.
+ */
+static bool
+ob_fetch_main_version(ObApplyRelInfo *ri, const char *where_clause,
+					  char **version)
+{
+	StringInfoData sql;
+	int			ret;
+	bool		found = false;
+
+	Assert(ri != NULL && where_clause != NULL && version != NULL);
+	*version = NULL;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT ctid::text, xmin::text FROM %s WHERE %s "
+					 "FOR UPDATE LIMIT 1",
+					 ri->q_relname, where_clause);
+	ret = ob_spi_one_shot(sql.data, false, 1);
 	pfree(sql.data);
 
 	if (ret == SPI_OK_SELECT && SPI_processed == 1 &&
 		SPI_tuptable && SPI_tuptable->vals && SPI_tuptable->vals[0])
 	{
-		HeapTuple	htup = SPI_tuptable->vals[0];
-		TupleDesc	td = SPI_tuptable->tupdesc;
-		MemoryContext oldmc;
-		TupleTableSlot *work;
+		char	   *ctid_txt = SPI_getvalue(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1);
+		char	   *xmin_txt = SPI_getvalue(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 2);
+		unsigned int blk = 0;
+		unsigned int off = 0;
 
-		work = MakeSingleTupleTableSlot(td, &TTSOpsHeapTuple);
-		ExecStoreHeapTuple(htup, work, false);
-		ExecMaterializeSlot(work);
-
-		oldmc = MemoryContextSwitchTo(TopMemoryContext);
-		copy_desc = CreateTupleDescCopy(reldesc);
-		result = MakeSingleTupleTableSlot(copy_desc, &TTSOpsVirtual);
+		found = true;
+		if (ctid_txt != NULL &&
+			sscanf(ctid_txt, "(%u,%u)", &blk, &off) == 2)
 		{
-			int natts_result = copy_desc->natts;
+			MemoryContext oldmc;
 
-			for (int i = 0; i < natts; i++)
-			{
-				Form_pg_attribute ratt = TupleDescAttr(reldesc, i);
-				Datum		v;
-				bool		isnull;
-				AttrNumber	work_idx;
-
-				if (ratt->attisdropped)
-				{
-					if (i < natts_result)
-						result->tts_isnull[i] = true;
-					continue;
-				}
-
-				work_idx = 0;
-				for (int k = 0; k < td->natts; k++)
-				{
-					Form_pg_attribute x = TupleDescAttr(td, k);
-					if (x->attisdropped)
-						continue;
-					if (strcmp(NameStr(x->attname), NameStr(ratt->attname)) == 0)
-					{
-						work_idx = k + 1;
-						break;
-					}
-				}
-				if (work_idx == 0)
-				{
-					ExecDropSingleTupleTableSlot(result);
-					ExecDropSingleTupleTableSlot(work);
-					result = NULL;
-					MemoryContextSwitchTo(oldmc);
-					SPI_finish();
-					return NULL;
-				}
-				v = slot_getattr(work, work_idx, &isnull);
-				if (isnull)
-				{
-					if (i < natts_result)
-						result->tts_isnull[i] = true;
-				}
-				else
-				{
-					int16		typlen;
-					bool		typbyval;
-					char		typalign;
-					Datum		copy_v;
-
-					get_typlenbyvalalign(ratt->atttypid, &typlen, &typbyval, &typalign);
-					copy_v = datumCopy(v, typbyval, typlen);
-					if (i < natts_result)
-					{
-						result->tts_values[i] = copy_v;
-						result->tts_isnull[i] = false;
-					}
-				}
-			}
+			oldmc = MemoryContextSwitchTo(TopMemoryContext);
+			*version = psprintf("%u:%u-x%s", blk, off,
+								xmin_txt ? xmin_txt : "0");
+			MemoryContextSwitchTo(oldmc);
 		}
-		ExecStoreVirtualTuple(result);
-		result->tts_tid = work->tts_tid;
-		ExecDropSingleTupleTableSlot(work);
-		MemoryContextSwitchTo(oldmc);
 	}
 	SPI_finish();
-	return result;
+	return found;
 }
 
 /* ================================================================
@@ -3246,153 +3251,152 @@ ob_fetch_main_current_slot(Relation rel, const char *where_clause)
  * base image (stripped of system columns that row_to_json does not
  * include) against the CURRENTLY LOCKED MAIN row at apply time, using
  * jsonb_object_agg(key, value ORDER BY key) to canonicalise both sides
- * to a field-order-independent representation.  The FOR UPDATE clause
- * on the MAIN row read guarantees we wait for any concurrent writer to
- * commit, so we compare against final committed state.
+ * to a field-order-independent representation.  The MAIN row was already
+ * locked FOR UPDATE by ob_fetch_main_version(), so the compared MAIN row
+ * is the one we will subsequently DELETE/UPDATE.
  *
- * If dt->tuple_data has no "_base" key (old INSERT deltas, or pure-
- * delta INSERT deltas generated from UPDATE fallbacks that carry no
- * base image) the helper is a no-op.  If the canonicalised base and
- * MAIN representations differ we raise a 55000 conflict and abort the
- * whole branch apply.
+ * The "_base" presence probe happens in C: the stored JSON payload is
+ * scanned for the "_base" key before any SPI round-trip, so the common
+ * case (no base image recorded) costs nothing.  Only when a "_base" key is
+ * actually present do we run the comparison statement, which returns three
+ * booleans (has_base, main_absent, differs).  When the canonicalised base
+ * and MAIN representations differ we raise a conflict and abort the whole
+ * branch apply.
  * ================================================================ */
+
+/*
+ * ob_delta_has_base_key - C-level probe for a top-level "_base" key in the
+ * stored delta tuple_data JSON payload.
+ *
+ * overlay_branch only records a base image for UPDATE/DELETE deltas written
+ * by the R15/R18 guard writer; every other delta (and every delta produced
+ * by the current write-redirect path) carries none.  Probing the raw bytes
+ * here avoids planning and executing the expensive canonicalising compare
+ * statement once per delta row, which otherwise dominates apply time.
+ */
+static bool
+ob_delta_has_base_key(const bytea *tuple_data)
+{
+	const char *p;
+	int			len;
+	int			i;
+
+	if (tuple_data == NULL)
+		return false;
+
+	p = (const char *) VARDATA_ANY(tuple_data);
+	len = VARSIZE_ANY_EXHDR(tuple_data);
+	if (len < 7)
+		return false;
+
+	for (i = 0; i + 7 <= len; i++)
+	{
+		if (memcmp(p + i, "\"_base\"", 7) == 0)
+			return true;
+	}
+	return false;
+}
+
 static void
-apply_check_base_image_match(Relation rel, DeltaTuple *dt,
+apply_check_base_image_match(ObApplyRelInfo *ri, DeltaTuple *dt,
 							 const char *where_clause, const char *branch_name)
 {
-	Oid			bytea_out_func;
-	bool		bytea_out_varlena;
 	char	   *bytea_lit;
 	char	   *ql;
-	char	   *q_relname;
 	StringInfoData sql;
 	int			ret;
-	bool		has_base;
-	bool		differs;
+	bool		has_base = false;
+	bool		main_found = false;
+	bool		differs = false;
 
 	if (dt->tuple_data == NULL)
 		return;
 
-	q_relname = quote_qualified_identifier(
-		get_namespace_name(RelationGetNamespace(rel)),
-		RelationGetRelationName(rel));
+	/* Fast path: nothing to compare when the payload has no base image. */
+	if (!ob_delta_has_base_key(dt->tuple_data))
+		return;
 
-	getTypeOutputInfo(BYTEAOID, &bytea_out_func, &bytea_out_varlena);
-	bytea_lit = OidOutputFunctionCall(bytea_out_func,
+	bytea_lit = OidOutputFunctionCall(ri->bytea_out_func,
 									  PointerGetDatum(dt->tuple_data));
 	ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
 
-	/* Step 1: fast-path check whether the tuple_data blob actually
-	 * contains a "_base" key.  Old INSERTs and legacy deltas created
-	 * before this patch do not. */
+	/* One statement yields: has_base, main_absent, differs. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT "
-					 " convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb ? '_base'",
-					 ql);
+					 "SELECT d.j ? '_base', "
+					 "       m.main_norm IS NULL, "
+					 "       CASE WHEN d.j ? '_base' "
+					 "            THEN COALESCE(b.base_norm, '{}'::jsonb) "
+					 "                 <> COALESCE(m.main_norm, '{}'::jsonb) "
+					 "            ELSE false END "
+					 "  FROM (SELECT convert_from(decode(substring(%1$s from 3), 'hex'), 'UTF8')::jsonb AS j) d "
+					 "  LEFT JOIN LATERAL (SELECT jsonb_object_agg(key, value ORDER BY key) AS base_norm "
+					 "                       FROM jsonb_each(COALESCE(d.j -> '_base', '{}'::jsonb))) b ON true "
+					 "  LEFT JOIN LATERAL (SELECT jsonb_object_agg(key, value ORDER BY key) AS main_norm "
+					 "                       FROM jsonb_each(COALESCE((SELECT to_jsonb(r) "
+					 "                                                  - 'ctid' - 'xmin' - 'cmin' "
+					 "                                                  - 'xmax' - 'cmax' - 'tableoid' "
+					 "                                                 FROM (SELECT * FROM %2$s WHERE %3$s) r), '{}'::jsonb))) m ON true",
+					 ql, ri->q_relname, where_clause);
 	ret = ob_spi_one_shot(sql.data, true, 1);
 	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
 		!SPI_tuptable || !SPI_tuptable->vals || !SPI_tuptable->vals[0])
 	{
 		pfree(sql.data);
-		pfree(q_relname);
 		if (bytea_lit) pfree(bytea_lit);
 		pfree(ql);
 		SPI_finish();
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("apply_check_base_image_match: _base exists SPI ret=%d", ret)));
+				 errmsg("apply_check_base_image_match: SPI ret=%d", ret)));
 	}
 	{
-		bool		is_null;
+		bool		null1;
+		bool		null2;
+		bool		null3;
+		Datum		d1;
+		Datum		d2;
+		Datum		d3;
 
-		has_base = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 1,
-											  &is_null));
-		if (is_null)
-			has_base = false;
+		d1 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &null1);
+		d2 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &null2);
+		d3 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &null3);
+		has_base = null1 ? false : DatumGetBool(d1);
+		main_found = null2 ? false : !DatumGetBool(d2);
+		differs = null3 ? false : DatumGetBool(d3);
 	}
-	SPI_finish();
 	pfree(sql.data);
+	if (bytea_lit) pfree(bytea_lit);
+	pfree(ql);
+	SPI_finish();
 
 	if (!has_base)
-	{
-		pfree(q_relname);
-		if (bytea_lit) pfree(bytea_lit);
-		pfree(ql);
 		return;
-	}
 
-	/* Step 2: compare canonicalised base vs canonicalised locked MAIN.
-	 * System columns (ctid/xmin/cmin/xmax/cmax/tableoid) are stripped
-	 * because overlay_serialize_tuple never writes them, and because
-	 * the whole point of the guard is to detect DATA changes regardless
-	 * of HOT reuse or updated xmin wraparound.  FOR UPDATE re-acquires
-	 * the lock so the compared MAIN row is the one we will subsequently
-	 * DELETE/UPDATE; no intervening committed writer can slip through. */
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "SELECT COALESCE(base_norm, '{}'::jsonb) "
-					 "     <> COALESCE(main_norm, '{}'::jsonb) "
-					 "  FROM (SELECT (SELECT jsonb_object_agg(key, value ORDER BY key) "
-					 "                FROM jsonb_each( "
-					 "                       convert_from(decode(substring(%1$s from 3), 'hex'), 'UTF8')::jsonb "
-					 "                    -> '_base'))) b(base_norm), "
-					 "       LATERAL (SELECT jsonb_object_agg(key, value ORDER BY key) "
-					 "                  FROM jsonb_each( "
-					 "                         to_jsonb(r) "
-					 "                       - 'ctid' - 'xmin' - 'cmin' "
-					 "                       - 'xmax' - 'cmax' - 'tableoid') "
-					 "                 FROM (SELECT * FROM %2$s WHERE %3$s FOR UPDATE) r "
-					 "                ) m(main_norm) ",
-					 ql, q_relname, where_clause);
-	ret = ob_spi_one_shot(sql.data, true, 1);
-	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
-		!SPI_tuptable || !SPI_tuptable->vals || !SPI_tuptable->vals[0])
+	if (!main_found)
 	{
-		char *reason = psprintf(
+		char	   *reason = psprintf(
 			"conflict pk=%s: MAIN row vanished during base_image compare (concurrent DELETE outside branch)",
 			dt->key ? dt->key : "(null)");
-		pfree(sql.data);
-		pfree(q_relname);
-		if (bytea_lit) pfree(bytea_lit);
-		pfree(ql);
-		SPI_finish();
+
 		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
-	{
-		bool		differs_null;
-		Datum		differs_val;
-
-		differs_null = false;
-		differs_val = SPI_getbinval(SPI_tuptable->vals[0],
-									SPI_tuptable->tupdesc, 1,
-									&differs_null);
-		if (differs_null)
-			differs = false;
-		else
-			differs = DatumGetBool(differs_val);
-	}
-	SPI_finish();
-	pfree(sql.data);
-	pfree(q_relname);
-	if (bytea_lit) pfree(bytea_lit);
-	pfree(ql);
 
 	if (differs)
 	{
-		char *reason = psprintf(
+		char	   *reason = psprintf(
 			"conflict pk=%s: MAIN row has diverged from branch base_image "
 			"(ctid/xmin token unchanged, so R15/R18 HOT-update collision "
 			"was caught by the secondary per-column compare).  Resolve by "
 			"discarding this branch, re-branching from current MAIN, and "
 			"re-applying the branch edits.",
 			dt->key ? dt->key : "(null)");
+
 		overlay_guard_ereport_fail("apply_branch (conflict R15/R18)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
@@ -3403,31 +3407,25 @@ apply_check_base_image_match(Relation rel, DeltaTuple *dt,
  * ================================================================ */
 
 static void
-apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
+apply_relation_delete_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 						   const char *branch_name)
 {
 	char	   *where_clause;
-	TupleTableSlot *main_slot;
-	char	   *main_ver;
+	char	   *main_ver = NULL;
 
-	elog(DEBUG1, "delpass[dbg] A1 key check");
 	if (dt->key == NULL || *dt->key == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply DELETE on %s: delta has empty key",
-						RelationGetRelationName(rel))));
+						RelationGetRelationName(ri->rel))));
 
-	elog(DEBUG1, "delpass[dbg] A2 build_identity_where");
-	where_clause = ob_build_identity_where_clause(rel, dt->key);
-	elog(DEBUG1, "delpass[dbg] A3 build_identity_where DONE where=%s", where_clause ? where_clause : "NULL");
+	where_clause = ob_build_identity_where_clause(ri, dt->key);
 	/* Pure-delta origin: old_version == NULL means this row never existed
 	 * on MAIN (it was INSERTed then DELETEd entirely inside the branch).
 	 * There is nothing to DELETE on MAIN; skipping prevents false-positive
 	 * "row no longer present" conflict errors. */
 	if (dt->old_version == NULL)
 	{
-		elog(DEBUG1, "delpass[dbg] A4 pure-delta DELETE (no MAIN baseline) → NOP skip pk=%s",
-			 dt->key);
 		if (where_clause) pfree(where_clause);
 		return;
 	}
@@ -3436,67 +3434,50 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply DELETE on %s: cannot build WHERE for pk=%s",
-						RelationGetRelationName(rel), dt->key)));
+						RelationGetRelationName(ri->rel), dt->key)));
 
-	elog(DEBUG1, "delpass[dbg] B fetch_main_slot");
-	main_slot = ob_fetch_main_current_slot(rel, where_clause);
-	elog(DEBUG1, "delpass[dbg] B2 fetch_main_slot DONE main_slot=%s", main_slot ? "nonNULL" : "NULL");
-	if (main_slot == NULL)
+	/* Locate + FOR UPDATE-lock the MAIN row; the same SPI call returns the
+	 * optimistic CAS token so no separate heap lookup is needed. */
+	if (!ob_fetch_main_version(ri, where_clause, &main_ver))
 	{
-		char *reason = psprintf("DELETE delta pk=%s: MAIN row no longer present at apply time (concurrent DELETE or UPDATE rewrite).  expected old_version=%s.  Resolve manually and re-branch.",
-							 dt->key, dt->old_version ? dt->old_version : "(null)");
+		char	   *reason = psprintf("DELETE delta pk=%s: MAIN row no longer present at apply time (concurrent DELETE or UPDATE rewrite).  expected old_version=%s.  Resolve manually and re-branch.",
+									 dt->key, dt->old_version ? dt->old_version : "(null)");
+
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
 
-	elog(DEBUG1, "delpass[dbg] C tuple_version expected=%s", dt->old_version ? dt->old_version : "(null)");
-	main_ver = overlay_tuple_version(rel, main_slot);
-	elog(DEBUG1, "delpass[dbg] C2 tuple_version DONE main_ver=%s", main_ver ? main_ver : "(null)");
-	if (dt->old_version == NULL || main_ver == NULL ||
-		strcmp(dt->old_version, main_ver) != 0)
+	if (main_ver == NULL || strcmp(dt->old_version, main_ver) != 0)
 	{
-		char *reason = psprintf("conflict pk=%s: old_version expected=%s but MAIN latest=%s",
-							 dt->key,
-							 dt->old_version ? dt->old_version : "(null)",
-							 main_ver ? main_ver : "(null)");
-		elog(DEBUG1, "delpass[dbg] CONFLICT %s", reason);
+		char	   *reason = psprintf("conflict pk=%s: old_version expected=%s but MAIN latest=%s",
+									 dt->key,
+									 dt->old_version,
+									 main_ver ? main_ver : "(null)");
+
 		if (main_ver) pfree(main_ver);
-		ExecDropSingleTupleTableSlot(main_slot);
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
-	elog(DEBUG1, "delpass[dbg] D pfree main_ver");
 	if (main_ver) pfree(main_ver);
-	elog(DEBUG1, "delpass[dbg] D2 drop main_slot");
-	ExecDropSingleTupleTableSlot(main_slot);
-	elog(DEBUG1, "delpass[dbg] D3 base_image vs MAIN lock check");
-	apply_check_base_image_match(rel, dt, where_clause, branch_name);
-	elog(DEBUG1, "delpass[dbg] E build DELETE sql");
+
+	apply_check_base_image_match(ri, dt, where_clause, branch_name);
 
 	{
 		StringInfoData del_sql;
-		char	   *q_relname;
 		int			ret;
-
-		q_relname = quote_qualified_identifier(
-			get_namespace_name(RelationGetNamespace(rel)),
-			RelationGetRelationName(rel));
 
 		initStringInfo(&del_sql);
 		appendStringInfo(&del_sql, "DELETE FROM %s WHERE %s",
-						 q_relname, where_clause);
-		pfree(q_relname);
+						 ri->q_relname, where_clause);
 		pfree(where_clause);
 
-		elog(DEBUG1, "delpass DELETE sql=%s", del_sql.data);
 		ret = ob_spi_one_shot(del_sql.data, false, 1);
-		elog(DEBUG1, "delpass DELETE ret=%d processed=%lu", ret, SPI_processed);
 		SPI_finish();
 		pfree(del_sql.data);
 		if (ret != SPI_OK_DELETE)
@@ -3504,36 +3485,35 @@ apply_relation_delete_pass(Relation rel, DeltaTuple *dt,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("apply DELETE failed ret=%d", ret)));
 	}
-	elog(DEBUG1, "delpass[dbg] Z DONE");
 }
 
 static void
-apply_relation_update_pass(Relation rel, DeltaTuple *dt,
+apply_relation_update_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 						   const char *branch_name)
 {
 	char	   *where_clause;
-	TupleTableSlot *main_slot;
-	char	   *main_ver;
+	char	   *main_ver = NULL;
+	bool		main_found;
 
 	if (dt->key == NULL || *dt->key == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply UPDATE on %s: delta has empty key",
-						RelationGetRelationName(rel))));
+						RelationGetRelationName(ri->rel))));
 	if (dt->tuple_data == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply UPDATE on %s: delta has NULL tuple_data for pk=%s",
-						RelationGetRelationName(rel), dt->key)));
+						RelationGetRelationName(ri->rel), dt->key)));
 
-	where_clause = ob_build_identity_where_clause(rel, dt->key);
+	where_clause = ob_build_identity_where_clause(ri, dt->key);
 	/* A NULL clause means a keyless "S:" synthetic key: there is no MAIN
 	 * anchor, so behave as a missing MAIN row (the pure-delta branch below
 	 * then falls back to insert_pass). */
-	main_slot = (where_clause != NULL)
-		? ob_fetch_main_current_slot(rel, where_clause)
-		: NULL;
-	if (main_slot == NULL)
+	main_found = (where_clause != NULL)
+		? ob_fetch_main_version(ri, where_clause, &main_ver)
+		: false;
+	if (!main_found)
 	{
 		char	   *reason;
 
@@ -3545,7 +3525,7 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt,
 		if (dt->old_version == NULL)
 		{
 			if (where_clause) pfree(where_clause);
-			apply_relation_insert_pass(rel, dt, branch_name);
+			apply_relation_insert_pass(ri, dt, branch_name);
 			return;
 		}
 		reason = psprintf("UPDATE pk=%s MAIN row missing at apply time "
@@ -3553,79 +3533,43 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt,
 						  dt->key);
 		if (where_clause) pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
 
-	main_ver = overlay_tuple_version(rel, main_slot);
 	if (dt->old_version == NULL || main_ver == NULL ||
 		strcmp(dt->old_version, main_ver) != 0)
 	{
-		char *reason = psprintf("conflict pk=%s: old_version expected=%s MAIN latest=%s",
-							 dt->key,
-							 dt->old_version ? dt->old_version : "(null)",
-							 main_ver ? main_ver : "(null)");
+		/* A NULL old_version means the delta carries no MAIN baseline, so
+		 * the conflict is simply "MAIN row unexpectedly present".  The live
+		 * (ctid,xmin) token is an internal, run-dependent value and is
+		 * deliberately not surfaced in that case. */
+		char	   *reason = psprintf("conflict pk=%s: old_version expected=%s MAIN latest=%s",
+									 dt->key,
+									 dt->old_version ? dt->old_version : "(null)",
+									 (dt->old_version && main_ver) ? main_ver : "(null)");
+
 		if (main_ver) pfree(main_ver);
-		ExecDropSingleTupleTableSlot(main_slot);
 		pfree(where_clause);
 		overlay_guard_ereport_fail("apply_branch (conflict)",
-								   RelationGetRelationName(rel),
+								   RelationGetRelationName(ri->rel),
 								   branch_name,
 								   reason);
 	}
 	if (main_ver) pfree(main_ver);
-	ExecDropSingleTupleTableSlot(main_slot);
-	apply_check_base_image_match(rel, dt, where_clause, branch_name);
+
+	apply_check_base_image_match(ri, dt, where_clause, branch_name);
 
 	{
-		TupleDesc	reldesc = RelationGetDescr(rel);
-		StringInfoData colnames;
-		StringInfoData colnames_parens;
-		StringInfoData colspec;
-		int			natts = reldesc->natts;
-		Oid			bytea_out_func;
-		bool		bytea_out_varlena;
 		char	   *bytea_lit;
 		StringInfoData upd_sql;
-		char	   *q_relname;
 		int			ret;
-		bool		first = true;
-		int			i;
 
-		initStringInfo(&colnames);
-		initStringInfo(&colnames_parens);
-		initStringInfo(&colspec);
-		for (i = 0; i < natts; i++)
-		{
-			Form_pg_attribute att = TupleDescAttr(reldesc, i);
-			if (att->attisdropped)
-				continue;
-			if (!first)
-			{
-				appendStringInfoChar(&colnames, ',');
-				appendStringInfoChar(&colnames_parens, ',');
-				appendStringInfoChar(&colspec, ',');
-			}
-			appendStringInfo(&colnames, "%s",
-							 quote_identifier(NameStr(att->attname)));
-			appendStringInfo(&colnames_parens, "j.%s",
-							 quote_identifier(NameStr(att->attname)));
-			appendStringInfo(&colspec, "%s %s",
-							 quote_identifier(NameStr(att->attname)),
-							 format_type_with_typemod(att->atttypid, att->atttypmod));
-			first = false;
-		}
-
-		getTypeOutputInfo(BYTEAOID, &bytea_out_func, &bytea_out_varlena);
-		bytea_lit = OidOutputFunctionCall(bytea_out_func,
+		bytea_lit = OidOutputFunctionCall(ri->bytea_out_func,
 										  PointerGetDatum(dt->tuple_data));
 		{
-			char *ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
-			(void) ql;
-			q_relname = quote_qualified_identifier(
-				get_namespace_name(RelationGetNamespace(rel)),
-				RelationGetRelationName(rel));
+			char	   *ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
 
 			initStringInfo(&upd_sql);
 			appendStringInfo(&upd_sql,
@@ -3634,21 +3578,15 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt,
 							 "convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb) "
 							 "AS j) "
 							 "WHERE %s",
-							 q_relname, colnames.data,
-							 colnames_parens.data, q_relname,
-							 ql,
-							 where_clause);
+							 ri->q_relname, ri->colnames,
+							 ri->colnames_parens, ri->q_relname,
+							 ql, where_clause);
+			pfree(ql);
 		}
-		pfree(q_relname);
 		pfree(where_clause);
 		if (bytea_lit) pfree(bytea_lit);
-		pfree(colnames.data);
-		pfree(colnames_parens.data);
-		pfree(colspec.data);
 
-		elog(DEBUG1, "updpass[dbg] G upd_sql=%s", upd_sql.data);
 		ret = ob_spi_one_shot(upd_sql.data, false, 1);
-		elog(DEBUG1, "updpass[dbg] G2 ret=%d processed=%lu", ret, SPI_processed);
 		pfree(upd_sql.data);
 		if (ret != SPI_OK_UPDATE && ret != SPI_OK_UPDATE_RETURNING)
 			ereport(ERROR,
@@ -3659,89 +3597,61 @@ apply_relation_update_pass(Relation rel, DeltaTuple *dt,
 }
 
 static void
-apply_relation_insert_pass(Relation rel, DeltaTuple *dt,
+apply_relation_insert_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 						   const char *branch_name)
 {
-	char	   *q_relname;
 	int			ret;
-	TupleDesc	reldesc;
-	StringInfoData colnames;
-	StringInfoData colspec;
-	StringInfoData colnames_parens;
-	int			natts;
-	Oid			bytea_out_func;
-	bool		bytea_out_varlena;
 	char	   *bytea_lit;
 	StringInfoData ins_sql;
-	bool		first = true;
-	int			i;
-	char	   *where_clause;
-	TupleTableSlot *main_slot;
 
 	if (dt->tuple_data == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("apply INSERT on %s: delta has NULL tuple_data pk=%s",
-						RelationGetRelationName(rel), dt->key ? dt->key : "(null)")));
+						RelationGetRelationName(ri->rel),
+						dt->key ? dt->key : "(null)")));
 
 	if (dt->key != NULL && *dt->key != '\0')
 	{
-		where_clause = ob_build_identity_where_clause(rel, dt->key);
+		char	   *where_clause;
+		bool		exists = false;
+
+		where_clause = ob_build_identity_where_clause(ri, dt->key);
 		/* NULL clause = keyless "S:" synthetic key (branch-only row); there
 		 * is no MAIN anchor to locate, so treat as row absent. */
-		main_slot = (where_clause != NULL)
-			? ob_fetch_main_current_slot(rel, where_clause)
-			: NULL;
-		if (main_slot != NULL)
+		if (where_clause != NULL)
 		{
-			char *reason = psprintf("INSERT pk=%s MAIN row already present (MAIN pk already contains this PK)",
-								 dt->key);
-			ExecDropSingleTupleTableSlot(main_slot);
+			StringInfoData probe_sql;
+			uint64		nrows;
+
+			initStringInfo(&probe_sql);
+			appendStringInfo(&probe_sql, "SELECT 1 FROM %s WHERE %s LIMIT 1",
+							 ri->q_relname, where_clause);
+			ret = ob_spi_one_shot(probe_sql.data, true, 1);
+			/* SPI_finish() restores SPI_processed from the outer SPI level,
+			 * so the row count must be captured before finishing. */
+			nrows = SPI_processed;
+			SPI_finish();
+			pfree(probe_sql.data);
+			exists = (ret == SPI_OK_SELECT && nrows == 1);
 			pfree(where_clause);
+		}
+		if (exists)
+		{
+			char	   *reason = psprintf("INSERT pk=%s MAIN row already present (MAIN pk already contains this PK)",
+									   dt->key);
+
 			overlay_guard_ereport_fail("apply_branch (conflict)",
-									   RelationGetRelationName(rel),
+									   RelationGetRelationName(ri->rel),
 									   branch_name,
 									   reason);
 		}
-		if (where_clause) pfree(where_clause);
 	}
 
-	reldesc = RelationGetDescr(rel);
-	natts = reldesc->natts;
-	initStringInfo(&colnames);
-	initStringInfo(&colspec);
-	initStringInfo(&colnames_parens);
-	for (i = 0; i < natts; i++)
+	bytea_lit = OidOutputFunctionCall(ri->bytea_out_func,
+								  PointerGetDatum(dt->tuple_data));
 	{
-		Form_pg_attribute att = TupleDescAttr(reldesc, i);
-
-		if (att->attisdropped)
-			continue;
-		if (!first)
-		{
-			appendStringInfoChar(&colnames, ',');
-			appendStringInfoChar(&colspec, ',');
-			appendStringInfoChar(&colnames_parens, ',');
-		}
-		appendStringInfo(&colnames, "%s",
-						 quote_identifier(NameStr(att->attname)));
-		appendStringInfo(&colnames_parens, "j.%s",
-						 quote_identifier(NameStr(att->attname)));
-		appendStringInfo(&colspec, "%s %s",
-						 quote_identifier(NameStr(att->attname)),
-						 format_type_be(att->atttypid));
-		first = false;
-	}
-
-	getTypeOutputInfo(BYTEAOID, &bytea_out_func, &bytea_out_varlena);
-	bytea_lit = OidOutputFunctionCall(bytea_out_func,
-								   PointerGetDatum(dt->tuple_data));
-	{
-		char *ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
-		(void) ql;
-		q_relname = quote_qualified_identifier(
-			get_namespace_name(RelationGetNamespace(rel)),
-			RelationGetRelationName(rel));
+		char	   *ql = quote_literal_cstr(bytea_lit ? bytea_lit : "");
 
 		initStringInfo(&ins_sql);
 		appendStringInfo(&ins_sql,
@@ -3749,23 +3659,522 @@ apply_relation_insert_pass(Relation rel, DeltaTuple *dt,
 						 "SELECT %s FROM jsonb_populate_record(NULL::%s, "
 						 "convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb) "
 						 "AS j",
-						 q_relname, colnames.data, colnames_parens.data,
-						 q_relname,
+						 ri->q_relname, ri->colnames, ri->colnames_parens,
+						 ri->q_relname,
 						 ql);
+		pfree(ql);
 	}
-	pfree(q_relname);
-	if (bytea_lit) pfree(bytea_lit);
-	pfree(colnames.data);
-	pfree(colnames_parens.data);
-	pfree(colspec.data);
+	if (bytea_lit)
+		pfree(bytea_lit);
 
-	elog(DEBUG1, "inspass[dbg] C ins_sql=%s", ins_sql.data);
 	ret = ob_spi_one_shot(ins_sql.data, false, 1);
-	elog(DEBUG1, "inspass[dbg] C2 ret=%d processed=%lu", ret, SPI_processed);
 	pfree(ins_sql.data);
 	if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("apply INSERT failed ret=%d", ret)));
 	SPI_finish();
+}
+
+/* ================================================================
+ * Phase 3B: set-based apply replay (one statement per relation+operation)
+ *
+ * The per-row replay above issues a few SPI statements per delta row, and
+ * planning those statements — not the SPI call count — dominates its cost
+ * (doc/performance.md §6.3.1).  Phase 3B folds each operation into a single
+ * statement per relation:
+ *
+ *   1. a validation SELECT that returns the first conflicting delta row, and
+ *   2. the batch DML itself.
+ *
+ * Both use the same predicate ("same-source predicate"), so a validation
+ * pass means the DML touches exactly the rows the C-side delta list counts.
+ * The batch DML carries the optimistic token in its own WHERE, so its row
+ * lock and the token comparison happen in one statement — the equivalent of
+ * the per-row "SELECT ... FOR UPDATE, compare, DML" sequence.
+ *
+ * A row-count mismatch between the batch DML and the C-side expectation can
+ * only come from a concurrent MAIN change slipping in between the two
+ * statements; it aborts the apply and rolls the whole transaction back, so
+ * nothing is partially applied.
+ *
+ * Relations without a PRIMARY KEY, and relations whose deltas carry a base
+ * image ("_base", the R15/R18 HOT-update guard), stay on the per-row replay.
+ * ================================================================ */
+
+/* TOKEN(alias) - canonical MAIN-row CAS token, byte-identical to the
+ * "<blk>:<off>-x<xmin>" string ob_fetch_main_version() produces. */
+static char *
+ob_batch_token_expr(const char *main_alias)
+{
+	return psprintf("(replace(translate(%s.ctid::text, '()', ''), ',', ':') "
+					"|| '-x' || %s.xmin::text)",
+					main_alias, main_alias);
+}
+
+/* PKJOIN(delta_alias, main_alias) - one equality per PK column against the
+ * matching element of the delta's JSON-array key. */
+static char *
+ob_batch_pkjoin_expr(ObApplyRelInfo *ri, const char *delta_alias,
+					 const char *main_alias)
+{
+	StringInfoData buf;
+	int			i;
+
+	Assert(ri != NULL && ri->n_pk > 0);
+
+	initStringInfo(&buf);
+	for (i = 0; i < ri->n_pk; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&buf, " AND ");
+		appendStringInfo(&buf, "%s.%s = ((%s.key)::jsonb->>%d)::%s",
+						 main_alias, quote_identifier(ri->pk_colname[i]),
+						 delta_alias, i, ri->pk_coltype[i]);
+	}
+	return buf.data;
+}
+
+/* First conflicting delta row for one operation, as reported by the
+ * validation SELECT.  All string fields are palloc'd in TopMemoryContext. */
+typedef struct ObBatchConflict
+{
+	bool		found;
+	char	   *key;			/* JSON-array PK text */
+	char	   *old_version;	/* delta base version, NULL when unset */
+	bool		main_missing;	/* no MAIN row matched the key */
+	char	   *main_ver;		/* canonical MAIN token, NULL when absent */
+} ObBatchConflict;
+
+/*
+ * ob_batch_validate - return the first (lowest-key) delta row of `op` that
+ * violates the batch DML predicate, or found=false when the operation can be
+ * replayed as one batch.
+ */
+static ObBatchConflict
+ob_batch_validate(ObApplyRelInfo *ri, int32 bid, char op)
+{
+	ObBatchConflict c;
+	StringInfoData sql;
+	char	   *pkjoin;
+	char	   *token;
+	int			ret;
+
+	c.found = false;
+	c.key = NULL;
+	c.old_version = NULL;
+	c.main_missing = false;
+	c.main_ver = NULL;
+
+	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+	token = ob_batch_token_expr("m");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT d.key, d.old_version, (m.ctid IS NULL), %s "
+					 "FROM %s d LEFT JOIN %s m ON %s "
+					 "WHERE d.branch_id = %d AND d.relid = %u AND d.op = '%c' AND ",
+					 token, OBTABLE_DELTA, ri->q_relname, pkjoin,
+					 (int) bid, (unsigned) ri->relid, op);
+
+	if (op == DELTA_OP_DELETE)
+	{
+		/* A pure-delta DELETE (no MAIN baseline) is a no-op, so only rows
+		 * that claim a MAIN baseline can conflict. */
+		appendStringInfo(&sql,
+						 "d.old_version IS NOT NULL AND "
+						 "d.old_version IS DISTINCT FROM %s", token);
+	}
+	else if (op == DELTA_OP_UPDATE)
+	{
+		/* Either a MAIN row appeared for a pure-delta UPDATE, or a row that
+		 * should be there is gone/rewritten.  One query covers both so the
+		 * first offender by key order wins, matching the per-row order. */
+		appendStringInfo(&sql,
+						 "((d.old_version IS NULL AND m.ctid IS NOT NULL) OR "
+						 "(d.old_version IS NOT NULL AND "
+						 "d.old_version IS DISTINCT FROM %s))", token);
+	}
+	else
+	{
+		appendStringInfoString(&sql, "m.ctid IS NOT NULL");
+	}
+	appendStringInfoString(&sql, " ORDER BY d.key LIMIT 1");
+
+	pfree(pkjoin);
+	pfree(token);
+
+	ret = ob_spi_one_shot(sql.data, true, 1);
+	pfree(sql.data);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply batch validation on %s failed ret=%d",
+						RelationGetRelationName(ri->rel), ret)));
+	}
+
+	if (SPI_processed == 1 && SPI_tuptable && SPI_tuptable->vals &&
+		SPI_tuptable->vals[0])
+	{
+		HeapTuple	tup = SPI_tuptable->vals[0];
+		TupleDesc	td = SPI_tuptable->tupdesc;
+		bool		isnull;
+		Datum		dv;
+		MemoryContext oldmc;
+
+		/* SPI_finish() tears the tuple down, so copy what we need. */
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		c.found = true;
+		c.key = SPI_getvalue(tup, td, 1);
+		c.old_version = SPI_getvalue(tup, td, 2);
+		dv = SPI_getbinval(tup, td, 3, &isnull);
+		c.main_missing = isnull ? false : DatumGetBool(dv);
+		c.main_ver = SPI_getvalue(tup, td, 4);
+		MemoryContextSwitchTo(oldmc);
+	}
+	SPI_finish();
+
+	return c;
+}
+
+/*
+ * ob_batch_report_conflict - raise the conflict error for a validated batch
+ * offender.  The wording matches the per-row passes verbatim so existing
+ * baselines are unaffected; never returns.
+ */
+static void
+ob_batch_report_conflict(ObApplyRelInfo *ri, char op, ObBatchConflict *c,
+						 const char *branch_name)
+{
+	char	   *reason;
+
+	Assert(c->found);
+
+	if (op == DELTA_OP_DELETE)
+	{
+		if (c->main_missing)
+			reason = psprintf("DELETE delta pk=%s: MAIN row no longer present at apply time (concurrent DELETE or UPDATE rewrite).  expected old_version=%s.  Resolve manually and re-branch.",
+							  c->key,
+							  c->old_version ? c->old_version : "(null)");
+		else
+			reason = psprintf("conflict pk=%s: old_version expected=%s but MAIN latest=%s",
+							  c->key,
+							  c->old_version ? c->old_version : "(null)",
+							  c->main_ver ? c->main_ver : "(null)");
+	}
+	else if (op == DELTA_OP_UPDATE)
+	{
+		/* A NULL old_version means the delta carries no MAIN baseline, so the
+		 * conflict is simply "MAIN row unexpectedly present": the live
+		 * (ctid,xmin) token is internal and deliberately not surfaced. */
+		if (c->old_version == NULL)
+			reason = psprintf("conflict pk=%s: old_version expected=(null) MAIN latest=(null)",
+							  c->key);
+		else if (c->main_missing)
+			reason = psprintf("UPDATE pk=%s MAIN row missing at apply time (concurrent UPDATE/DELETE or table rewrite)",
+							  c->key);
+		else
+			reason = psprintf("conflict pk=%s: old_version expected=%s MAIN latest=%s",
+							  c->key, c->old_version,
+							  c->main_ver ? c->main_ver : "(null)");
+	}
+	else
+	{
+		reason = psprintf("INSERT pk=%s MAIN row already present (MAIN pk already contains this PK)",
+						  c->key ? c->key : "(null)");
+	}
+
+	/* ob_batch_validate() parked these in TopMemoryContext; the guard below
+	 * never returns, so release them (reason already holds its own copies). */
+	if (c->key)
+		pfree(c->key);
+	if (c->old_version)
+		pfree(c->old_version);
+	if (c->main_ver)
+		pfree(c->main_ver);
+
+	overlay_guard_ereport_fail("apply_branch (conflict)",
+							   RelationGetRelationName(ri->rel),
+							   branch_name,
+							   reason);
+}
+
+/* ob_batch_check_count - the validation SELECT ran right before the batch
+ * DML, so a differing row count means a concurrent MAIN change slipped into
+ * the gap.  Abort: the enclosing transaction rolls the whole apply back. */
+static void
+ob_batch_check_count(ObApplyRelInfo *ri, const char *op_name,
+					 uint64 expected, uint64 actual)
+{
+	if (expected == actual)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("apply batch %s on %s processed " UINT64_FORMAT
+					" rows, expected " UINT64_FORMAT
+					" (concurrent MAIN modification during batch replay)",
+					op_name, RelationGetRelationName(ri->rel),
+					actual, expected),
+			 errhint("Re-run apply_branch(); the branch state was rolled back to ACTIVE.")));
+}
+
+static void
+ob_batch_delete_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
+{
+	StringInfoData sql;
+	char	   *pkjoin;
+	char	   *token;
+	int			ret;
+	uint64		n;
+
+	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+	token = ob_batch_token_expr("m");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "DELETE FROM %s m USING %s d "
+					 "WHERE d.branch_id = %d AND d.relid = %u "
+					 "AND d.op = 'D' AND d.old_version IS NOT NULL "
+					 "AND %s AND d.old_version = %s",
+					 ri->q_relname, OBTABLE_DELTA, (int) bid,
+					 (unsigned) ri->relid, pkjoin, token);
+	pfree(pkjoin);
+	pfree(token);
+
+	ret = ob_spi_one_shot(sql.data, false, 1);
+	n = SPI_processed;
+	SPI_finish();
+	pfree(sql.data);
+
+	if (ret != SPI_OK_DELETE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply batch DELETE on %s failed ret=%d",
+						RelationGetRelationName(ri->rel), ret)));
+
+	ob_batch_check_count(ri, "DELETE", expected, n);
+}
+
+static void
+ob_batch_update_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
+{
+	StringInfoData sql;
+	char	   *pkjoin;
+	char	   *token;
+	int			ret;
+	uint64		n;
+
+	pkjoin = ob_batch_pkjoin_expr(ri, "s", "m");
+	token = ob_batch_token_expr("m");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "UPDATE %s m SET (%s) = ("
+					 "SELECT %s FROM jsonb_populate_record(NULL::%s, s.tj) AS j) "
+					 "FROM (SELECT convert_from(d.tuple_data, 'UTF8')::jsonb AS tj, "
+					 "d.key AS key, d.old_version AS old_version "
+					 "FROM %s d WHERE d.branch_id = %d AND d.relid = %u "
+					 "AND d.op = 'U' AND d.old_version IS NOT NULL) s "
+					 "WHERE %s AND s.old_version = %s",
+					 ri->q_relname, ri->colnames, ri->colnames_parens,
+					 ri->q_relname, OBTABLE_DELTA, (int) bid,
+					 (unsigned) ri->relid, pkjoin, token);
+	pfree(pkjoin);
+	pfree(token);
+
+	ret = ob_spi_one_shot(sql.data, false, 1);
+	n = SPI_processed;
+	SPI_finish();
+	pfree(sql.data);
+
+	if (ret != SPI_OK_UPDATE && ret != SPI_OK_UPDATE_RETURNING)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply batch UPDATE on %s failed ret=%d",
+						RelationGetRelationName(ri->rel), ret)));
+
+	ob_batch_check_count(ri, "UPDATE", expected, n);
+}
+
+static void
+ob_batch_insert_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
+{
+	StringInfoData sql;
+	char	   *pkjoin;
+	int			ret;
+	uint64		n;
+
+	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s (%s) "
+					 "SELECT %s FROM %s d "
+					 "CROSS JOIN LATERAL jsonb_populate_record(NULL::%s, "
+					 "convert_from(d.tuple_data, 'UTF8')::jsonb) AS j "
+					 "WHERE d.branch_id = %d AND d.relid = %u "
+					 "AND (d.op = 'I' OR (d.op = 'U' AND d.old_version IS NULL)) "
+					 "AND NOT EXISTS (SELECT 1 FROM %s m WHERE %s)",
+					 ri->q_relname, ri->colnames, ri->colnames_parens,
+					 OBTABLE_DELTA, ri->q_relname, (int) bid,
+					 (unsigned) ri->relid, ri->q_relname, pkjoin);
+	pfree(pkjoin);
+
+	ret = ob_spi_one_shot(sql.data, false, 1);
+	n = SPI_processed;
+	SPI_finish();
+	pfree(sql.data);
+
+	if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("apply batch INSERT on %s failed ret=%d",
+						RelationGetRelationName(ri->rel), ret)));
+
+	ob_batch_check_count(ri, "INSERT", expected, n);
+}
+
+/* ob_apply_relation_per_row - the legacy replay: full D→U→I sweeps of the
+ * delta list, one SPI statement group per row. */
+static void
+ob_apply_relation_per_row(ObApplyRelInfo *ri, List *deltas,
+						  const char *branch_name)
+{
+	ListCell   *dlc;
+
+	foreach(dlc, deltas)
+	{
+		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+		if (dt->op == DELTA_OP_DELETE)
+		{
+			elog(DEBUG1, "apply[dbg] DELETE pass key=%s", dt->key ? dt->key : "NULL");
+			apply_relation_delete_pass(ri, dt, branch_name);
+			elog(DEBUG1, "apply[dbg] DELETE pass DONE");
+		}
+	}
+	foreach(dlc, deltas)
+	{
+		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+		if (dt->op == DELTA_OP_UPDATE)
+		{
+			elog(DEBUG1, "apply[dbg] UPDATE pass key=%s", dt->key ? dt->key : "NULL");
+			apply_relation_update_pass(ri, dt, branch_name);
+			elog(DEBUG1, "apply[dbg] UPDATE pass DONE");
+		}
+	}
+	foreach(dlc, deltas)
+	{
+		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+		if (dt->op == DELTA_OP_INSERT)
+		{
+			elog(DEBUG1, "apply[dbg] INSERT pass key=%s", dt->key ? dt->key : "NULL");
+			apply_relation_insert_pass(ri, dt, branch_name);
+			elog(DEBUG1, "apply[dbg] INSERT pass DONE");
+		}
+	}
+}
+
+/* ob_apply_batch_can_use - can this relation be replayed with batch SQL? */
+static bool
+ob_apply_batch_can_use(ObApplyRelInfo *ri, List *deltas)
+{
+	ListCell   *lc;
+
+	if (!ob_apply_batch)
+		return false;
+
+	/* Keyless tables have no PK column to join the delta key against. */
+	if (ri->n_pk <= 0)
+		return false;
+
+	/* The R15/R18 base-image compare stays row-scoped: one delta carrying a
+	 * "_base" key sends the whole relation down the per-row replay. */
+	foreach(lc, deltas)
+	{
+		DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
+
+		if (ob_delta_has_base_key(dt->tuple_data))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * ob_apply_relation_batch - replay one relation's deltas with batch SQL,
+ * keeping the D→U→I order (and thus the conflict error priority).
+ */
+static void
+ob_apply_relation_batch(ObApplyRelInfo *ri, int32 bid, List *deltas,
+						const char *branch_name)
+{
+	uint64		n_del = 0;		/* DELETE rows claiming a MAIN baseline */
+	uint64		n_upd = 0;		/* UPDATE rows claiming a MAIN baseline */
+	uint64		n_orphan = 0;	/* pure-delta UPDATE rows (no MAIN row) */
+	uint64		n_ins = 0;		/* INSERT rows + materialised orphan-U rows */
+	ListCell   *lc;
+	ObBatchConflict c;
+
+	foreach(lc, deltas)
+	{
+		DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
+
+		if (dt->op == DELTA_OP_DELETE)
+		{
+			if (dt->old_version != NULL)
+				n_del++;
+		}
+		else if (dt->op == DELTA_OP_UPDATE)
+		{
+			if (dt->old_version != NULL)
+				n_upd++;
+			else
+			{
+				n_orphan++;
+				n_ins++;
+			}
+		}
+		else if (dt->op == DELTA_OP_INSERT)
+			n_ins++;
+	}
+
+	elog(DEBUG1, "apply[dbg] batch counts D=" UINT64_FORMAT " U=" UINT64_FORMAT
+		 " orphan=" UINT64_FORMAT " I=" UINT64_FORMAT,
+		 n_del, n_upd, n_orphan, n_ins);
+
+	/* ---- DELETE pass (pure-delta DELETEs are no-ops and need no SQL) ---- */
+	if (n_del > 0)
+	{
+		c = ob_batch_validate(ri, bid, DELTA_OP_DELETE);
+		if (c.found)
+			ob_batch_report_conflict(ri, DELTA_OP_DELETE, &c, branch_name);
+		ob_batch_delete_pass(ri, bid, n_del);
+	}
+
+	/* ---- UPDATE pass ----
+	 * Validate whenever the relation carries any UPDATE delta: an orphan-U
+	 * whose MAIN row exists must report the UPDATE-specific conflict before
+	 * the INSERT pass runs. */
+	if (n_upd + n_orphan > 0)
+	{
+		c = ob_batch_validate(ri, bid, DELTA_OP_UPDATE);
+		if (c.found)
+			ob_batch_report_conflict(ri, DELTA_OP_UPDATE, &c, branch_name);
+		if (n_upd > 0)
+			ob_batch_update_pass(ri, bid, n_upd);
+	}
+
+	/* ---- INSERT pass: new rows plus materialised orphan-U rows ---- */
+	if (n_ins > 0)
+	{
+		c = ob_batch_validate(ri, bid, DELTA_OP_INSERT);
+		if (c.found)
+			ob_batch_report_conflict(ri, DELTA_OP_INSERT, &c, branch_name);
+		ob_batch_insert_pass(ri, bid, n_ins);
+	}
 }

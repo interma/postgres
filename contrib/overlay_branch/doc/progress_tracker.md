@@ -6,13 +6,15 @@
 > **V2** = 透明 BranchScan 模式（普通 `SELECT *` 自动做 Main⊕Delta 合并）
 > **V3** = 多会话 MVCC + snapshot 模式（NOTIFY 失效广播 / 阈值节流 / DQL-DML 拆分 / use_branch('name','mode') 两参）
 > **V4** = Review 260926 修复闭环（S02–S18 Batch 1-6 × 22 R 问题台账 × G01/G02 产品化加固 × S13 双门禁）
+> **V5** = B6 无 PK 表 ctid 实验特性（GUC `overlay_branch.keyless_tables`）
+> **V6** = 性能路线（读路径去 SPI / P0 谓词下推 / 阶段 3A apply 每行合并 / 阶段 3B 集合式批处理 / WR-1 前置 M10 基线 + 删 delta 冗余索引 / 阶段 5 WR-1a 写路径参数化 prepared plan），见 [performance.md](performance.md)
 
 > 编号说明：1/2/3/4/5/7/8 对应 V1 实际里程碑；Step 6 被并入 Step 7 的 Hard Guard
 > 和推迟到 V3 的多 session MVCC pin；V4 为 2026-10 新增批次。
 
 ---
 
-## 整体状态（2026-10-16 — V4 全段主路径完成 + V5 B6 keyless）
+## 整体状态（2026-10-29 — SRF 读路径瞬态峰值修复（MF-1 补漏：leak 9/10））
 
 | 维度 | 当前状态 | 验收证据 |
 |------|---------|---------|
@@ -24,7 +26,7 @@
 | 架构 A1–A10 | A3/A5 ✅；A7 ✅ (schema epoch registry + DDL restricted MVP)；A2 ✅ (Read/Write View Unification)；**A8 ✅ (MVP cost_branchscan cost model + planner correctness)**；**A9 ✅ (pg_branch identity & restore metadata: schema_hash/creation_snapshot_xmin/tablespace_list/col_signature, new get_branch_identity helper, 13+9 2x green)**；**A4 ✅ (SQL-layer empty-branch apply/discard fast-return wrapper, 10K-row 3-op 5 PASS markers, 13+9 2x green)**；A1/A6 ⚡ DEFER (M4+)；A10 ⚡ OPEN | 见 [review_260926.md §9](review/review_260926.md#L447) |
 | 产品 P01–P03 / G03–G06 | ✅ P01/P02/P03 FIXED by 2026-10-11 trial run (10 PR 10/10 PASS: editor 100% / reviewer 10/10 pure-read / apply 100% / 0 silent-merge / 10 non-empty apply / 0 hidden catalog UPDATE; P02 weighted support 100% ≥80%). G03/G04/G06 remain 📌 MANIFEST (need real FAIL-case drill / M4+ owner fill / DBA live drill). G05 S28 ⚡ OPEN (100-concurrency baseline pending). | [example_sql §0.1 P01](example_sql.md#L68) / [§9.2 P02](example_sql.md#L870) / [agent_workflow §4 P03](agent_workflow.md#L151) / [ops_runbook G03-G06](ops_runbook.md) |
 | 代码编译 0 warning/error | ✅（连续 clean rebuild 3 轮均 0） | `make -C contrib/overlay_branch -j`（in-tree，prefix=$(HOME)/pg17） |
-| L3 单会话 pg_regress （17 files） | ✅ **17/17 PASS**，`diff -r results expected` = **0 lines** | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) / **keyless** (B6 no-PK ctid identity) / **parallel** (MF-2/MF-3 分支内禁并行) / **memgrow** (MF-1 会话内存稳定) / **pushdown** (RD-1/RD-2 non-PK 下推 + Pass2 孤儿路径正确性) |
+| L3 单会话 pg_regress （18 files） | ✅ **18/18 PASS**，`diff -r results expected` = **0 lines** | basic / user / scan_pk / scan_type / mvcc_bounds / mvcc_usage / mvcc_review / puredelta / puredelta_mix / rentry / upsert / view_unify / **planner_cost** (A8 cost!=0 / PK<<SEQ / SJ 2× CustomScan 3 PASS assertions) / **keyless** (B6 no-PK ctid identity) / **parallel** (MF-2/MF-3 分支内禁并行) / **memgrow** (MF-1 会话内存稳定：读路径 / 写路径 / 纯 delta 多行 UPDATE / 错误路径 / per-row apply 回放 5 组探针，全 `grew=0`；另 Section 1b 覆盖 SRF 读路径，其瞬态峰值由 L2 `test/bench/srf_peak_rss.sh` 兜底) / **pushdown** (RD-1/RD-2 non-PK 下推 + Pass2 孤儿路径正确性) / **plancache** (WR-1a 写路径 prepared-plan 跨语句复用 + DISCARD PLANS / ALTER TABLE 后失效重建 + `"` `\` `'` 换行 / 非 UTF8 bytea delta durability) |
 | L1 isolationtester 多会话（12 specs） | ✅ **12/12 PASS**（2× consecutive stable 后，0 diff） | ob_apply_mutex / ob_state_inval / ob_applying_freeze / ob_snapshot_mode / ob_branchscan_rescan / pure_delta_upsert / pure_delta_update / pure_delta_delete / ob_view_unify_rescan / **keyless_basic / keyless_pure_delta_repeat / keyless_apply_conflict** (B6 keyless ctid: GUC on WARNING + 读写叠加 + pure-delta 合成键幂等 + 跨会话 apply 冲突 0A000) |
 | 标签唯一性（G01_SCOPE_* × 11 + G02_* × 10 PASS） | ✅ 每个 label grep count = 2（1 SQL CASE WHEN token + 1 output row = 完美唯一） | rentry L3 out |
 | Shared-preload + extension script 重启闭环 | ✅ 每次 `make install` 后强制 `pg_ctl restart` 且 lsof 确认 .so 时间戳匹配 | 见 VPATH/prefix triple-check |
@@ -48,6 +50,13 @@
 13. **阶段 2b 读路径去 SPI（RD-7）**：MAIN 基线读取由 SPI `SELECT *` 全量物化改为 `table_beginscan`/`table_scan_getnextslot` 直扫（探针 slot `TTSOpsBufferHeapTuple`）；用 executor `node->ss.ps.qual`（baserestrictinfo 全套）预筛 MAIN 行，被预筛剔除但被分支改写的行由 Pass2 orphan 补回、`scan.plan.qual` 复筛兜底；P0 点查（`has_pk_pred`）保留 SPI 以复用 planner PK 索引；非 P0 时不再构建 deparsed SQL 文本。新增 L3 Section H（8 用例：全扫/预筛补回/复筛/P0 点查/SRF 等价/LIMIT/MAIN 零污染）。踩坑修复：virtual slot 上编译的 qual 须先 `slot_getsomeattrs` 物化探针 slot（`ExecComputeSlotInfo` 省略 de-form）；P0 分支 `SPI_connect` 重挂 `CurrentMemoryContext` 须在读行前切回 `result_cxt`。详见 [branchscan.md §D.3 / §D.3.1](branchscan.md) / [performance.md §5](performance.md)
 14. **阶段 2c 读路径流式早停（RD-6）**：叠加读路径由「先全量物化 `List<slot>`」改为**迭代器** `OverlayScanState` + `overlay_scan_open/next/close`——Pass1 按需吐 MAIN 行、Pass2 按需补发 delta 孤儿，迭代顺序与旧实现逐字节一致；`ob_branchscan_exec()` 每次只拉一行（`LIMIT`/游标可早停），`ReScan` 丢弃迭代器并 `MemoryContextReset(scan_cxt)` 后懒重开；SRF `overlay_main_plus_delta` 改为流式句柄 `ob_overlay_srf_open/next/close`（`LIMIT` 截断由 context reset callback 释放）；exec methods 表移除 MarkPos/RestorePos（`CustomPath.flags` 不含 `CUSTOMPATH_SUPPORT_MARK_RESTORE`，需要时由 planner 自动插 `Materialize`）。连带修复：`baserestrictinfo` 中含 PARAM_EXEC / 外层 Var 的 clause 在 deparse 前剔除（`ob_expr_has_outer_ref()`）——否则 `ruleutils.get_parameter()` 会以 NULL plan 解引用 `dpns->plan` 而崩溃。新增 L3 Section I（9 用例：拉干全扫/Pass1 早停/跨 Pass2 早停/游标复用/SRF 早停/SRF 等价/相关子计划 rewind/MAIN 零污染）。详见 [branchscan.md §D.4–§D.6](branchscan.md) / [performance.md §5](performance.md)
 15. **阶段 2d P0 谓词下推扩展（IN / 范围 / OR）**：P0 的 L1 识别面由「单列 `pk = Const`」放宽到 PK 列的 btree 五算子（`= < <= > >=`）+ `IN` / `= ANY(...)` + 其 `AND`/`OR` 组合（`ob_pk_btree_op_strategy` / `ob_is_pk_pushable_clause` / `ob_pk_point_const`）；Planner 改为「收集全部纯 PK 子句 → `AND` 串起 → 一次性 `deparse_expression`」透传同一个 MAIN SPI SELECT（自动获得 planner 选出的 PK 索引扫描，SPI 机制不变）。custom_private 6 元素协议**语义放宽**：`pkflag=1` 不再要求 `pk_serialized_key` 非空；L2 DELTA 明确降级为「仅单点等值走 `overlay_delta_lookup` O(1)，其余走 `overlay_delta_list_for_rel` 全量列表」——**零新增 delta 侧代码**。P0 SPI 结果由「只取 `vals[0]`」改为遍历 `SPI_processed` **多行物化**到 `st->p0_rows`。取舍：P0 命中路径失去 RD-6 的 MAIN 侧早停（谓词已收窄 + 走索引扫描，物化行数有界）。新增 L3 Section J（8 断言：IN / BETWEEN / 开区间 / OR / P0+P2 协同 / 范围下 Pass2 orphan 补回与越界 orphan 丢弃 / EXPLAIN 单节点 / MAIN 零污染）。详见 [branchscan.md Part E](branchscan.md) / [performance.md §5](performance.md)
+16. **阶段 3A apply 每行合并（去 `_base` 冗余探测，消除 planning 回归）**：`ob_build_pk_where_clause` 由「`VALUES`+`string_agg` 内联拼 WHERE」退化为**裸 targetlist**（`SELECT jsonb_array_length($1) , ($1::jsonb)->>0 , ...`），WHERE 在 C 层用 `format_type_with_typemod()` 记忆化的列类型拼装；新增 `ob_delta_has_base_key()` C 层字节扫描快路径——活路径写重定向从不写 `_base`，无 `_base` 键则跳过整条规范化比对 SQL（0 SPI）。每 delta 行 SPI 由 D/U 4 次降到 **3**、I 4 次降到 **2**。**关键在于规划成本而非 SPI 次数**：3A 初版复杂 SQL 字面量内联导致计划不可复用，M8 apply 从 HEAD ~1300 ms 回归到 3293.7 ms（+150%）；修正版回到 1310.5 ms（与 HEAD 持平）。改回语义等价，L3 新增 `SECTION AP1`（D+U+I 正路径 + 3 条 `0A000` 冲突负向）。详见 [performance.md §6.3 / §6.3.1](performance.md)
+17. **阶段 3B 集合式批处理（AP-1）**：apply 回放由「每 delta 行 4~5 次 SPI」改为**每 `(relid, op)` 2 条 SQL**（验证 SELECT + 批 DML），把 planning 与 exec 都压到 `O(1)/op`。GUC `overlay_branch.apply_batch`（**默认 on**）控制启用；keyless（`n_pk=0`）与任一 delta 含 `_base` 的 `(relid, op)` **自动回退** 3A 逐行路径。核心：验证与变更**谓词同源**（token = `translate(ctid::text,'()','')` + `-x` + `xmin`）；批 DML 自带行锁 + 同语句 token 谓词 =「加锁即校验」；以 `SPI_processed` 与 C 端预期计数比对做兜底断言（`ERRCODE_INTERNAL_ERROR`）；单事务内冲突 `ereport` 回滚全部批 DML。3 趟顺序 D→U→I、逐行乐观冲突语义、纯 delta 特例、6 类冲突消息措辞**逐字**保持不变。**L2**：M8 apply `N=200000 M=20000` 由 3A 的 1260.8 ms 降到 **192.4 / 165.9 ms**（**~7×**）。新增 L3 `SECTION AP2`（11 断言：D+U+I 批回放正路径、6 类冲突负向、orphan-U→INSERT、keyless 回退、`apply_batch` off/on **差分等价**）。详见 [performance.md §6.4](performance.md)
+18. **WR-1 前置（M10 写路径基线 + 删除 delta 冗余索引）**：`perf_baseline.sql` 把 build-delta 拆为 M10a/b/c 三段计时（UPDATE `m/2` / DELETE `m/4` / INSERT `m/4`）；首跑即暴露 M10c INSERT 每行 ~1686 µs（比 UPDATE/DELETE 慢 **20×**）。根因非 planning 也非内存：`pg_branch_delta` 上冗余索引 `pg_branch_delta_relid_idx (branch_id, relid)` 是 PK `(branch_id, relid, key)` 的严格前缀，内部表统计缺失（`reltuples = -1`）时 planner 优先选它并把 `key = ...` 降级为 **Filter**，使每行 delta 存在性探测退化为 **O(delta)**。删除该索引后恒走 pkey 点查（与统计无关）：M10c `N=200000 M=20000` 由 **8429.8 ms → 422.6 ms**（每行 1686 → 84.5 µs，**~20×**），与 UPDATE/DELETE 同量级。新增 L3 `overlay_branch_upsert.sql` `Section V`（索引布局不变式：内部表只应有 PK、无 `(branch_id, relid)` 冗余索引；+ M=2000 行下写路径探测命中/冲突两路径）。详见 [performance.md §8.6 / §8.6.1](performance.md)
+19. **写路径 MF-1 泄漏收尾（WR-1 前置）**：读路径 MF-1 只覆盖读侧；写重定向里同源的「跨 `SPI_finish` 存活对象误放 `TopMemoryContext`」又现三处——`fetch_tuple_by_ctid()` 重建的 pre-image slot / `CreateTupleDescCopy()` tupdesc / 列值 `datumCopy()`（每重定向 UPDATE/DELETE 行一份）、UPDATE SET-merge 的 post-image 列副本（每行每 varchar SET 列一份）、pure-delta UPDATE 步 `overlay_delta_lookup()` 结果从不释放（每重写行整段序列化 payload）。修复：`fetch_tuple_by_ctid()` 增 `MemoryContext result_cxt`（镜像 `reconstruct_slot_from_delta()`），3 调用点传 `es_query_cxt`；SET-merge / pure-delta post-image 分配改 `es_query_cxt`；pure-delta 步补 `dtu` 释放。`overlay_branch_memgrow.sql` 增写路径探针（阈值 1 MB）：修复前 pure-delta UPDATE 2000 行 `grew=4128768`（≈2064 B/行），修复后全部 `grew=0`。详见 [performance.md §2.1 / §8.6.1](performance.md)
+20. **阶段 5 WR-1a 写路径参数化 prepared plan**：新增 `src/plan_cache.c`（`TopMemoryContext` 子 context + `HASH_STRINGS` 缓存，键 = SQL 文本；`ob_spi_exec_params()` 契约同 `ob_spi_one_shot()`，`SPI_prepare_cursor(CURSOR_OPT_GENERIC_PLAN)` + `SPI_keepplan()` 只 prepare 一次 + `SPI_execute_plan()` 复用；失效完全交给常规 plancache——`ResetPlanCache()` 遍历 `saved_plan_list`，由 relcache/syscache 回调、`DISCARD PLANS` 与 branch 切换 `CacheInvalidateRelcacheAll()` 驱动，**不自建失效回调**）。改造 `delta_store.c` 4 处 + `write_redirect.c` 4 处由字面量内联改为 `$1..$n` 绑定；`tuple_data` 由 `'\x..'` 文本字面量改为 `BYTEAOID` datum；每条 SQL 后显式 `pfree` 参 datum（allocation-neutral，MF-1 写探针不回归）。**连带修复**：`r21_check_insert_preconditions()` 在 SPI 上下文内 `pstrdup`、`SPI_finish()` 后 `ereport` 再读（cassert `CLOBBER_FREED_MEMORY` 下打印 `0x7F` 垃圾，`overlay_branch_upsert` DETAIL 曾被 bless 成脏数据）——改为直接引用调用方上下文的 `pkval_txt`。新增 L3 `overlay_branch_plancache.sql`（跨语句复用一致 / `DISCARD PLANS` + `ALTER TABLE` 后重跑 / `"` `\` `'` 换行与非 UTF8 bytea durability）。Green-Bar：2× clean rebuild 0 warning + L3 **18/18** + L1 **12/12** + 双 `diff -r` 0。详见 [performance.md §8.10](performance.md)
+21. **全库内存泄漏二次审计与统一修复（MF-1 同类族）**：以 [performance.md §2.1 MF-1](performance.md) 记录的历史根因为基线，对全树每处 SPI 分配点做同类排查，又定位并统一修复 5 类「跨 `SPI_finish` 存活对象 / 中间副本 / 错误路径副本」泄漏 —— ① `write_redirect.c` pure-delta Phase D `raw_rows` 收集循环在 `es_query_cxt` 内 `pstrdup(SPI_getvalue())`（原串无人释放，`continue` 分支同样泄漏）；② `branch_lifecycle.c : ob_check_branch_scope` 在 `SPI_finish()` 后读 `detail`（UAF）；③ `ob_registry_check_current_schema` 两处 `sql/ins` 文本 finish 后读（UAF）+ 只服务 `ereport` 的副本落 `TopMemoryContext`（每次失败累积）；④ `ob_build_pk_where_clause`（仅 per-row apply 回放）`SPI_getvalue()` PK 文本与 `quote_lit` 未释放；⑤ `ob_batch_report_conflict` 每次冲突 3 串、`delta_store.c : overlay_delta_insert` state≠ACTIVE 拒写分支文本落 TopMC。统一原则：SPI 指针 **finish 前**拷出到调用方 context；只为报错的副本落调用方 context；`SPI_getvalue()` 结果直接接管或即用即放。`overlay_branch_memgrow.sql` 新增 3 个探针 Section（纯 delta 多行 UPDATE / 反复失败 `create_branch()` 错误路径 / `apply_batch=off` per-row apply 回放），三探针 `grew=0`。Green-Bar：2× clean rebuild 0 warning + L3 18/18 + L1 12/12 + 双 `diff -r` 0。详见 [performance.md §2.1 第 11 处 / §8.7](performance.md) 与 [internals.md §4.8](internals.md)
+22. **SRF 读路径瞬态峰值修复（MF-1 补漏：leak 9/10）**：承接批次 21 的「成功路径」审计，续查 **SRF 读路径**的**语句内瞬态**增长（语句结束即释放，`TopMemoryContext` 前后断言不可见）——① `overlay_branch.c : overlay_main_plus_delta()` 把每行 scratch（`values[]`/`isnulls[]` + 结果 tuple）分配在 `funcctx->multi_call_memory_ctx`（SRF 结束才删），整表扫描随行数线性增长；修复为 per-call 不再切 multi-call ctx，scratch 落 executor 的 `ecxt_per_tuple_memory`（value-per-call 循环每次 `ResetExprContext`）。② `branch_scan.c : overlay_scan_next()` 每行重建的结果 slot 及其 `datumCopy` 落 `result_cxt`（SRF 侧即 multi-call ctx，扫描期不 reset）；修复为新增 child `row_cxt`（`overlay_scan_open` 建），每次调用入口 `MemoryContextReset`，`reconstruct_slot_from_delta()` / tombstone 均走 `row_cxt`。**定性**：新增 L2 探针 `test/bench/srf_peak_rss.sh`（两轮扫描，只判**第二轮** VmHWM 增量）证明修复后 300k 行首轮 +32 MB（一次性 allocator 高水位，有界）、**第二轮仅 +0.4 MB**（平台化），而带缺陷时每轮约 +80 MB——确认**无残留泄漏**。L3 `overlay_branch_memgrow.sql` 新增 Section 1b 钉住 SRF 读路径结果（`MF1_SRF_RESULT_CORRECT_PASS` / `MF1_SRF_CONTENT_CORRECT_PASS`）。Green-Bar：2× clean rebuild 0 warning + L3 18/18 + L1 12/12 + 双 `diff -r` 0。详见 [performance.md §2.1 SRF 段落](performance.md) / [test/bench/README.md](../test/bench/README.md)
 
 ---
 
@@ -56,7 +65,7 @@
 | Step | 标题 | 状态 | 交付物入口 |
 |------|------|------|-----------|
 | 1 | Branch Context SPI + 管理函数 | ✅ | [overlay_branch--1.0.sql](../overlay_branch--1.0.sql#L21-L128) / `overlay_branch.c` `overlay_branch_create/use/current` |
-| 2 | Delta Store SPI + UPSERT/lookup/count | ✅ | [overlay_branch--1.0.sql#L41-L55](../overlay_branch--1.0.sql#L41-L55) / [overlay_delta_insert](../src/overlay_branch.c#L2637) |
+| 2 | Delta Store SPI + UPSERT/lookup/count | ✅ | [overlay_branch--1.0.sql#L41-L52](../overlay_branch--1.0.sql#L41-L52) / [overlay_delta_insert](../src/overlay_branch.c#L2637) |
 | 3 | Write Redirect INSERT-only + ExecutorRun hook | ✅ | [overlay_ExecutorRun](../src/overlay_branch.c#L961-L1220) CMD_INSERT 分支 |
 | 4 | U/D 真实重定向 + `overlay_main_plus_delta` 2-pass SRF | ✅ | [overlay_main_plus_delta](../src/overlay_branch.c#L1487) / 2-Pass 算法 |
 | 7 | Hard Guard 16 场景零静默穿透 | ✅ | `overlay_guard_ereport_fail()` × 6 级 guard order × ProcessUtility/ExecutorRun 双接入 |
@@ -884,6 +893,53 @@ Section P PASS marker 之后追加 Section Q：
 **文档同步**
 - 设计：`doc/keyless_ctid_design.md`（§8 已决策 + §9 同步清单 ✅）
 - 用户/实现：`internals.md`（§1.1/§4.3/§5）、`README.md`、`example_sql.md` §5+§6.8、`AGENTS.md` §1 Managed tables（keyless 例外）+ §7 文档索引、`test_coverage_index.md`
+
+
+## V6 — 性能路线（2026-10-28）
+
+> 目标：在**不改变 L1/L3 语义**的前提下压缩读路径（BranchScan 2-pass 叠加）、写路径（DML 重定向）与
+> apply（3-pass 回灌）的常数因子。详见 [performance.md](performance.md)。
+
+**交付批次**（详见「关键交付批次」第 9–17 项）
+- 阶段 0 热修（MF-1/MF-2/MF-3）+ MF-5/RD-1/RD-2 O(M²) 折叠删除
+- 阶段 1 / 1b / 2a 读路径去 SPI（RD-3/4/5/8）
+- 阶段 2b/2c/2d 读路径直扫 + 流式早停 + P0 谓词下推扩展（RD-7/RD-6）
+- 阶段 3A apply 每行合并：`ob_build_pk_where_clause` 退化裸 targetlist + `ob_delta_has_base_key` C 层 `_base` 探测
+  → 每 delta 行 SPI D/U **3**、I **2**；顺带消除 3A 初版的 planning 回归（M8 apply ~1300 ms 与 HEAD 持平）
+- **阶段 3B 集合式批处理（AP-1，本次）**：`apply_batch`（默认 on）→ 每 `(relid, op)` 2 条 SQL（验证 + 批 DML）；
+  keyless / 含 `_base` 的 `(relid, op)` 回退 3A 逐行；谓词同源 + `SPI_processed` 兜底计数 + 单事务冲突回滚
+- **写路径 MF-1 收尾（WR-1 前置，本次）**：读路径 MF-1 只覆盖读侧，写重定向三处同源泄漏一并修复 ——
+  `fetch_tuple_by_ctid()` 增 `MemoryContext result_cxt`（3 调用点传 `es_query_cxt`）、UPDATE SET-merge 与
+  pure-delta post-image 分配改 `es_query_cxt`、pure-delta 步补 `overlay_delta_lookup()` 结果释放；
+  `memgrow` 增写路径探针（`MF1_WRITE_MEM_STABLE_PASS`）
+
+**验收（2026-10-28）**
+- L2 实测（`N=200000 M=20000`，M8 = `SELECT overlay_branch.apply_branch(...)`）：
+  HEAD ~1301–1319 ms / 3A 初版 3293.7 ms（+150% 回归）/ 3A 修正版 1310.5 ms（回归消除）/
+  **3B 192.4 / 165.9 ms**（对 3A 修正版 **~7×**）
+- L3 **17/17** PASS（`overlay_branch_mvcc_review.sql`：`SECTION AP1` = 3A 语义等价；`SECTION AP2` = 3B 集合式批处理 + 差分等价）
+- L1 **12/12** PASS（默认 `on` 下全绿）；双 `diff -r` = 0 lines
+- 编译 0 warning（`-Wdeclaration-after-statement` hard fail 通过）
+- **写路径泄漏探针**（修复前 pure-delta UPDATE 2000 行 `grew=4128768` ≈ 2064 B/行；修复后主表
+  UPDATE/DELETE/INSERT、pure-delta UPDATE、P0 点读全部 `grew=0`）
+
+**证据锚点（`file : function_name`）**
+- `src/branch_lifecycle.c : ob_build_pk_where_clause`（裸 targetlist + C 层 WHERE 拼装）
+- `src/branch_lifecycle.c : ob_delta_has_base_key` / `apply_check_base_image_match`（`_base` C 层快路径）
+- `src/branch_lifecycle.c : ob_fetch_main_version` / `ob_apply_rel_info_build`
+- `src/branch_lifecycle.c : ob_apply_batch_can_use` / `ob_apply_relation_batch` / `ob_batch_delete_pass|update_pass|insert_pass` / `ob_batch_validate` / `ob_batch_report_conflict`
+- `src/overlay_branch.c : ob_apply_batch`（GUC `overlay_branch.apply_batch`，默认 on）
+- `src/delta_store.c : fetch_tuple_by_ctid`（新增 `result_cxt`，写路径 pre-image 不再落 TopMemoryContext）
+- `src/write_redirect.c`（3 调用点传 `es_query_cxt`；SET-merge / pure-delta post-image 改上下文；pure-delta 补 `dtu` 释放）
+- `test/regress/sql/overlay_branch_mvcc_review.sql : SECTION AP1 / SECTION AP2`
+- `doc/performance.md §6.3 / §6.3.1 / §6.4`
+
+**范围外（单独评审）**：3B-1 参数化 prepared plan（备选）；阶段 4 delta 体积可观测。
+
+**文档同步**
+- `doc/performance.md`（§2.1 MF-1 写路径补记 / §5 阶段 0 / §6.1 / §6.3 / §6.3.1 / §6.4 / §6.5 / §6.6 / §7 / §8.6.1）
+- `doc/progress_tracker.md`（本段 + 批次 16/17）、`doc/test_coverage_index.md`（`mvcc_review` 行补 AP1/AP2；`memgrow` 行补写路径探针）
+- `doc/example_sql.md`：**无改动**（API 与用户可见行为不变，均为纯内部优化）
 
 
 ## 关于 Step 6 留空

@@ -214,6 +214,7 @@ extern bool overlay_keyless_tables;	/* experimental: ctid identity for no-PK tab
 extern int	ob_invalidation_check_threshold;	/* every N is_active() calls → SPI check */
 extern int	ob_invalidation_check_interval_ms;	/* every M ms → SPI check */
 extern bool	ob_apply_strict_pins;				/* apply fails if other sessions hold pins */
+extern bool	ob_apply_batch;						/* apply replays deltas per (relid, op) */
 extern bool	ob_use_shared_mem_pin_table;		/* optional: shmem pin tracking */
 extern bool	ob_in_snapshot_mode_helper;		/* internal: PushActiveSnapshot guard */
 extern int	ob_snapshot_max_hold_minutes;		/* R19 RESTRICTED: snapshot mode max minutes */
@@ -493,6 +494,13 @@ extern bool             overlay_in_write_redirect(void);
 extern void             overlay_write_redirect_enter(void);
 extern void             overlay_write_redirect_exit(void);
 extern int              ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount);
+/* WR-1a: parameterized prepared-plan reuse (plan_cache.c).  Same
+ * connect/finish contract as ob_spi_one_shot(); values are bound as $n
+ * parameters instead of being interpolated into the SQL text. */
+extern int              ob_spi_exec_params(const char *sql, bool read_only,
+										   uint64 tcount, int nargs,
+										   const Oid *argtypes,
+										   Datum *values, const char *nulls);
 extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 													MemoryContext result_cxt);
 
@@ -503,7 +511,8 @@ extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_d
  */
 extern AttrNumber       rel_attno_to_slot_idx(TupleDesc slotdesc, AttrNumber rel_attno);
 extern char            *slot_get_ctid_cstr(TupleTableSlot *slot);
-extern TupleTableSlot  *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr);
+extern TupleTableSlot  *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
+											MemoryContext result_cxt);
 
 /* ----------
  * write_redirect.c entry point — thin dispatch from
