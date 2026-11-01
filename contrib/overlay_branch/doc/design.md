@@ -139,6 +139,50 @@ typedef struct BranchContext
 
 > ⚠️ **注意**：不要真的持有一个 PostgreSQL Snapshot 几十分钟，否则 `xmin` 一直不推进，`VACUUM` 会被拖住。第一版可以先规定 Branch 读取"创建时已提交数据"的语义，但物理实现不依赖 long-lived MVCC snapshot。
 
+#### A1/A6 结构性重构：`BranchExecContext`（每语句执行上下文）
+
+**现状：分支身份由三个独立机制 + 全局标志拼装，且执行中途可再读**
+
+| 概念 | 当前存放 | 读取方式 |
+|---|---|---|
+| 模式（live/snapshot） | `CurrentBranchContext->mode`（+ 会话级 `ob_mode_cache_*`） | 每次需要时再读 |
+| 语句快照 | `CurrentBranchContext->branch_main_snapshot` / `snapshot_registered` / `entered_at` | 每次需要时再读 |
+| 首次修改基线（R15） | 每行写时由 `overlay_tuple_version()` 现算，落在 `DeltaTuple.old_version` | 逐行现算；**语义上属每行，不进本结构** |
+| schema 指纹（A7） | `pg_branch_registry.schema_hash`（SPI） | 每次再查 |
+| 递归 bypass | `ob_in_*` 全局 bool | 每次再读 |
+
+**问题**：上述身份信息在执行**中途**可从可变全局再次推导。一旦语句内出现嵌套语句 / SPI / 子事务回滚 / 跨会话失效踢出，同一条语句的两次读取可能观察到**半更新**的分支身份（torn read）；且没有任何单一位置作为「本语句权威上下文」，供缓存/prepared 计划查询与断言。
+
+**目标结构**
+
+```c
+typedef struct BranchExecContext
+{
+    int32    bid;                /* 本语句生效的 branch_id；0 = MAIN */
+    char     mode[16];           /* BRANCH_MODE_LIVE / BRANCH_MODE_SNAPSHOT */
+    struct SnapshotData *stmt_snap;  /* MAIN 读快照；live 模式为 NULL */
+} BranchExecContext;
+```
+
+**`base_ver` 不再作为字段**：R15 的「首次修改基线」是**每行**状态（`DeltaTuple.old_version`），语句级标量无法表达。该 token 记录的是「**该次写入所用 pre-image 的 MAIN 版本**」（`ctid + xmin`）：
+
+- 对**纯 delta 行**（MAIN 无对应行），写路径 Phase I 读出既有 delta 行的 `oldver_txt` 并透传，仅在无基线时才现算，因此重复写**不**改基线。
+- 对 **MAIN-present 行**，pre-image 取自 **overlay 行（MAIN⊕delta）**：DML 子计划对 `resultRelation` 也注入 BranchScan（ACC-1 完整修复），故分支内连续 UPDATE 的表达式以 overlay 视图值而非 MAIN 值为基准。token 的锚点仍是 MAIN 行的物理 `ctid + xmin`，MAIN 在两次分支写之间移动会**重新基线化** token（apply 侧据此 CAS 判冲突），见 `doc/review/review_260926_tracker.md : ACC-1`。
+
+因此第二步只收敛该 token 的**形状**：产生端 `overlay_tuple_version()`（写路径）与 `ob_fetch_main_version()`（apply）统一走 `overlay_base_ver_format()`，解析端 `ob_anchor_is_stale()`（读路径 keyless 锚点新鲜度）统一走 `overlay_base_ver_parse_xmin()`，声明见 `include/overlay_branch.h`。schema 指纹（A7）同理留到第三步按需引入。
+
+**生命周期**：`overlay_ExecutorStart` 在委派 `standard_ExecutorStart` **之前**从 `CurrentBranchContext` 派生并绑定；整条语句只读该副本，**不再**回读全局。存放采用 backend-local 固定栈（`ob_exec_ctx_push` / `ob_exec_ctx_unwind`），不走 palloc：PostgreSQL 在错误中止时会跳过 `ExecutorEnd`（`portalcmds.c : PortalCleanup`），因此中止语句无法自我出栈，改由事务回调 `ob_exec_ctx_reset()` 与子事务回调在 `ABORT_SUB` 时回退到进入该子事务时的深度。planner hook 在规划期把本语句的 branch id 一并打进 `CustomScan.custom_private[6]`（plan-time stamp）；执行期 `BeginCustomScan`（位于 `standard_ExecutorStart` 之内）**校验**该 stamp 与本语句绑定上下文一致，不一致即 `ereport(ERROR)`（0A000）。正常的跨分支复用由 R07 失效（`CacheInvalidateRelcacheAll` + `CommandEndInvalidationMessages`）在更早处强制 replan 并重新打 stamp；该断言是其兜底——把「靠失效兜底、失效漏网则静默读错库」升级为「失效兜底 + 显式断言契约」。**不做伪重规划**：PostgreSQL 无法在 `ExecutorStart` 内真正重新规划。
+
+**`stmt_snap` 为借用指针**：不改变 ownership / `regd_count`；live 模式为 NULL（沿用 executor 的 `ActiveSnapshot`），snapshot 模式指向 `BranchContext` 已管理的快照，仅由 `branch_main_snapshot` 负责注册/注销。
+
+**保留为全局**：`ob_in_*` 递归 bypass 标志**不**进本结构——它们守护的是**同后端重入**（重入天然发生在单条语句之内），语义上本就应 backend-global；本次重构仅补文档说明，不改其存放与语义。`overlay_branch_is_active()` 同样保持 live（内含 FR4 踢出检查，须能在语句中途禁用重定向）。
+
+**迁移（每步独立可测，各自 Green-Bar）**
+1. ✅ 结构 + `overlay_ExecutorStart` 绑定 + 读路径（`branch_scan.c` Pass1 快照/bid、`delta_store.c : overlay_should_redirect`）改用绑定副本；单语句行为不变。
+2. ✅ base-version token codec：`overlay_base_ver_parse_ctid` / `overlay_base_ver_format` / `overlay_base_ver_parse_xmin` 成为 R15/R18 CAS token 的唯一来源，写路径 / apply / 读路径三端共用；行为不变。
+3. ✅ 缓存计划契约（断言式）：planner hook 把 plan-time branch id 打进 `custom_private[6]`；`BeginCustomScan` 校验不一致即 `ereport(ERROR)`（0A000）；新增 `execcontext.sql : EC.7` prepared-plan 回归。**不做伪重规划**——跨分支复用交由 R07 失效在更早处负责。
+4. ✅ 错误恢复：**不用 `PG_TRY` 就地保护**——PostgreSQL 错误中止会跳过 `ExecutorEnd`（`portalcmds.c : PortalCleanup`），就地 catch 反而要在「正常出栈」与「异常出栈」两条路径上重复维护栈且互相干扰；改由 backend-local 栈 + 事务/子事务回调恢复（`ob_exec_ctx_reset` / `ABORT_SUB` 回退到进入该子事务时的深度，见上「生命周期」）。覆盖：L3 `execcontext.sql` `EC.2`（显式 SAVEPOINT 回滚后 identity 存活）/ `EC.3`（PL/pgSQL EXCEPTION ×200 无栈泄漏）；L1 `ob_state_inval.spec`（跨会话 apply → 另一会话 DML 硬 ERROR 55000 / DQL 软 NOTICE + MAIN 回退）。
+
 ### 第二层：Write Redirect
 
 **正常路径：**

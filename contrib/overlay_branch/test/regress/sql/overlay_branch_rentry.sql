@@ -1097,7 +1097,13 @@ SELECT CASE
        END AS a7_d11;
 
 /* ---- A7_D12: FINAL Z clean — fresh branch → use → UPDATE → apply →
- *      discard → MAIN write visible AND registry 0 rows after discard.
+ *      MAIN write visible AND registry rows cascaded by apply.
+ *      ACC-1: the in-branch UPDATE now actually persists (before the
+ *      write-path fix it was silently dropped, so apply found an empty
+ *      delta and the write never reached MAIN).  apply is terminal: it
+ *      moves the branch to state='applied', so a later discard_branch()
+ *      is refused by the idempotency guard; apply itself cascades the
+ *      branch's registry rows, so no separate discard is needed.
  * ---- */
 SELECT create_branch('br_a7_z');
 SELECT use_branch('br_a7_z');
@@ -1111,9 +1117,8 @@ UPDATE public.a7_users SET name='alice-z' WHERE id=1;
 SELECT public.use_branch(NULL);
 RESET overlay_branch.current;
 SELECT apply_branch('br_a7_z');
-SELECT public.discard_branch('br_a7_z');
 SELECT CASE
-         WHEN name = 'alice-z' THEN 'PASS:A7_D12_APPLY_WRITE_VISIBLE_AFTER_DISCARD'
+         WHEN name = 'alice-z' THEN 'PASS:A7_D12_APPLY_WRITE_VISIBLE_AFTER_APPLY'
          ELSE 'FAIL:A7_D12_APPLY write not propagated (name='||name||')'
        END AS a7_d12
 FROM public.a7_users WHERE id=1;
@@ -1121,7 +1126,7 @@ SELECT CASE WHEN NOT EXISTS (
   SELECT 1 FROM overlay_branch.pg_branch_registry r
    JOIN public.pg_branch b ON b.branch_id = r.branch_id
    WHERE b.branch_name = 'br_a7_z')
-            THEN 'PASS:A7_D12B_DISCARD_CASCADE_REGISTRY_EMPTY'
+            THEN 'PASS:A7_D12B_APPLY_CASCADE_REGISTRY_EMPTY'
             ELSE 'FAIL:A7_D12B'
        END AS a7_d12b;
 

@@ -2648,6 +2648,13 @@ overlay_branch_apply_internal(const char *branch_name)
 		}
 		SPI_finish();
 		pfree(sql_final.data);
+
+		/* ACC-1: an applied branch is terminal — the idempotency guard
+		 * refuses a later discard_branch() — so its schema-epoch
+		 * fingerprint rows would otherwise leak forever (only discard
+		 * cascades them).  Delete them here too, symmetric with
+		 * discard_branch(). */
+		ob_registry_cascade_discard(bid);
 	}
 
 	ob_broadcast_state_change(bid, BRANCH_STATE_APPLIED);
@@ -3216,18 +3223,18 @@ ob_fetch_main_version(ObApplyRelInfo *ri, const char *where_clause,
 										SPI_tuptable->tupdesc, 1);
 		char	   *xmin_txt = SPI_getvalue(SPI_tuptable->vals[0],
 										SPI_tuptable->tupdesc, 2);
-		unsigned int blk = 0;
-		unsigned int off = 0;
+		char		token[OB_BASE_VER_MAX];
+		uint32		blk = 0;
+		uint32		off = 0;
 
 		found = true;
-		if (ctid_txt != NULL &&
-			sscanf(ctid_txt, "(%u,%u)", &blk, &off) == 2)
+		if (overlay_base_ver_parse_ctid(ctid_txt, &blk, &off))
 		{
 			MemoryContext oldmc;
 
+			overlay_base_ver_format(token, sizeof(token), blk, off, xmin_txt);
 			oldmc = MemoryContextSwitchTo(TopMemoryContext);
-			*version = psprintf("%u:%u-x%s", blk, off,
-								xmin_txt ? xmin_txt : "0");
+			*version = pstrdup(token);
 			MemoryContextSwitchTo(oldmc);
 		}
 	}

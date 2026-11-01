@@ -123,9 +123,9 @@ RESET overlay_branch.current;
 
 /* =========================================================== Section L */
 -- =====================================================================
--- ===== Section L: pure delta UPDATE (MVP-out-of-scope: SET projection
--- =====            for reconstructed pure-delta slot is not wired yet;
--- =====            assert WR is SAFE NO-OP, NOT silent data corruption)
+-- ===== Section L: pure delta UPDATE (ACC-1 wires SET projection over
+-- =====            the reconstructed overlay row and applies an explicit
+-- =====            WHERE to pure-delta rows)
 -- =====================================================================
 CREATE TABLE public.bs_L_upd (id INT4 PRIMARY KEY, payload TEXT, score INT4);
 INSERT INTO public.bs_L_upd VALUES (1,'main-a', 10),(2,'main-b', 20);
@@ -151,13 +151,13 @@ SELECT CASE WHEN payload = 'pd-c-UPD' AND score = 130 THEN 'PASS:L2_UPD_PK_EQ_AP
             ELSE 'FAIL:'||COALESCE(payload,'NULL')||'@'||COALESCE(score::text,'NULL') END AS l2_upd
 FROM public.bs_L_upd WHERE id = 11;
 
--- L.3 Pure delta UPDATE WHERE id IN (...): ScalarArrayOpExpr is NOT
---     decomposed into PK-equality qual by the current MVP qual decomposer,
---     so the MVP no-qual guard correctly makes it a SAFE NOP for rows 12
---     and 13.  Row 11 was already updated by L.2.
+-- L.3 Pure delta UPDATE WHERE id IN (...): ACC-1 evaluates an explicit
+--     WHERE against every reconstructed pure-delta row, so the matching
+--     rows 12 and 13 are updated and the unmatched 9999 is a no-op.
+--     Row 11 was already updated by L.2.
 UPDATE public.bs_L_upd SET payload = 'WRONG' WHERE id IN (12, 13, 9999);
-SELECT CASE WHEN string_agg(id::text||':'||payload, ',' ORDER BY id) = '11:pd-c-UPD,12:pd-d,13:pd-e'
-            THEN 'PASS:L3_UPD_PK_IN_NOP_SAFE'
+SELECT CASE WHEN string_agg(id::text||':'||payload, ',' ORDER BY id) = '11:pd-c-UPD,12:WRONG,13:WRONG'
+            THEN 'PASS:L3_UPD_PK_IN_APPLIED'
             ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||payload, ',' ORDER BY id),'NULL') END AS l3_nop
 FROM public.bs_L_upd WHERE id IN (11,12,13);
 
@@ -378,7 +378,7 @@ RESET overlay_branch.current;
 -- =====================================================================
 -- ===== Section P: EMPTY MAIN heap — pure delta 100% of rows
 -- =====            (MAIN has zero rows; overlay consists entirely of
--- =====             pure delta INSERTs, then UPDATE (MVP NOP) / DELETE,
+-- =====             pure delta INSERTs, then UPDATE / DELETE,
 -- =====             BranchScan reads correctly, apply propagates)
 -- =====================================================================
 CREATE TABLE public.bs_P (id INT4 PRIMARY KEY, t TEXT);

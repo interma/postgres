@@ -42,7 +42,9 @@ REGRESS = \
   overlay_branch_parallel \
   overlay_branch_memgrow \
   overlay_branch_pushdown \
-  overlay_branch_plancache
+  overlay_branch_plancache \
+  overlay_branch_acc1 \
+  overlay_branch_execcontext
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \

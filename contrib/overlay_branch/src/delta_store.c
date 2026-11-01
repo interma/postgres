@@ -606,6 +606,12 @@ slot_get_ctid_cstr(TupleTableSlot *slot)
 				elog(ERROR, "slot_get_ctid_cstr: ctid IS NULL (cannot locate row)");
 
 			ip = *DatumGetItemPointer(d);
+			/* ACC-1: a pure-delta overlay row (no MAIN counterpart) carries an
+			 * invalid ItemPointer (block/offset 0).  Treat it as "no ctid" so
+			 * the WR ctid loop skips it — those rows are handled by the
+			 * pure-delta SPI pass — instead of emitting a bogus "(0,0)". */
+			if (!ItemPointerIsValid(&ip))
+				return NULL;
 			{
 				char	   *out = (char *) palloc(32);
 
@@ -645,8 +651,13 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
 	overlay_overlay_helper_enter();
 
 	/* WR-1a: relation name stays inline (the cached plan is keyed on the
-	 * full statement text); ctid is bound as $1 rather than interpolated. */
-	sql = psprintf("SELECT * FROM %s WHERE ctid = $1::tid LIMIT 1",
+	 * full statement text); ctid is bound as $1 rather than interpolated.
+	 * The ctid system column is selected explicitly: SPI materialises the
+	 * result tuple with a fresh heap_form_tuple(), which leaves t_self
+	 * invalid, so htup->t_self cannot be used as the row identity (it only
+	 * looks valid when the plan needs no projection, e.g. a table with no
+	 * dropped columns). */
+	sql = psprintf("SELECT ctid, * FROM %s WHERE ctid = $1::tid LIMIT 1",
 				   quote_qualified_identifier(
 					   get_namespace_name(RelationGetNamespace(rel)),
 					   RelationGetRelationName(rel)));
@@ -680,27 +691,50 @@ fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
 			out_slot = MakeSingleTupleTableSlot(slot_desc, &TTSOpsVirtual);
 		}
 		ExecClearTuple(out_slot);
-		for (int a = 0; a < reldesc->natts; a++)
+		/* td_spi layout is (ctid, <non-dropped attributes in attnum order>).
+		 * Map each physical attribute to its result column so a dropped
+		 * column cannot shift the columns that follow it. */
 		{
-			bool			isnull;
-			Form_pg_attribute ratt = TupleDescAttr(reldesc, a);
-			Datum			d;
+			int			spi_col_idx = 1;	/* result column 1 is the ctid */
 
-			d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
-			out_slot->tts_isnull[a] = isnull;
-			if (!isnull)
+			for (int a = 0; a < reldesc->natts; a++)
 			{
-				int16		typlen;
-				bool		typbyval;
+				bool			isnull;
+				bool			dropped = TupleDescAttr(reldesc, a)->attisdropped;
+				Datum			d;
 
-				get_typlenbyval(ratt->atttypid, &typlen, &typbyval);
-				d = datumCopy(d, typbyval, typlen);
+				if (dropped)
+				{
+					out_slot->tts_isnull[a] = true;
+					out_slot->tts_values[a] = (Datum) 0;
+					continue;
+				}
+
+				spi_col_idx++;
+				d = SPI_getbinval(htup, td_spi, spi_col_idx, &isnull);
+				out_slot->tts_isnull[a] = isnull;
+				if (!isnull)
+				{
+					Form_pg_attribute ratt = TupleDescAttr(reldesc, a);
+					int16		typlen;
+					bool		typbyval;
+
+					get_typlenbyval(ratt->atttypid, &typlen, &typbyval);
+					d = datumCopy(d, typbyval, typlen);
+				}
+				out_slot->tts_values[a] = isnull ? (Datum) 0 : d;
 			}
-			out_slot->tts_values[a] = d;
 		}
 		ExecStoreVirtualTuple(out_slot);
 		out_slot->tts_nvalid = reldesc->natts;
-		out_slot->tts_tid = htup->t_self;
+		{
+			/* Row identity from the projected ctid column, NOT htup->t_self. */
+			bool		ctid_isnull;
+			Datum		ctid_d = SPI_getbinval(htup, td_spi, 1, &ctid_isnull);
+
+			if (!ctid_isnull)
+				out_slot->tts_tid = *DatumGetItemPointer(ctid_d);
+		}
 		MemoryContextSwitchTo(oldmc);
 	}
 	SPI_finish();
@@ -1484,6 +1518,54 @@ overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
 }
 
 /* ================================================================
+ * Base-version token codec (A1/A6 stage 2) — see include/overlay_branch.h
+ * for the contract.  This is the single source of the "<blk>:<off>-x<xmin>"
+ * CAS token used by R15/R18: the write path captures it through
+ * overlay_tuple_version() below, apply re-derives it through
+ * ob_fetch_main_version() (branch_lifecycle.c), and the read path parses it
+ * back through ob_anchor_is_stale() (branch_scan.c).  Keeping format and
+ * parse in one place is what stops the producer and the consumers drifting
+ * apart.
+ * ================================================================ */
+
+bool
+overlay_base_ver_parse_ctid(const char *ctid_txt, uint32 *blk, uint32 *off)
+{
+	if (ctid_txt == NULL || blk == NULL || off == NULL)
+		return false;
+
+	return sscanf(ctid_txt, "(%u,%u)", blk, off) == 2;
+}
+
+void
+overlay_base_ver_format(char *buf, size_t buflen, uint32 blk, uint32 off,
+						const char *xmin_txt)
+{
+	/* xmin_txt is NULL only when the caller could not read xmin; "0" keeps
+	 * the token shape parseable so the mismatch is still detected. */
+	snprintf(buf, buflen, "%u:%u-x%s", blk, off, xmin_txt ? xmin_txt : "0");
+}
+
+bool
+overlay_base_ver_parse_xmin(const char *token, TransactionId *xmin_out)
+{
+	const char *dash;
+	unsigned long parsed;
+
+	if (token == NULL || xmin_out == NULL)
+		return false;
+
+	dash = strrchr(token, '-');
+	if (dash == NULL || dash[1] != 'x' || dash[2] == '\0')
+		return false;
+	if (sscanf(dash + 2, "%lu", &parsed) != 1)
+		return false;
+
+	*xmin_out = (TransactionId) parsed;
+	return true;
+}
+
+/* ================================================================
  * overlay_tuple_version: 物理 ctid + xmin 构建可比较版本串
  * ================================================================ */
 char *
@@ -1535,6 +1617,7 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 		bool		isnull1, isnull2;
 		char	   *ctid_txt;
 		char	   *xmin_txt;
+		char		token[OB_BASE_VER_MAX];
 		uint32		blk, off;
 
 		ctid_txt = SPI_getvalue(SPI_tuptable->vals[0],
@@ -1545,18 +1628,15 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 		isnull2 = (xmin_txt == NULL);
 
 		if (!isnull1 && !isnull2 &&
-			sscanf(ctid_txt, "(%u,%u)", &blk, &off) == 2)
+			overlay_base_ver_parse_ctid(ctid_txt, &blk, &off))
 		{
-			char *tmp = psprintf("%u:%u-x%s", blk, off, xmin_txt);
+			MemoryContext oldmc3;
 
-			if (tmp != NULL)
-			{
-				MemoryContext oldmc3;
+			overlay_base_ver_format(token, sizeof(token), blk, off, xmin_txt);
 
-				oldmc3 = MemoryContextSwitchTo(TopMemoryContext);
-				result = pstrdup(tmp);
-				MemoryContextSwitchTo(oldmc3);
-			}
+			oldmc3 = MemoryContextSwitchTo(TopMemoryContext);
+			result = pstrdup(token);
+			MemoryContextSwitchTo(oldmc3);
 		}
 	}
 
@@ -1572,6 +1652,18 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 /* ================================================================
  * overlay_should_redirect：写重定向的快速判定 gate
  * ================================================================ */
+
+/* A1/A6: branch id in effect for the current statement (bound once in
+ * overlay_ExecutorStart).  Falls back to the live global when no statement
+ * context is bound. */
+static int32
+ob_stmt_branch_id(void)
+{
+	BranchExecContext *ectx = ob_get_exec_context();
+
+	return (ectx != NULL) ? ectx->bid : overlay_branch_get_current_id();
+}
+
 bool
 overlay_should_redirect(Relation rel)
 {
@@ -1581,7 +1673,12 @@ overlay_should_redirect(Relation rel)
 	/* 第一层：apply 内部的 MAIN 真实写回放必须绝对绕过，否则写入又被吃进 delta 死循环 */
 	if (overlay_in_apply_operation())
 		return false;
+	/* is_active() stays live: it also runs the FR4 kickout check, which must
+	 * be able to disable redirection mid-statement. */
 	if (!overlay_branch_is_active())
+		return false;
+	/* A1/A6: the branch written to is the one bound for this statement. */
+	if (ob_stmt_branch_id() <= 0)
 		return false;
 	if (rel == NULL)
 		return false;
@@ -1616,7 +1713,7 @@ overlay_should_redirect(Relation rel)
 void
 overlay_modify_insert(Relation rel, TupleTableSlot *slot)
 {
-	int32		bid = overlay_branch_get_current_id();
+	int32		bid = ob_stmt_branch_id();
 	char	   *pk;
 	char	   *tdata;
 
@@ -1719,7 +1816,7 @@ void
 overlay_modify_update(Relation rel, TupleTableSlot *oldslot,
 					  TupleTableSlot *newslot)
 {
-	int32		bid = overlay_branch_get_current_id();
+	int32		bid = ob_stmt_branch_id();
 	char	   *pk;
 	char	   *oldver;
 	char	   *tdata_new;
@@ -1744,7 +1841,7 @@ overlay_modify_update(Relation rel, TupleTableSlot *oldslot,
 void
 overlay_modify_delete(Relation rel, TupleTableSlot *slot)
 {
-	int32		bid = overlay_branch_get_current_id();
+	int32		bid = ob_stmt_branch_id();
 	char	   *pk;
 	char	   *oldver;
 	char	   *base_json;

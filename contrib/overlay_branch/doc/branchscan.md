@@ -337,7 +337,7 @@ general_where  = "color = 'red'"    → P2 deparse 剩下的 AND 条件
 ```
 **没有 `pk=12 AND pk=12 AND color='red'` 的重复。**
 
-## B.5 Executor 解包协议（custom_private 6-element，v3 最终版）
+## B.5 Executor 解包协议（custom_private 8-element，v3 最终版）
 
 | index | node type | 内容 | malformed 回退 |
 |-------|-----------|------|----------------|
@@ -347,8 +347,10 @@ general_where  = "color = 'red'"    → P2 deparse 剩下的 AND 条件
 | 3 | String | pk_serialized_key（和 Write Redirect `overlay_serialize_pk` 格式完全兼容） | 空串 → has_pk_pred=false |
 | 4 | Integer | gwflag (0/1) P2 非 PK | 类型错 → 0 → has_general_where=false |
 | 5 | String | general_where_sql P2 反编译结果 | 空串 → has_general_where=false |
+| 6 | Integer | plan_bid：规划期分支 id（0=MAIN，A1/A6 Stage 3 断言戳） | 缺失 → 0；`ob_branchscan_begin` 与执行期绑定分支不一致即 0A000 |
+| 7 | Integer | dml_target (0/1)：本计划是否为 UPDATE/DELETE 的 resultRelation 目标（ACC-1） | 缺失 → 0 → 走 Virtual slot 的 SELECT 路径 |
 
-**向后兼容硬约束**：list_length(cpriv) == 4 时（P2 代码加入前的旧版本），index 4/5 不存在 → BeginCustomScan 直接 fallthrough `has_general_where=false`，永不崩。
+**向后兼容硬约束**：老计划可含更少元素——`list_length(cpriv) < 6`（P2 之前）→ 6/7 缺失，`plan_bid`/`dml_target` 取 0；`list_length(cpriv) == 7`（A1/A6 之后、ACC-1 之前）→ index 7 缺失，`dml_target=0`。Executor 对任何缺失/类型错元素都安全回退，永不崩。
 
 ### Executor 解包关键修复：
 - **不得使用 `lsecond_int / list_nth_int`**：这些宏（或函数）的语义是"把 ListCell 的 `ptr_value` 当作 int 读"，而 List 里存的是 `Integer *` 节点指针。**必须用 `intVal(lsecond(...))` 和 `intVal(list_nth(cpriv, 4))`** 先解指针再取 ival。lsecond_int 在 PG17 里直接宏展开到 `(int)(intptr_t) lsecond(l)` → 截断 Integer* 成 int（64-bit 下高位丢）。之前 exit code 2 连续 3 次崩的真根因就是这个（不是 deparse，是 Executor 越界读 Assert）。
@@ -445,7 +447,7 @@ SPI_finish();
 
 > 消除 MAIN 基线读取的 SPI 中间物化与结果集全量物化，使大表分支读接近原生扫描，
 > 并让 `LIMIT` / 游标能早期终止。**不改** planner hook 的 P0/P2 谓词识别逻辑
-> （custom_private 6 元素协议保持不变）。
+> （custom_private 前 6 元素协议保持不变；后续 A1/A6、ACC-1 各自追加 [6]、[7]，见 §B.5）。
 
 ## D.1 现状与瓶颈
 
@@ -647,7 +649,7 @@ pk_serialized_key ← 仅当 len(pk_clauses)==1 且该条是单点等值时才�
 
 ## E.4 协议与执行
 
-**custom_private 6 元素协议不变**（§B.5）。唯一变更是**语义放宽**：
+**custom_private 前 6 元素协议不变**（§B.5；[6]/[7] 由 A1/A6、ACC-1 追加）。唯一变更是**语义放宽**：
 
 | index | 变更 |
 |---|---|
@@ -703,3 +705,170 @@ pk_serialized_key ← 仅当 len(pk_clauses)==1 且该条是单点等值时才�
 | `PKIN_ORPHAN` | 分支把谓词外的行 UPDATE 进谓词范围（Pass2 orphan 补回） | 结果一致 |
 | `PKIN_EXPLAIN` | `EXPLAIN` 只出现 `Custom Scan`，无 SeqScan 泄露 | 单节点 |
 | `PKIN_MAIN_CLEAN` | `RESET` 后 MAIN 零污染 | 逐行比对 |
+
+---
+
+# Part F — DML 目标 BranchScan（ACC-1 完整修复）
+
+> 规格来源：`doc/review/review_260926_tracker.md` : **ACC-1**（⚠️ OPEN）。
+> 用户选定路径：「完整修复」——为 UPDATE/DELETE 的 **DML 目标 baserel** 注入 BranchScan，
+> 并让 WR 以「overlay 行（MAIN⊕delta）」为 pre-image。本 Part 为 **design-first（Conv-2）** 稿，
+> 实现前先评审。
+
+## F.1 问题（ACC-1）
+
+分支内对 **MAIN-present 行**的连续 UPDATE/DELETE 有三类缺口，根因同一：UPDATE/DELETE 的
+DML 子计划扫的是 **MAIN baserel**（planner hook 对非 SELECT `commandType` 直接 `return`，
+见 [B2 pre-check](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1283-L1291)），
+而不是 overlay。
+
+| 缺口 | 现状表现 | 期望 |
+|---|---|---|
+| **G1 SET 表达式值依赖** | 分支内 `SET v=v\|\|'+1'` 再 `SET v=v\|\|'+2'` → delta `v='base+2'`（第 2 次以 MAIN `v` 为基准） | `base+1+2` |
+| **G2 WHERE 过滤** | 过滤条件以 MAIN 行为基准，overlay-only 的列值/行不参与 | 以 overlay 行为基准 |
+| **G3 跨列回退** | WR 以 MAIN 行 + SET 列 merge 成 post-image，未被本次 SET 覆盖的列退回 MAIN 值 | 保留 overlay 值 |
+
+G3 机制见 [write_redirect.c UPDATE/DELETE 主循环](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/write_redirect.c#L852-L1009)：
+`fetch_tuple_by_ctid(MAIN)` → 按列名 merge junk(SET) 列 → **其余列 = MAIN**。
+
+## F.2 目标与非目标
+
+**目标**：让 DML 子计划在分支模式下读 **overlay（MAIN⊕delta）**，使 G1/G2/G3 全部消除。
+
+**非目标**（明确记录，不在本批次）：
+- `UPDATE t SET ... FROM other_branch_table` 中 **FROM 侧**的分支表仍读 MAIN（仅 DML 目标 rel 注入）。
+- RETURNING 语义、继承/分区（`target_rte->inh`）保持现有行为。
+- `hasModifyingCTE` 仍按 R16 门禁 `0A000` 拒绝。
+
+## F.3 方案总览
+
+三处协同：
+
+1. **Planner（`branch_scan.c` B2）**：对 `commandType ∈ {CMD_UPDATE, CMD_DELETE}` 且
+   `rti == root->parse->resultRelation` 的 RTE 放行 BranchScan；其余非 SELECT 仍早退。
+2. **BranchScan（DML-target 模式）**：输出的即 overlay 行（主合并不变），并让 `ctid` 系统列**可达**（F.4）。
+3. **WR（`write_redirect.c`）**：UPDATE/DELETE 的 pre-image 由「MAIN 行」改为「overlay 行」（F.6）。
+
+## F.4 关键约束：ctid 系统列的交付
+
+DML 子计划的 `ctid` junk 是**真实 ctid 系统列 Var**：
+[`add_row_identity_columns`](file:///home/ubuntu/work/postgres/src/backend/optimizer/util/appendinfo.c#L889-L956)
+用 `makeVar(rtindex, SelfItemPointerAttributeNumber, TIDOID, ...)` 注册 row-identity，
+非继承时 [`add_row_identity_var`](file:///home/ubuntu/work/postgres/src/backend/optimizer/util/appendinfo.c#L814-L822)
+直接把该 Var 塞进 `processed_tlist`（resname `"ctid"`，resjunk），**不走 `ROWID_VAR`**。
+
+求值链：
+- [`fix_scan_expr_mutator`](file:///home/ubuntu/work/postgres/src/backend/optimizer/plan/setrefs.c#L2199-L2217)
+  对系统列 Var **只做 rtoffset 平移**，不改 `varattno`、也不映射 INDEX_VAR → 仍是系统列 Var。
+- 执行期 [`ExecEvalSysVar`](file:///home/ubuntu/work/postgres/src/backend/executor/execExprInterp.c#L5067-L5081)
+  → `slot_getsysattr(scan_slot, SelfItemPointerAttributeNumber)`。
+- [`ExecInitCustomScan`](file:///home/ubuntu/work/postgres/src/backend/executor/nodeCustom.c#L64-L98)：
+  `slotOps = css->slotOps ?: &TTSOpsVirtual`；`custom_scan_tlist == NIL && scan_rel != NULL`
+  → `ExecInitScanTupleSlot(..., RelationGetDescr(scan_rel), slotOps)`。
+
+**PG17 事实（更正）**：[`slot_getsysattr`](file:///home/ubuntu/work/postgres/src/include/executor/tuptable.h#L415-L433)
+在委托 `tts_ops->getsysattr` **之前**，对 `SelfItemPointerAttributeNumber` **不分 slot 类型**
+统一 `return PointerGetDatum(&slot->tts_tid)`（`TableOidAttributeNumber` 同理返回 `tts_tableOid`）。
+因此 **virtual / minimal slot 同样能交付 ctid**——只要 `tts_tid` 已置位；只有 ctid 之外的系统列
+（`xmin`/`cmin`/…）才落到 `tts_ops->getsysattr`，virtual/minimal 仅在**那个**分支
+`ereport(ERROR, "cannot retrieve a system column in this context")`
+（[execTuples.c L140-L150 / L557-L566](file:///home/ubuntu/work/postgres/src/backend/executor/execTuples.c#L140-L150)）。
+（F.4 初稿曾断言「virtual slot 无法交付 ctid」，与 PG17 实现不符，此处更正。）
+
+**决定：DML-target 模式下 `ss.ss_ScanTupleSlot` 仍改用 `TTSOpsHeapTuple`。**
+理由非 ctid 可达性（virtual 亦可），而是：
+- **行身份随真实 tuple 携带**：`heap_form_tuple` + `t_self = src->tts_tid` 让 row-identity 与 `t_self`
+  一致，和 WR pre-image / [`overlay_tuple_version`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1538-L1565)
+  的 `t_self`/`tts_tid` 读取路径形状统一。
+- **规避 deferred FETCHSOME 陷阱**：DML 子计划的投影/qual 是在「扫描 slot 被当作 virtual」的
+  前提下编译的，`ExecComputeSlotInfo()` 省略了 `EEOP_SCAN_FETCHSOME`；heap slot + 显式
+  `slot_getallattrs(dst)` 强制把 `tts_values` 物化，避免 qual 读到 stale 值而静默丢行（ACC-1 G2 症状）。
+- 不改扫描节点的 **tlist 契约**（仍 `custom_scan_tlist = NIL`，slot 形状 = rel 物理 tupdesc），
+  SELECT 路径零影响。
+- 合并结果**已携带 MAIN ctid**：[branch_scan.c L750](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L735-L750)
+  已 `main_slot->tts_tid = st->probe->tts_tid`；[`overlay_tuple_version`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1538-L1565)
+  也已有 `tts_tid` 兜底。
+
+实现要点：
+- `CreateCustomScanState`：DML-target 时置 `ebs->css.slotOps = &TTSOpsHeapTuple;`（其余仍 NULL→Virtual）。
+- `ob_branchscan_exec`：DML-target 时 `slot_getallattrs(src)` →
+  `heap_form_tuple(dst->tts_tupleDescriptor, src->tts_values, src->tts_isnull)` →
+  `htup->t_self = src->tts_tid` → `ExecStoreHeapTuple(htup, dst, true)` → `slot_getallattrs(dst)`。
+  heap tuple 分配在 **`es_query_cxt`**（**不是** `ebs->scan_cxt`）：该 slot 已登记进 `estate->es_tupleTable`，
+  而 `ExecEndPlan` 的 `ExecResetTupleTable()` 在 `ob_branchscan_end` 删除 `scan_cxt` **之后**才运行——
+  若分配在 `scan_cxt` 会成悬垂指针，触发 `BogusFree` 二次释放。`shouldFree=true`，由下一次
+  `ExecClearTuple(dst)` 释放，任一时刻仅 1 个在途。
+- 纯 delta 行（Pass2 orphan，无 MAIN 配对）`tts_tid` invalid → `t_self=(0,0)`。需把
+  [`slot_get_ctid_cstr`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L570-L609)
+  对 invalid ItemPointer（`!ItemPointerIsValid`）返回 NULL，使 WR 走既有「无 ctid → 跳过」分支。
+
+**备选（未采纳）**：`custom_scan_tlist` 显式列出全部列 + 一个 TID 列。需要
+[`search_indexed_tlist_for_var`](file:///home/ubuntu/work/postgres/src/backend/optimizer/plan/setrefs.c#L2796-L2849)
+命中系统列 Var（以 `(varno,varattno)` 匹配，varattno=-1 语义脆弱），且须覆盖**全部**被引用列
+（含 RETURNING/whole-row）——面更大、更易漏，故弃。
+
+## F.5 Planner 改动（`branch_scan.c`）
+
+B2 早退改为（hook 形参 [`Index rti`](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c#L1172-L1176) 可用）：
+
+```c
+if (root->parse != NULL && root->parse->type == T_Query)
+{
+    CmdType ct = ((Query *) root->parse)->commandType;
+    if (ct != CMD_SELECT &&
+        ((ct != CMD_UPDATE && ct != CMD_DELETE) ||
+         rti != root->parse->resultRelation))
+        return;
+}
+```
+
+其余门禁不变：`rtekind/relkind`、`hasModifyingCTE`(R16)、`overlay_relation_has_pk`、pathlist lappend/prune（§B.3/A8）。
+
+协议扩展：`custom_private` 增 **`[7]` = dml_target(0/1)**（现 7 元素 → 8 元素）。
+`ob_branchscan_begin` 解析；旧计划（7 元素）→ `dml_target=0`（fallthrough，无回归）。
+A1/A6 stamp 断言仍校验 `[6]`。
+
+## F.6 WR 改动（`write_redirect.c`）
+
+UPDATE/DELETE 主循环（[L852-L1009](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/write_redirect.c#L852-L1009)）：
+
+- **pre-image 换源**：由「`fetch_tuple_by_ctid(MAIN)`」改为「先取 MAIN 行定锚，再取 overlay 行」：
+  1. `main_row = fetch_tuple_by_ctid(rel, ctid)`（判存在性）；
+  2. `key = overlay_serialize_identity(rel, main_row, op)` → `overlay_delta_lookup(bid, relid, key, &dtu)`；
+  3. 有 delta（op ∈ {I,U}）→ **overlay pre-image = `reconstruct_slot_from_delta(rel, dtu.tuple_data)`**（delta 的
+     `tuple_data` 本就是整行 post-image）；无 delta → overlay = MAIN 行；op='D' → 跳过；
+  4. `oldver = overlay_tuple_version(rel, main_row)`（**锚点仍是 MAIN ctid+xmin**，token 语义不变）。
+- **SET-merge 不变**：仍按列名把 junk(SET) 值 merge 进 overlay pre-image。因 junk(SET) 现由 BranchScan
+  基于 overlay 求值 → **G1 消除**；非 SET 列来自 overlay → **G3 消除**；WHERE 由子计划在 overlay 上执行 → **G2 消除**。
+- **纯 delta 行**：`slot_get_ctid_cstr` 返回 NULL → 走既有跳过分支，交由 Phase A-H SPI pass 处理（不变）；
+  更新该 NOTICE 文案（去掉 `MVP-out-of-scope (requires subplan BranchScan)`）。
+
+## F.7 交互与不变式
+
+- R16 `hasModifyingCTE` 门禁、R24 DDL 门禁、A7 registry 指纹：**均不变**。
+- 递归 guard：DML 子计划在 WR 内部执行（`ob_in_write_redirect` 保护下），BranchScan 的 SPI 读走
+  `ob_in_overlay_helper`；planner 期已结束，不会二次注入。
+- **两路并集 = overlay 全集**：ctid 循环（MAIN-present）+ Phase A-H SPI pass（pure-delta），
+  以 ctid 有无互斥，无重复处理。
+
+## F.8 风险
+
+| 风险 | 说明 | 缓解 |
+|---|---|---|
+| 每行 heap tuple 物化 | DML-target 扫描 slot virtual→heap，产生每行 `heap_form_tuple` | 仅 DML-target 路径；行数受 WHERE 约束 |
+| 系统列 Var 匹配 | 依赖 setrefs 保留系统列 Var（已核 [fix_scan_expr_mutator](file:///home/ubuntu/work/postgres/src/backend/optimizer/plan/setrefs.c#L2199-L2217)） | L3 覆盖 + 断言 |
+| WR 每行 overlay 反查 | 每行一次 O(1) delta lookup + JSON reconstruct | 正确性优先；必要时批量化 |
+| 覆盖不到的分支 | UPDATE FROM / RETURNING / 继承 | 见 F.2 non-goal |
+
+## F.9 测试（Conv-1）
+
+新增 L3 Section，以 `overlay_branch_puredelta.sql` 的 `R02_PURE_UPDATE_CHAIN` 为模板；
+须跑在 `pg_regress` 干净库、有 PK（P0）、无 view（避开 G01 support matrix）。
+
+| Test | 场景 | 通过标准 |
+|---|---|---|
+| `ACC1_CHAIN` | MAIN `v='base'` → 分支 `SET v=v\|\|'+1'` 再 `SET v=v\|\|'+2'` | delta `v='base+1+2'`；apply 后 MAIN `v='base+1+2'` |
+| `ACC1_CROSSCOL` | 分支 `SET v='x'` 后 `SET w='y'` | 第 2 次 post-image 保留 `v='x'` |
+| `ACC1_WHERE` | 分支内先 UPDATE 把行改入谓词范围，再按谓词 UPDATE | 命中行 = overlay 语义 |
+| `ACC1_MIX` | 同事务内 pure-delta 行与 MAIN-present 行 UPDATE 混合 | 两路都正确、无重复 |
+| `ACC1_NEG` | 无 PK 表 | 不注入，回退 MAIN，无回归 |

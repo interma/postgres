@@ -156,6 +156,7 @@ static OverlayScanState *overlay_scan_open(Relation rel, int32 branch_id,
                                            const char *general_where_sql,
                                            ExprState *qual,
                                            ExprContext *qual_econtext,
+                                           bool dml_target,
                                            MemoryContext result_cxt);
 static TupleTableSlot *overlay_scan_next(OverlayScanState *st);
 static void overlay_scan_close(OverlayScanState *st);
@@ -242,6 +243,11 @@ typedef struct ExtendedCustomScanState
     /* P2 general non-PK qual pushdown: 已 deparse 的 SQL WHERE 片段 */
     bool          has_general_where;
     char         *general_where_sql;
+    /* ACC-1: true when this BranchScan feeds an UPDATE/DELETE DML target
+     * (custom_private[7]).  Drives the heap-backed scan slot below so the
+     * ctid system column (row identity) is retrievable (see doc/branchscan.md
+     * Part F).  Set in CreateCustomScanState from the plan, not in Begin. */
+    bool          dml_target;
 } ExtendedCustomScanState;
 
 /* css MUST be a valid CustomScanState* whose embedding is ExtendedCustomScanState.
@@ -277,24 +283,22 @@ typedef struct ExtendedCustomScanState
 static bool
 ob_anchor_is_stale(const DeltaTuple *dt, TransactionId raw_xmin)
 {
-    const char   *dash;
-    unsigned long anchor_xmin;
+    TransactionId anchor_xmin;
 
     if (dt == NULL || dt->key == NULL || dt->old_version == NULL)
         return false;
     if (!(dt->key[0] == 'A' && dt->key[1] == ':'))
         return false;
 
-    dash = strrchr(dt->old_version, '-');
-    if (dash == NULL || dash[1] != 'x')
-        return false;
-    if (sscanf(dash + 2, "%lu", &anchor_xmin) != 1)
+    /* Shared base-version codec (A1/A6 stage 2): parse the token with the
+     * same helper that formats it on the write path and at apply time. */
+    if (!overlay_base_ver_parse_xmin(dt->old_version, &anchor_xmin))
         return false;
 
     if (!TransactionIdIsNormal(raw_xmin))
         return false;
 
-    return ((TransactionId) anchor_xmin) != raw_xmin;
+    return anchor_xmin != raw_xmin;
 }
 
 /* One MAIN baseline row as produced by the MAIN reader below: the merge
@@ -382,6 +386,7 @@ overlay_scan_open(Relation rel, int32 branch_id,
                   const char *general_where_sql,
                   ExprState *qual,
                   ExprContext *qual_econtext,
+                  bool dml_target,
                   MemoryContext result_cxt)
 {
     OverlayScanState *st;
@@ -389,11 +394,23 @@ overlay_scan_open(Relation rel, int32 branch_id,
     int         natts;
     Oid         relid;
     MemoryContext oldcxt;
+    BranchExecContext *ectx;
+    Snapshot    stmt_snap;      /* A1/A6 bound MAIN read snapshot; NULL = live */
 
     Assert(rel != NULL);
     reldesc = RelationGetDescr(rel);
     natts = reldesc->natts;
     relid = RelationGetRelid(rel);
+
+    /* A1/A6: consume the statement-bound identity instead of re-reading the
+     * mutable global, so the branch id and the MAIN read snapshot come from
+     * one bind point.  Fall back to the live global when no statement context
+     * is bound (defensive only: reads always run inside an executor). */
+    ectx = ob_get_exec_context();
+    stmt_snap = (ectx != NULL)
+        ? ectx->stmt_snap
+        : (CurrentBranchContext != NULL ? CurrentBranchContext->branch_main_snapshot
+                                        : NULL);
 
     oldcxt = MemoryContextSwitchTo(result_cxt != NULL ? result_cxt
                                                       : CurrentMemoryContext);
@@ -419,8 +436,17 @@ overlay_scan_open(Relation rel, int32 branch_id,
      * in the delta falls to the Pass 2 orphan rule: Pass 2 reconstructs a *PK*
      * orphan from tuple_data, but DROPS an unmatched keyless ("A:") anchor
      * (resurrecting it by ctid would be unsafe).  So keyless must scan MAIN
-     * unfiltered and rely on the executor's post-merge qual re-check. */
-    st->do_prefilter   = (qual != NULL && qual_econtext != NULL && st->rel_has_pk);
+     * unfiltered and rely on the executor's post-merge qual re-check.
+     *
+     * ACC-1: a DML-target scan must NEVER filter on MAIN, because the
+     * predicate is defined over the OVERLAY row.  If MAIN dropped a row whose
+     * branch edit satisfies the predicate, that delta would be demoted to a
+     * Pass 2 orphan -- and an orphan has no MAIN ctid, so the write path would
+     * skip it.  Disabling the prefilter keeps every MAIN row paired with its
+     * own ctid; the post-merge qual (which sees the overlay values) then makes
+     * the correct keep/kill call. */
+    st->do_prefilter   = (qual != NULL && qual_econtext != NULL &&
+                          st->rel_has_pk && !dml_target);
 
     /* RD-3: one shared tupdesc for every emitted slot.  CreateTupleDescCopy()
      * is NOT reference-counted (tdrefcount == -1), so MakeSingleTupleTableSlot
@@ -521,13 +547,28 @@ overlay_scan_open(Relation rel, int32 branch_id,
         initStringInfo(&sql);
         any_where = false;
 
-        appendStringInfo(&sql, "SELECT * FROM %s", q_qualified);
+        /* ACC-1: ask for the physical ctid explicitly.  SPI materialises each
+         * result tuple with a fresh heap_form_tuple(), which leaves t_self
+         * invalid -- so htup->t_self is NOT a reliable row identity.  It only
+         * looks valid when the plan is a bare relation scan with no projection
+         * (a table with no dropped columns); any projection (e.g. after
+         * ALTER TABLE ... ADD/DROP COLUMN) makes the executor build a virtual
+         * tuple and the ctid is lost.  Selecting the ctid system column forces
+         * the executor to project the real physical ctid into a datum that
+         * survives materialisation. */
+        appendStringInfo(&sql, "SELECT ctid, * FROM %s", q_qualified);
         if (pk_where_sql != NULL && pk_where_sql[0] != '\0')
         {
             appendStringInfo(&sql, " WHERE (%s)", pk_where_sql);
             any_where = true;
         }
-        if (has_general_where && general_where_sql != NULL && general_where_sql[0] != '\0')
+        /* ACC-1: a DML-target scan must not push the non-PK WHERE to MAIN
+         * either -- the predicate is over the OVERLAY row, and over-filtering
+         * MAIN would strand a branch-updated row as a ctid-less Pass 2
+         * orphan.  Keep only the PK point predicate (safe: PK is immutable in
+         * a branch, R03) and let scan.plan.qual re-check on the overlay. */
+        if (!dml_target &&
+            has_general_where && general_where_sql != NULL && general_where_sql[0] != '\0')
         {
             if (any_where)
                 appendStringInfo(&sql, " AND (%s)", general_where_sql);
@@ -550,15 +591,14 @@ overlay_scan_open(Relation rel, int32 branch_id,
          * Exactly one push brackets the single ob_spi_one_shot() call and
          * exactly one pop follows it; pop_done_ lets the CATCH path avoid a
          * double pop. */
-        pushed_snap_ = (CurrentBranchContext != NULL &&
-                        CurrentBranchContext->branch_main_snapshot != NULL);
+        pushed_snap_ = (stmt_snap != NULL);
         pop_done_ = false;
 
         overlay_overlay_helper_enter();
         PG_TRY();
         {
             if (pushed_snap_)
-                PushActiveSnapshot(CurrentBranchContext->branch_main_snapshot);
+                PushActiveSnapshot(stmt_snap);
             ret = ob_spi_one_shot(sql.data, true, 0);
             if (pushed_snap_)
             {
@@ -596,6 +636,24 @@ overlay_scan_open(Relation rel, int32 branch_id,
         {
             TupleDesc       td_spi = SPI_tuptable->tupdesc;
             uint64          row;
+            int            *spi_col;    /* SPI result column per rel attribute; 0 = dropped */
+            int             spi_idx;
+
+            /* td_spi layout is (ctid, <non-dropped attributes in attnum
+             * order>).  Build the attribute->result-column map ONCE so a
+             * dropped column anywhere in the table cannot shift the columns
+             * that follow it. */
+            spi_col = (int *) palloc(sizeof(int) * natts);
+            spi_idx = 1;                /* result column 1 is the ctid */
+            for (row = 0; row < (uint64) natts; row++)
+            {
+                int att_i = (int) row;
+
+                if (TupleDescAttr(reldesc, att_i)->attisdropped)
+                    spi_col[att_i] = 0;
+                else
+                    spi_col[att_i] = ++spi_idx;
+            }
 
             /* The PK pushdown is no longer a point query: IN / range / OR
              * can match many MAIN rows, so materialise ALL of them (each in
@@ -606,6 +664,8 @@ overlay_scan_open(Relation rel, int32 branch_id,
                 TupleTableSlot *mslot;
                 ObMainRow      *mrow;
                 int             a;
+                bool            ctid_isnull;
+                Datum           ctid_d;
 
                 mslot = MakeSingleTupleTableSlot(st->slot_desc, &TTSOpsVirtual);
                 for (a = 0; a < natts; a++)
@@ -614,7 +674,13 @@ overlay_scan_open(Relation rel, int32 branch_id,
                     Form_pg_attribute   ratt = TupleDescAttr(reldesc, a);
                     Datum               d;
 
-                    d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
+                    if (spi_col[a] == 0)    /* dropped attribute */
+                    {
+                        mslot->tts_isnull[a] = true;
+                        mslot->tts_values[a] = (Datum) 0;
+                        continue;
+                    }
+                    d = SPI_getbinval(htup, td_spi, spi_col[a], &isnull);
                     mslot->tts_isnull[a] = isnull;
                     mslot->tts_values[a] = isnull
                                                ? (Datum) 0
@@ -622,7 +688,12 @@ overlay_scan_open(Relation rel, int32 branch_id,
                 }
                 ExecStoreVirtualTuple(mslot);
                 mslot->tts_nvalid = natts;
-                mslot->tts_tid = htup->t_self;
+
+                /* ACC-1: row identity comes from the projected ctid column,
+                 * NOT htup->t_self (which SPI leaves invalid). */
+                ctid_d = SPI_getbinval(htup, td_spi, 1, &ctid_isnull);
+                if (!ctid_isnull)
+                    mslot->tts_tid = *DatumGetItemPointer(ctid_d);
 
                 mrow = (ObMainRow *) palloc(sizeof(ObMainRow));
                 mrow->slot = mslot;
@@ -639,9 +710,8 @@ overlay_scan_open(Relation rel, int32 branch_id,
     {
         Snapshot snap;
 
-        if (CurrentBranchContext != NULL &&
-            CurrentBranchContext->branch_main_snapshot != NULL)
-            snap = CurrentBranchContext->branch_main_snapshot;
+        if (stmt_snap != NULL)
+            snap = stmt_snap;
         else
             snap = GetActiveSnapshot();
 
@@ -829,6 +899,11 @@ overlay_scan_next(OverlayScanState *st)
                                     match->op, match->key)));
                 output_slot = reconstruct_slot_from_delta(st->rel, match->tuple_data,
                                                           st->row_cxt);
+                /* ACC-1: keep the MAIN anchor ctid on the merged (delta) row.
+                 * A DML-target heap slot carries it into t_self so the ctid
+                 * system column resolves to the MAIN row (the overlay row has
+                 * no physical ctid of its own). */
+                output_slot->tts_tid = main_slot->tts_tid;
                 ExecDropSingleTupleTableSlot(main_slot);
                 match->emitted = true;
             }
@@ -1272,13 +1347,18 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         }
     }
 
-    /* B2 PRE-CHECK: MVP only inject CustomScan for pure SELECT.
-     * (Same logic as before, but now it's here, above the is_active() call
-     * to avoid unnecessary helper C entry for non-SELECT statements.) */
+    /* B2 PRE-CHECK: MVP injects CustomScan for pure SELECT, and (ACC-1) for
+     * the DML target baserel of an UPDATE/DELETE so the DML subplan reads
+     * overlay rows.  Every other non-SELECT command (INSERT, and the FROM/USING
+     * side of UPDATE ... FROM / DELETE ... USING, which is a non-target RTI)
+     * still bails out here.  Guarded by the same reason as before: this runs
+     * above the is_active() call to avoid an unnecessary helper C entry. */
     if (root->parse != NULL && root->parse->type == T_Query)
     {
         CmdType ct = ((Query *) root->parse)->commandType;
-        if (ct != CMD_SELECT)
+        if (ct != CMD_SELECT &&
+            ((ct != CMD_UPDATE && ct != CMD_DELETE) ||
+             rti != ((Query *) root->parse)->resultRelation))
             return;
     }
 
@@ -1646,15 +1726,33 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         /* 打包 custom_private（统一 Integer/String 包装）。
          * OID 用十进制字符串传递（PG List 的 Integer cell 是 int32，
          * 大 OID >INT32_MAX 会截断成负数，Executor 端 open rel 失败）。
-         * custom_private 扩展到 6 元素保持向后兼容：任何元素缺失
+         * custom_private 扩展到 8 元素保持向后兼容：任何元素缺失
          * Executor 端都安全回退到相应的全量路径。 */
         {
             List       *cpriv = NIL;
             int         pkflag;
             int         gwflag;
+            int32       plan_bid;
+            int         dml_target;
             char       *oid_cstr;
             pkflag = has_pk_pred ? 1 : 0;
             gwflag = has_general_where ? 1 : 0;
+            /* ACC-1: mark plans built for an UPDATE/DELETE DML target so the
+             * executor exposes a heap-backed scan slot (ctid system column
+             * must be retrievable).  Same predicate as the B2 pre-check. */
+            dml_target = 0;
+            if (root->parse != NULL && root->parse->type == T_Query)
+            {
+                Query *pq = (Query *) root->parse;
+                if ((pq->commandType == CMD_UPDATE ||
+                     pq->commandType == CMD_DELETE) &&
+                    rti == pq->resultRelation)
+                    dml_target = 1;
+            }
+            /* A1/A6 Stage 3: record the branch identity this plan was built
+             * for.  BeginCustomScan asserts that the executing statement is
+             * bound to the same branch (see ob_branchscan_begin). */
+            plan_bid = overlay_branch_get_current_id();
             oid_cstr = psprintf("%u", (unsigned) rte->relid);
             /* CRITICAL: makeString() stores the passed char* pointer
              * BY REFERENCE — it does NOT copy.  We MUST NOT pfree()
@@ -1695,6 +1793,12 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
             cpriv = lappend(cpriv,
                             makeString(pstrdup(
                                 (has_general_where && general_where_sql) ? general_where_sql : "")));
+            /* [6] Integer → plan-time branch id (0 = MAIN).  Consumed by the
+             * A1/A6 Stage 3 assertion in ob_branchscan_begin. */
+            cpriv = lappend(cpriv, makeInteger((int) plan_bid));
+            /* [7] Integer → dml_target (0/1, ACC-1).  Older plans carry 7
+             * elements; the executor treats a missing element as 0. */
+            cpriv = lappend(cpriv, makeInteger(dml_target));
             cpath->custom_private = cpriv;
         }
         if (pk_where_sql)
@@ -1869,8 +1973,20 @@ static Node *
 ob_branchscan_create_custom_scan_state(CustomScan *cscan)
 {
     ExtendedCustomScanState *ebs;
+    List       *cpriv = cscan->custom_private;
+    int         dml_target = 0;
 
-    (void) cscan;
+    /* ACC-1: custom_private[7] (Integer) marks an UPDATE/DELETE DML-target
+     * BranchScan.  Plans built before this element existed (7 entries) fall
+     * through to 0, i.e. the plain virtual-slot behaviour. */
+    if (list_length(cpriv) >= 8)
+    {
+        Node *nde = list_nth(cpriv, 7);
+
+        if (nde != NULL && IsA(nde, Integer))
+            dml_target = intVal(nde);
+    }
+
     ebs = (ExtendedCustomScanState *) palloc0(sizeof(ExtendedCustomScanState));
     /* Tag the embedded CustomScanState as T_CustomScanState.  We
      * can't use makeNode() because it allocates exactly
@@ -1878,11 +1994,19 @@ ob_branchscan_create_custom_scan_state(CustomScan *cscan)
     NodeSetTag(&ebs->css, T_CustomScanState);
     ebs->css.methods = &ob_branchscan_exec_methods;
     /* slotOps NULL lets ExecInitCustomScan default to TTSOpsVirtual
-     * (nodeCustom.c L69-70), which is what we want. */
-    ebs->css.slotOps = NULL;
+     * (nodeCustom.c L69-70).  For a DML target we need a heap-backed slot
+     * instead: the row-identity ctid is a system column and only
+     * heap_getsysattr() can deliver it (tts_virtual_getsysattr raises
+     * "cannot retrieve a system column in this context").  See
+     * doc/branchscan.md Part F.4. */
+    if (dml_target)
+        ebs->css.slotOps = &TTSOpsHeapTuple;
+    else
+        ebs->css.slotOps = NULL;
     /* custom_ps starts NIL; no child PlanState subtrees.  Begin fills
      * ExtendedCustomScanState private fields. */
     ebs->css.custom_ps = NIL;
+    ebs->dml_target = (dml_target != 0);
     return (Node *) ebs;
 }
 
@@ -1941,7 +2065,7 @@ ob_overlay_srf_open(Oid relid, int32 branch_id, MemoryContext result_cxt)
     h->rel = table_open(relid, AccessShareLock);
     h->st  = overlay_scan_open(h->rel, branch_id,
                                false, NULL, NULL, false, NULL,
-                               NULL, NULL, result_cxt);
+                               NULL, NULL, false, result_cxt);
 
     h->cb.func = ob_srf_scan_reset_cb;
     h->cb.arg  = h;
@@ -2076,7 +2200,41 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
              ebs->general_where_sql ? ebs->general_where_sql : "(null)");
     }
 
-    branch_id = overlay_branch_get_current_id();
+    /* A1/A6: branch identity comes from the statement-level bind performed
+     * in overlay_ExecutorStart, not from the live global. */
+    {
+        BranchExecContext *ectx = ob_get_exec_context();
+
+        branch_id = (ectx != NULL) ? ectx->bid : overlay_branch_get_current_id();
+    }
+
+    /* A1/A6 Stage 3 — cached-plan branch identity contract.
+     *
+     * The plan records the branch id it was built for (custom_private[6]).
+     * R07 already invalidates cached plans on every branch enter/exit, so a
+     * plan is normally re-planned (and re-stamped) before it can be reused
+     * under a different branch.  This assertion is the backstop for any path
+     * that misses that invalidation: rather than silently returning another
+     * branch's overlay (or MAIN's rows), refuse loudly.  A plan carrying no
+     * stamp (older/lower element count) is skipped for compatibility. */
+    if (list_length(cpriv) >= 7)
+    {
+        Node *nde = list_nth(cpriv, 6);
+
+        if (nde != NULL && IsA(nde, Integer))
+        {
+            int         plan_bid = intVal(nde);
+
+            if (plan_bid != (int) branch_id)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("overlay_branch: cached plan branch identity mismatch "
+                                "(plan built for branch %d, statement bound to branch %d)",
+                                plan_bid, branch_id),
+                         errhint("Re-plan the statement after switching branches; "
+                                 "a cached plan must not be reused across a branch change.")));
+        }
+    }
 
     /* ----- LAZY OPEN -----
      * PG 17's ExecInitCustomScan calls BeginCustomScan unconditionally
@@ -2141,6 +2299,7 @@ ob_branchscan_exec(CustomScanState *node)
                                       ebs->general_where_sql,
                                       node->ss.ps.qual,
                                       node->ss.ps.ps_ExprContext,
+                                      ebs->dml_target,
                                       ebs->scan_cxt);
 
 next_tuple:
@@ -2150,41 +2309,79 @@ next_tuple:
     if (src == NULL)
         return NULL;
 
-    /* Copy src -> ss.ss_ScanTupleSlot.  dst is already initialized by
-     * PG ExecInitCustomScan with the scan relation's physical tupdesc
-     * (all columns).  We always copy ALL columns from src into dst
-     * regardless of the query's requested projection because the
-     * scan-level projection (ProjInfo) is applied below via
-     * ExecProject() to produce the plan node's final output slot. */
     ExecClearTuple(dst);
     natts = dst->tts_tupleDescriptor->natts;
-    for (int a = 0; a < natts; a++)
-    {
-        bool                sisnull;
-        Datum               sd;
-        Form_pg_attribute   dstatt;
 
-        if (a >= src->tts_tupleDescriptor->natts)
-        {
-            dst->tts_isnull[a] = true;
-            continue;
-        }
-        sd = slot_getattr(src, (AttrNumber)(a + 1), &sisnull);
-        dst->tts_isnull[a] = sisnull;
-        if (!sisnull)
-        {
-            /* RD-3: use the attribute's own attlen/attbyval (kept in sync
-             * with pg_type) instead of a per-column get_typlenbyval()
-             * syscache round trip on every emitted row. */
-            dstatt = TupleDescAttr(dst->tts_tupleDescriptor, a);
-            sd = datumCopy(sd, dstatt->attbyval, dstatt->attlen);
-            dst->tts_values[a] = sd;
-        }
-        else
-            dst->tts_values[a] = (Datum) 0;
+    if (ebs->dml_target)
+    {
+        /* ACC-1: heap-backed scan slot.  The DML subplan carries the row
+         * identity as a ctid system-column Var; only heap-backed slots can
+         * deliver system columns (tts_virtual_getsysattr ERRORS), so we form
+         * a HeapTuple from src's fully-deformed attributes and carry the MAIN
+         * anchor ctid (src->tts_tid) in t_self.  Handed over with
+         * shouldFree=true, so at most one is live and the next
+         * ExecClearTuple(dst) releases it.
+         *
+         * Allocated in es_query_cxt, NOT ebs->scan_cxt: this slot is
+         * registered in estate->es_tupleTable and ExecResetTupleTable()
+         * (from ExecEndPlan) clears it AFTER overlay_branchscan_end has
+         * already MemoryContextDelete'd scan_cxt.  Allocating in scan_cxt
+         * would leave the tuple dangling and turn that clear into a
+         * double-free (BogusFree).  es_query_cxt outlives both. */
+        MemoryContext oldcxt;
+        HeapTuple     htup;
+
+        slot_getallattrs(src);
+        oldcxt = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+        htup = heap_form_tuple(dst->tts_tupleDescriptor,
+                               src->tts_values, src->tts_isnull);
+        MemoryContextSwitchTo(oldcxt);
+        if (ItemPointerIsValid(&src->tts_tid))
+            htup->t_self = src->tts_tid;
+        ExecStoreHeapTuple(htup, dst, true);
+        /* De-form the heap tuple into tts_values/tts_isnull.  The scan-level
+         * qual below (and any projection column Var) was compiled against a
+         * VIRTUAL scan slot, so ExecComputeSlotInfo() elided the
+         * EEOP_SCAN_FETCHSOME step; without this the qual would read stale
+         * tts_values and silently filter overlay rows out (ACC-1 G2). */
+        slot_getallattrs(dst);
     }
-    ExecStoreVirtualTuple(dst);
-    dst->tts_nvalid = natts;
+    else
+    {
+        /* Copy src -> ss.ss_ScanTupleSlot.  dst is already initialized by
+         * PG ExecInitCustomScan with the scan relation's physical tupdesc
+         * (all columns).  We always copy ALL columns from src into dst
+         * regardless of the query's requested projection because the
+         * scan-level projection (ProjInfo) is applied below via
+         * ExecProject() to produce the plan node's final output slot. */
+        for (int a = 0; a < natts; a++)
+        {
+            bool                sisnull;
+            Datum               sd;
+            Form_pg_attribute   dstatt;
+
+            if (a >= src->tts_tupleDescriptor->natts)
+            {
+                dst->tts_isnull[a] = true;
+                continue;
+            }
+            sd = slot_getattr(src, (AttrNumber)(a + 1), &sisnull);
+            dst->tts_isnull[a] = sisnull;
+            if (!sisnull)
+            {
+                /* RD-3: use the attribute's own attlen/attbyval (kept in sync
+                 * with pg_type) instead of a per-column get_typlenbyval()
+                 * syscache round trip on every emitted row. */
+                dstatt = TupleDescAttr(dst->tts_tupleDescriptor, a);
+                sd = datumCopy(sd, dstatt->attbyval, dstatt->attlen);
+                dst->tts_values[a] = sd;
+            }
+            else
+                dst->tts_values[a] = (Datum) 0;
+        }
+        ExecStoreVirtualTuple(dst);
+        dst->tts_nvalid = natts;
+    }
 
     /* Reset per-tuple expr context so quals / projection have a clean
      * slate for this tuple. */

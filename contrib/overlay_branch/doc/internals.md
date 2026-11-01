@@ -257,11 +257,15 @@ DDL guard（`overlay_guard_ddl_ok_for_branch`）拦截 CREATE/ALTER/DROP/TRUNCAT
 
 ### 4.6 old_version token 生成
 
-`overlay_tuple_version`（[delta_store.c:1094](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c#L1094)）：
+R15/R18 的乐观 CAS token 是 `<blk>:<off>-x<xmin>`，格式化与解析有唯一 codec（声明见 `include/overlay_branch.h`），三端共用：
 
-1. 从 junk slot 取 ctid
-2. 走 `ob_in_overlay_helper` 下的 SPI `SELECT ctid::text, xmin::text FROM rel WHERE ctid = '...'`
-3. 组装 `blk:off-x<xmin>` 格式 token
+- **写路径** `overlay_tuple_version`（[delta_store.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/delta_store.c)）：从 junk slot 取 ctid → `ob_in_overlay_helper` 下的 SPI `SELECT ctid::text, xmin::text FROM rel WHERE ctid = $1::tid` → `overlay_base_ver_format()` 组装 token。
+- **apply** `ob_fetch_main_version`（[branch_lifecycle.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_lifecycle.c)）：同一 SQL 形状（加 `FOR UPDATE`）→ 同一 `overlay_base_ver_format()`。
+- **读路径** `ob_anchor_is_stale`（[branch_scan.c](file:///home/ubuntu/work/postgres/contrib/overlay_branch/src/branch_scan.c)）：keyless 锚点新鲜度校验，用 `overlay_base_ver_parse_xmin()` 反解 xmin。
+
+`overlay_base_ver_parse_ctid()` 承担 `ctid::text` 的 `(blk,off)` 解析。producer / consumer 不再各自维护格式串，避免形状漂移。
+
+token 语义是「**该次写入所用 pre-image 的 MAIN 版本**」：纯 delta 行的重复写复用既有 `old_version`（基线不动）；MAIN-present 行的 pre-image 取自 **overlay 行（MAIN⊕delta）**（ACC-1 后 DML 子计划对 `resultRelation` 也注入 BranchScan，分支内连续 UPDATE 的表达式以 overlay 视图值为基准），但 token 的锚点仍是 MAIN 行的物理 `ctid + xmin`，MAIN 在两次分支写之间移动会重新基线化 token——见 tracker `ACC-1`。
 
 ### 4.7 junk attr 映射
 
@@ -294,7 +298,13 @@ session-local bid→mode HTAB 替代旧的 catalog `UPDATE pg_branch.mode`，消
 
 每次 enter/leave branch 后调用 `CacheInvalidateRelcacheAll()` + `CommandEndInvalidationMessages()`，强制 PREPARE 语句下次 EXECUTE 重新规划，注入或移除 BranchScan。
 
-### 4.14 ACL 双层防御
+### 4.14 cached plan branch identity stamp（A1/A6 Stage 3）
+
+planner hook 打包 `CustomScan.custom_private` 时追加 `[6] = Integer`，记录**该计划被规划时所处的 branch id**（`overlay_branch_get_current_id()`，0 = MAIN）。执行期 `ob_branchscan_begin` 在解析出本语句绑定 bid 后比对该 stamp：不一致即 `ereport(ERROR)`（0A000，`ERRCODE_FEATURE_NOT_SUPPORTED`）。元素缺失（旧计划）跳过校验。
+
+这是 R07 失效的**兜底断言**：正常跨分支复用由 §4.13 的 invalidation 在更早处强制 replan 并重新打 stamp；一旦某条路径漏掉失效，本断言把「静默读错分支 overlay」变成响亮报错，而非伪重规划（PostgreSQL 不允许在 `ExecutorStart` 内重新规划）。回归见 [overlay_branch_execcontext.sql](file:///home/ubuntu/work/postgres/contrib/overlay_branch/test/regress/sql/overlay_branch_execcontext.sql) `EC.7`。
+
+### 4.15 ACL 双层防御
 
 - **Layer 1（SQL）**：lifecycle 函数 `REVOKE EXECUTE TO PUBLIC`，仅 owner + `overlay_branch_administrators` 角色
 - **Layer 2（C）**：`ob_acl_check_lifecycle` 在每个 wrapper 内再次校验，防止直接 `@extschema@.qualification` 绕过
@@ -305,11 +315,11 @@ session-local bid→mode HTAB 替代旧的 catalog `UPDATE pg_branch.mode`，消
 | USE（退出）| 恒允许 |
 | USE（进入）/ APPLY / DISCARD | superuser 或 mgmt 角色 或 branch owner |
 
-### 4.15 apply/discard 幂等拒绝
+### 4.16 apply/discard 幂等拒绝
 
 已 `discarded` 或 `applied` 的分支再次 discard 报 55000，不可重复操作。
 
-### 4.16 publication 泄漏检查（G06）
+### 4.17 publication 泄漏检查（G06）
 
 create_branch 时 throttled 检测是否有 FOR ALL TABLES / 含 overlay_branch schema 的 publication，命中则 WARNING（逻辑复制会把 delta 表的变更复制到订阅端，破坏隔离）。
 
@@ -325,3 +335,5 @@ create_branch 时 throttled 检测是否有 FOR ALL TABLES / 含 overlay_branch 
 6. **跨 SPI 内存必须进 TopMemoryContext** — 防止 SPI_finish 后悬垂；且必须在 finish **之前**拷出，错误路径消息副本改用调用方上下文（见 §4.8）
 7. **use 不加锁，apply/discard 用 CAS** — 死锁自由
 8. **观察者不做破坏性清理** — kickout 只在 DML 路径执行
+9. **每语句绑定一次分支身份（A1/A6）** — 语句执行期不再回读可变全局；`bid` / `mode` / `stmt_snap` 从 `BranchExecContext` 取（`overlay_ExecutorStart` 在委派 `standard_ExecutorStart` **之前**绑定，存放于 backend-local 固定栈，**不**走 `es_query_cxt`）。错误中止会跳过 `ExecutorEnd`（`portalcmds.c : PortalCleanup`），故栈由事务回调 `ob_exec_ctx_reset()` 与子事务 `ABORT_SUB` 回调恢复。递归 bypass 标志 `ob_in_*` 与 `is_active()`（含 FR4 踢出）仍为 live，理由见 [design.md §第一层](design.md)
+10. **R15/R18 CAS token 单一来源** — `<blk>:<off>-x<xmin>` 的格式化与解析只走 `include/overlay_branch.h` 的 `overlay_base_ver_*` codec（见 §4.6）

@@ -115,6 +115,173 @@ int			ob_snapshot_max_hold_minutes = 10; /* 10 minutes = default */
  * ================================================================ */
 BranchContext *CurrentBranchContext = NULL;
 
+/* ================================================================
+ * A1/A6: per-statement branch identity (BranchExecContext)
+ *
+ * ob_exec_ctx_push()/pop() bracket every ExecutorStart/ExecutorEnd, so the
+ * innermost executing statement is always reachable via
+ * CurrentBranchExecContext.  The context is derived once, at push time, from
+ * the live CurrentBranchContext; read sites then consume the copy.
+ *
+ * The stack is a fixed backend-local array (no palloc, no free): executor
+ * nesting depth from SPI is a handful at most.  It only needs an explicit
+ * reset because PostgreSQL skips ExecutorEnd on error abort (see
+ * portalcmds.c PortalCleanup), so aborted statements would otherwise leak
+ * stack slots; ob_exec_ctx_reset() is driven from the transaction callback.
+ * ================================================================ */
+BranchExecContext *CurrentBranchExecContext = NULL;
+
+#define OB_EXEC_CTX_MAX_DEPTH	64
+static BranchExecContext ob_exec_ctx_stack[OB_EXEC_CTX_MAX_DEPTH];
+static void *ob_exec_ctx_owner[OB_EXEC_CTX_MAX_DEPTH];	/* QueryDesc*, parallel */
+static int	ob_exec_ctx_depth = 0;			/* number of slots in use */
+static int	ob_exec_ctx_overflow = 0;		/* pushes past OB_EXEC_CTX_MAX_DEPTH */
+
+/* Subtransaction bookkeeping: depth at each open subxact level, so an
+ * aborted subxact can drop every statement it started. */
+#define OB_SUBXACT_MAX_LEVEL	64
+static int	ob_subxact_saved_depth[OB_SUBXACT_MAX_LEVEL];
+static int	ob_subxact_level = 0;
+
+static void
+ob_exec_ctx_push(void *owner)
+{
+	BranchExecContext *c;
+
+	if (ob_exec_ctx_depth < OB_EXEC_CTX_MAX_DEPTH)
+	{
+		c = &ob_exec_ctx_stack[ob_exec_ctx_depth];
+		ob_exec_ctx_owner[ob_exec_ctx_depth] = owner;
+		ob_exec_ctx_depth++;
+	}
+	else
+	{
+		/* Pathological nesting only: saturate on the top slot so the
+		 * matching pop stays balanced.  Never hit in practice. */
+		c = &ob_exec_ctx_stack[OB_EXEC_CTX_MAX_DEPTH - 1];
+		ob_exec_ctx_overflow++;
+	}
+
+	if (CurrentBranchContext != NULL && CurrentBranchContext->is_active)
+	{
+		c->bid = CurrentBranchContext->branch_id;
+		strlcpy(c->mode, CurrentBranchContext->mode, sizeof(c->mode));
+		c->stmt_snap = CurrentBranchContext->branch_main_snapshot;
+	}
+	else
+	{
+		c->bid = 0;
+		strlcpy(c->mode, BRANCH_MODE_LIVE, sizeof(c->mode));
+		c->stmt_snap = NULL;
+	}
+
+	CurrentBranchExecContext = c;
+}
+
+/* Unwind down to (and including) the entry owned by `owner`.  Statements
+ * that aborted before ExecutorEnd never popped themselves, so entries above
+ * the match are leaked ones and are dropped here as well. */
+static void
+ob_exec_ctx_unwind(void *owner)
+{
+	int			i;
+
+	if (ob_exec_ctx_overflow > 0)
+		ob_exec_ctx_overflow--;
+	else
+	{
+		for (i = ob_exec_ctx_depth - 1; i >= 0; i--)
+		{
+			if (ob_exec_ctx_owner[i] == owner)
+			{
+				ob_exec_ctx_depth = i;
+				break;
+			}
+		}
+	}
+
+	CurrentBranchExecContext = (ob_exec_ctx_depth > 0)
+		? &ob_exec_ctx_stack[ob_exec_ctx_depth - 1]
+		: NULL;
+}
+
+static void
+ob_exec_ctx_reset(void)
+{
+	ob_exec_ctx_depth = 0;
+	ob_exec_ctx_overflow = 0;
+	ob_subxact_level = 0;
+	CurrentBranchExecContext = NULL;
+}
+
+/* PostgreSQL skips ExecutorEnd on error abort (portalcmds.c PortalCleanup),
+ * so aborted statements cannot pop themselves.  A subtransaction abort drops
+ * every statement started since that savepoint; a transaction end drops all
+ * of them. */
+static void
+ob_exec_ctx_xact_cb(XactEvent event, void *arg)
+{
+	(void) arg;
+
+	switch (event)
+	{
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PREPARE:
+			ob_exec_ctx_reset();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+ob_exec_ctx_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
+					   SubTransactionId parentSubid, void *arg)
+{
+	(void) mySubid;
+	(void) parentSubid;
+	(void) arg;
+
+	switch (event)
+	{
+		case SUBXACT_EVENT_START_SUB:
+			if (ob_subxact_level < OB_SUBXACT_MAX_LEVEL)
+				ob_subxact_saved_depth[ob_subxact_level] = ob_exec_ctx_depth;
+			ob_subxact_level++;
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			if (ob_subxact_level > 0)
+				ob_subxact_level--;
+			break;
+		case SUBXACT_EVENT_ABORT_SUB:
+			if (ob_subxact_level > 0)
+			{
+				ob_subxact_level--;
+				if (ob_subxact_level < OB_SUBXACT_MAX_LEVEL)
+				{
+					ob_exec_ctx_depth = ob_subxact_saved_depth[ob_subxact_level];
+					if (ob_exec_ctx_depth > OB_EXEC_CTX_MAX_DEPTH)
+						ob_exec_ctx_depth = OB_EXEC_CTX_MAX_DEPTH;
+					ob_exec_ctx_overflow = 0;
+					CurrentBranchExecContext = (ob_exec_ctx_depth > 0)
+						? &ob_exec_ctx_stack[ob_exec_ctx_depth - 1] : NULL;
+				}
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+BranchExecContext *
+ob_get_exec_context(void)
+{
+	return CurrentBranchExecContext;
+}
+
 /* ---------- Recursion guard flags (5-layer Bypass stack) ---------- */
 bool		ob_in_apply_operation = false;		/* extern: branch_lifecycle.c writes */
 bool		ob_in_guc_setconfig = false;		/* extern: branch_lifecycle.c writes */
@@ -432,6 +599,11 @@ _PG_init(void)
 
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = overlay_ProcessUtility;
+
+	/* A1/A6: keep the per-statement branch-identity stack consistent across
+	 * error aborts (ExecutorEnd is skipped on abort). */
+	RegisterXactCallback(ob_exec_ctx_xact_cb, NULL);
+	RegisterSubXactCallback(ob_exec_ctx_subxact_cb, NULL);
 
 	elog(DEBUG1, "overlay_branch: module loaded");
 
@@ -1164,6 +1336,11 @@ overlay_guard_ddl_ok_for_branch(Node *parsetree, char **operation,
 static void
 overlay_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	/* A1/A6: bind this statement's branch identity BEFORE the executor
+	 * initialises plan nodes, so BranchScan BeginCustomScan (which runs
+	 * inside standard_ExecutorStart) already sees the bound copy. */
+	ob_exec_ctx_push(queryDesc);
+
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -1203,6 +1380,11 @@ overlay_ExecutorEnd(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+
+	/* A1/A6: release the statement's bound identity.  ExecutorEnd is
+	 * skipped on error abort; the transaction/subtransaction callbacks
+	 * clean the stack up in that case. */
+	ob_exec_ctx_unwind(queryDesc);
 }
 
 static void
@@ -1849,7 +2031,14 @@ overlay_main_plus_delta(PG_FUNCTION_ARGS)
 		}
 		table_close(rel, AccessShareLock);
 
-		branch_id = overlay_branch_get_current_id();
+		/* A1/A6: use the identity bound for this statement rather than
+		 * re-reading the live global. */
+		{
+			BranchExecContext *ectx = ob_get_exec_context();
+
+			branch_id = (ectx != NULL) ? ectx->bid
+									   : overlay_branch_get_current_id();
+		}
 
 		overlay_overlay_helper_enter();
 		PG_TRY();

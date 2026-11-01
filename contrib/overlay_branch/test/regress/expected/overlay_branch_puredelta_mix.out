@@ -141,9 +141,9 @@ SET client_min_messages = WARNING;
 RESET overlay_branch.current;
 /* =========================================================== Section L */
 -- =====================================================================
--- ===== Section L: pure delta UPDATE (MVP-out-of-scope: SET projection
--- =====            for reconstructed pure-delta slot is not wired yet;
--- =====            assert WR is SAFE NO-OP, NOT silent data corruption)
+-- ===== Section L: pure delta UPDATE (ACC-1 wires SET projection over
+-- =====            the reconstructed overlay row and applies an explicit
+-- =====            WHERE to pure-delta rows)
 -- =====================================================================
 CREATE TABLE public.bs_L_upd (id INT4 PRIMARY KEY, payload TEXT, score INT4);
 INSERT INTO public.bs_L_upd VALUES (1,'main-a', 10),(2,'main-b', 20);
@@ -185,18 +185,18 @@ FROM public.bs_L_upd WHERE id = 11;
  PASS:L2_UPD_PK_EQ_APPLIED
 (1 row)
 
--- L.3 Pure delta UPDATE WHERE id IN (...): ScalarArrayOpExpr is NOT
---     decomposed into PK-equality qual by the current MVP qual decomposer,
---     so the MVP no-qual guard correctly makes it a SAFE NOP for rows 12
---     and 13.  Row 11 was already updated by L.2.
+-- L.3 Pure delta UPDATE WHERE id IN (...): ACC-1 evaluates an explicit
+--     WHERE against every reconstructed pure-delta row, so the matching
+--     rows 12 and 13 are updated and the unmatched 9999 is a no-op.
+--     Row 11 was already updated by L.2.
 UPDATE public.bs_L_upd SET payload = 'WRONG' WHERE id IN (12, 13, 9999);
-SELECT CASE WHEN string_agg(id::text||':'||payload, ',' ORDER BY id) = '11:pd-c-UPD,12:pd-d,13:pd-e'
-            THEN 'PASS:L3_UPD_PK_IN_NOP_SAFE'
+SELECT CASE WHEN string_agg(id::text||':'||payload, ',' ORDER BY id) = '11:pd-c-UPD,12:WRONG,13:WRONG'
+            THEN 'PASS:L3_UPD_PK_IN_APPLIED'
             ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||payload, ',' ORDER BY id),'NULL') END AS l3_nop
 FROM public.bs_L_upd WHERE id IN (11,12,13);
-           l3_nop           
-----------------------------
- PASS:L3_UPD_PK_IN_NOP_SAFE
+          l3_nop           
+---------------------------
+ PASS:L3_UPD_PK_IN_APPLIED
 (1 row)
 
 -- L.4 Verify MAIN rows untouched.
@@ -574,7 +574,7 @@ RESET overlay_branch.current;
 -- =====================================================================
 -- ===== Section P: EMPTY MAIN heap — pure delta 100% of rows
 -- =====            (MAIN has zero rows; overlay consists entirely of
--- =====             pure delta INSERTs, then UPDATE (MVP NOP) / DELETE,
+-- =====             pure delta INSERTs, then UPDATE / DELETE,
 -- =====             BranchScan reads correctly, apply propagates)
 -- =====================================================================
 CREATE TABLE public.bs_P (id INT4 PRIMARY KEY, t TEXT);
@@ -607,9 +607,9 @@ SELECT CASE WHEN string_agg(id::text||':'||t, ',' ORDER BY id) = '1:one,3:three'
             THEN 'PASS:P2_DELETE_2_OF_4_ON_EMPTY_MAIN'
             ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||t, ',' ORDER BY id),'NULL') END AS p2_del
 FROM public.bs_P;
-             p2_del              
----------------------------------
- FAIL:1:one,2:two,3:three,4:four
+               p2_del                
+-------------------------------------
+ PASS:P2_DELETE_2_OF_4_ON_EMPTY_MAIN
 (1 row)
 
 -- P.3 RETURNING delete id=3
@@ -623,9 +623,9 @@ SELECT CASE WHEN string_agg(id::text||':'||t, ',' ORDER BY id) = '1:one'
             THEN 'PASS:P3_RETURNING_DELETE_3'
             ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||t, ',' ORDER BY id),'NULL') END AS p3_ret
 FROM public.bs_P;
-         p3_ret          
--------------------------
- FAIL:1:one,2:two,4:four
+           p3_ret           
+----------------------------
+ PASS:P3_RETURNING_DELETE_3
 (1 row)
 
 -- P.4 apply: MAIN should now have id=1 only
@@ -640,9 +640,9 @@ SELECT CASE WHEN string_agg(id::text||':'||t, ',' ORDER BY id) = '1:one'
             THEN 'PASS:P4_APPLY_PROPAGATED_1_ROW'
             ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||t, ',' ORDER BY id),'NULL') END AS p4_app
 FROM public.bs_P;
-         p4_app          
--------------------------
- FAIL:1:one,2:two,4:four
+             p4_app             
+--------------------------------
+ PASS:P4_APPLY_PROPAGATED_1_ROW
 (1 row)
 
 DROP TABLE public.bs_P;
@@ -686,17 +686,18 @@ FROM public.bs_Q WHERE a >= 10;
 -- Q.2 WHERE a=20 (partial PK prefix filter, non-exact composite match)
 --     (still should hit the survivor)
 DELETE FROM public.bs_Q WHERE a = 20 RETURNING a, b, v;
- a | b | v 
----+---+---
-(0 rows)
+ a  |  b   | v 
+----+------+---
+ 20 | pd-c | C
+(1 row)
 
 SELECT CASE WHEN string_agg(a::text||':'||b||'='||v, ',' ORDER BY a, b) = '10:pd-a=A'
             THEN 'PASS:Q2_PREFIX_PK_DELETE_20'
             ELSE 'FAIL:'||COALESCE(string_agg(a::text||':'||b||'='||v, ',' ORDER BY a, b),'NULL') END AS q2_pfx
 FROM public.bs_Q WHERE a >= 10;
-          q2_pfx          
---------------------------
- FAIL:10:pd-a=A,20:pd-c=C
+           q2_pfx            
+-----------------------------
+ PASS:Q2_PREFIX_PK_DELETE_20
 (1 row)
 
 RESET overlay_branch.current;

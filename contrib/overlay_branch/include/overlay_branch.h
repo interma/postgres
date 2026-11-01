@@ -9,6 +9,7 @@
 #define OVERLAY_BRANCH_H
 
 #include "postgres.h"
+#include "access/transam.h"
 #include "miscadmin.h"
 #include "datatype/timestamp.h"
 #include "executor/tuptable.h"
@@ -145,6 +146,33 @@ typedef struct BranchContext
 	TimestampTz	invalidation_last_check;		/* FR4: throttle SPI re-checks */
 	TimestampTz	entered_at;						/* REVIEW-260926/R19: when use_internal last activated this ctx (snapshot TTL clock).  0 = not in snapshot mode. */
 } BranchContext;
+
+/* ----------
+ * BranchExecContext (A1/A6): per-statement branch identity.
+ *
+ * Bound exactly once per statement in overlay_ExecutorStart(), derived from
+ * CurrentBranchContext at bind time.  Read sites for the rest of the
+ * statement consult this read-only copy instead of re-deriving identity from
+ * mutable globals, so a statement cannot observe a torn branch identity via
+ * nested SPI, subtransaction rollback or cross-session kickout.
+ *
+ * Storage: a fixed, backend-local stack (no palloc; see ob_exec_ctx_push()).
+ * CurrentBranchExecContext always points at the innermost open statement,
+ * or NULL when no statement is executing.
+ *
+ * Deliberately NOT in this struct: the ob_in_* recursion bypass flags (they
+ * guard same-backend re-entrancy, which is inherently scoped to one
+ * statement) and is_active/kickout (FR4 must stay live).
+ * ----------
+ */
+typedef struct BranchExecContext
+{
+	int32		bid;			/* branch in effect; 0 = MAIN */
+	char		mode[16];		/* BRANCH_MODE_LIVE / BRANCH_MODE_SNAPSHOT */
+	struct SnapshotData *stmt_snap;	/* MAIN read snapshot; NULL = live */
+} BranchExecContext;
+
+extern BranchExecContext *ob_get_exec_context(void);
 
 /* ----------
  * TypedKey (REVIEW-260926/R14 MVP):
@@ -416,6 +444,30 @@ extern void		overlay_modify_delete(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_serialize_pk(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_serialize_tuple(Relation rel, TupleTableSlot *slot);
 extern char    *overlay_tuple_version(Relation rel, TupleTableSlot *slot);
+
+/* ----------
+ * Base-version token codec (A1/A6 stage 2, serves R15/R18).
+ *
+ * The optimistic CAS token that ties a delta row to the MAIN image it was
+ * first written against is the string "<blk>:<off>-x<xmin>".  It is produced
+ * by overlay_tuple_version() on the write path and by ob_fetch_main_version()
+ * at apply time, and parsed back by ob_anchor_is_stale() on the read path.
+ * Those three sites must agree byte-for-byte, so the shape lives here only:
+ * every producer calls overlay_base_ver_format(), every consumer calls one of
+ * the parse helpers.  Buffer size for the formatted token; the longest form
+ * ("4294967295:65535-x4294967295") is well under 32 bytes.
+ * ----------
+ */
+#define OB_BASE_VER_MAX		64
+
+extern bool		overlay_base_ver_parse_ctid(const char *ctid_txt,
+										   uint32 *blk, uint32 *off);
+extern void		overlay_base_ver_format(char *buf, size_t buflen,
+									   uint32 blk, uint32 off,
+									   const char *xmin_txt);
+extern bool		overlay_base_ver_parse_xmin(const char *token,
+										TransactionId *xmin_out);
+
 extern bool		overlay_relation_has_pk(Relation rel);
 extern char    *overlay_serialize_identity(Relation rel, TupleTableSlot *slot, char op);
 extern char    *overlay_anchor_key_from_ctid(const char *ctid_cstr);

@@ -468,20 +468,17 @@ SELECT CASE
        END AS adv_c4b_delete_gone;
 
 -- C.5 UPDATE ... RETURNING id, name_tag, newamt (MAIN-only id=5.
---     NOTE: for MVP WR subplan only scans MAIN heap (BranchScan injection is
---     disabled for CMD_UPDATE for safety per confirmed fact 3), so a
---     "consecutive double-UPDATE on the same row" e.g. UPDATE id=2 then
---     UPDATE id=2 AGAIN sees the MAIN baseline for the second pass, not the
---     just-written delta row.  This is documented MVP limitation.  Use id=5
---     here, which has not been touched since C3 (C3 set amt=500, name='five'
---     unchanged; MAIN baseline for id=5 is amt=5.00 name='five' → after
---     SET amt = amt + 1000 → junk slot amt=1005.00; merged post-UPDATE row
---     amt is 1005.  name stays 'five'.)
+--     ACC-1: the WR subplan now scans the OVERLAY row (MAIN ⊕ delta) as the
+--     pre-image, so a consecutive UPDATE on the same PK sees the branch's
+--     earlier edit, not the MAIN baseline.  id=5 was first updated in C.3
+--     (SET amt=500.00), so the branch delta holds amt=500.00; this UPDATE's
+--     SET amt = amt + 1000 therefore evaluates against 500.00 → 1500.00.
+--     name stays 'five'.)
 UPDATE public.bs_ret SET amt = amt + 1000 WHERE id IN (5)
 RETURNING id, ('name=' || name) AS name_tag, amt AS newamt;
 SELECT CASE
          WHEN string_agg(id::text||':'||('name='||name)||':'||amt::text, ',' ORDER BY id)
-              = '5:name=five:1005.00'
+              = '5:name=five:1500.00'
          THEN 'PASS:ADV_C5_UPDATE_RETURNING_EXPR'
          ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||('name='||name)||':'||amt::text, ',' ORDER BY id),'NULL')
        END AS adv_c5_update_expr

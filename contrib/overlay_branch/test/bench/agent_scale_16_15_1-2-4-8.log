@@ -1,0 +1,278 @@
+==== multi-agent concurrency-scaling probe (G05/S28) ====
+date        : 2026-11-01T02:13:45+00:00
+db          : ob_bench   port=55432   host=m4m-vm
+cpu         : 8 vCPU   mem: 9.7 GB
+MAIN_CLIENTS=16   DURATION=15s   M_LIST=[1 2 4 8]   REPEAT=4   WARMUP=5s   CONTROL=1
+max_conn    : 100
+topology    : one INDEPENDENT branch per Agent client (cross-branch)
+agent sql   : /home/ubuntu/workspace_ub/postgres/contrib/overlay_branch/test/bench/mixed_agent_own.sql
+control sql : /home/ubuntu/workspace_ub/postgres/contrib/overlay_branch/test/bench/mixed_agent_nobranch.sql
+
+warm-up: MAIN 16 x 5s ...
+
+---- Phase A #1 (MAIN=16 AGENT=0 15s) ----
+  pgbench MAIN : latency average = 2.009 ms
+  pgbench MAIN : tps = 7963.442382 (without initial connection time)
+  MAIN latency ms : p50=1.91  p95=3.09  p99=3.96
+  CPU busy %      : 49.4
+
+---- Phase B1 #1 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.084 ms
+  pgbench MAIN : tps = 7677.664459 (without initial connection time)
+  MAIN latency ms : p50=1.96  p95=3.24  p99=4.20
+  CPU busy %      : 59.3
+  AGENT           : p99=50.79 ms   tps=34.474662
+
+---- Phase B2 #1 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.432 ms
+  pgbench MAIN : tps = 6578.512646 (without initial connection time)
+  MAIN latency ms : p50=2.28  p95=3.95  p99=5.04
+  CPU busy %      : 71.7
+  AGENT           : p99=54.25 ms   tps=62.658229
+
+---- Phase B4 #1 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 3.230 ms
+  pgbench MAIN : tps = 4953.642296 (without initial connection time)
+  MAIN latency ms : p50=2.90  p95=5.99  p99=7.89
+  CPU busy %      : 85.3
+  AGENT           : p99=74.13 ms   tps=101.317453
+
+---- Phase B8 #1 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 4.506 ms
+  pgbench MAIN : tps = 3550.914813 (without initial connection time)
+  MAIN latency ms : p50=3.95  p95=9.33  p99=12.33
+  CPU busy %      : 94.3
+  AGENT           : p99=122.80 ms   tps=137.934807
+
+---- Phase C1 #1 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.096 ms
+  pgbench MAIN : tps = 7633.094137 (without initial connection time)
+  MAIN latency ms : p50=1.98  p95=3.20  p99=4.15
+  CPU busy %      : 57.7
+  AGENT           : p99=12.17 ms   tps=149.959001
+
+---- Phase C2 #1 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.390 ms
+  pgbench MAIN : tps = 6695.357978 (without initial connection time)
+  MAIN latency ms : p50=2.21  p95=3.94  p99=5.38
+  CPU busy %      : 67.6
+  AGENT           : p99=14.88 ms   tps=266.183561
+
+---- Phase C4 #1 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 2.839 ms
+  pgbench MAIN : tps = 5636.129485 (without initial connection time)
+  MAIN latency ms : p50=2.56  p95=5.11  p99=6.63
+  CPU busy %      : 77.9
+  AGENT           : p99=19.64 ms   tps=421.669283
+
+---- Phase C8 #1 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 3.433 ms
+  pgbench MAIN : tps = 4660.624642 (without initial connection time)
+  MAIN latency ms : p50=3.02  p95=6.75  p99=8.81
+  CPU busy %      : 88.9
+  AGENT           : p99=32.65 ms   tps=569.721284
+
+---- Phase B1 #2 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.210 ms
+  pgbench MAIN : tps = 7241.096454 (without initial connection time)
+  MAIN latency ms : p50=2.05  p95=3.57  p99=4.61
+  CPU busy %      : 60.8
+  AGENT           : p99=51.63 ms   tps=31.680387
+
+---- Phase B2 #2 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.764 ms
+  pgbench MAIN : tps = 5788.559101 (without initial connection time)
+  MAIN latency ms : p50=2.58  p95=4.53  p99=5.99
+  CPU busy %      : 72.9
+  AGENT           : p99=64.03 ms   tps=60.179422
+
+---- Phase B4 #2 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 3.761 ms
+  pgbench MAIN : tps = 4254.431878 (without initial connection time)
+  MAIN latency ms : p50=3.30  p95=7.17  p99=10.27
+  CPU busy %      : 85.4
+  AGENT           : p99=83.03 ms   tps=93.508421
+
+---- Phase B8 #2 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 5.469 ms
+  pgbench MAIN : tps = 2925.685603 (without initial connection time)
+  MAIN latency ms : p50=4.58  p95=11.84  p99=18.08
+  CPU busy %      : 93.6
+  AGENT           : p99=148.35 ms   tps=125.284885
+
+---- Phase C1 #2 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.380 ms
+  pgbench MAIN : tps = 6722.569303 (without initial connection time)
+  MAIN latency ms : p50=2.26  p95=3.65  p99=4.96
+  CPU busy %      : 59.6
+  AGENT           : p99=14.11 ms   tps=131.528037
+
+---- Phase C2 #2 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.275 ms
+  pgbench MAIN : tps = 7034.482253 (without initial connection time)
+  MAIN latency ms : p50=2.04  p95=3.81  p99=6.25
+  CPU busy %      : 67.0
+  AGENT           : p99=19.26 ms   tps=266.515923
+
+---- Phase C4 #2 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 3.014 ms
+  pgbench MAIN : tps = 5308.256460 (without initial connection time)
+  MAIN latency ms : p50=2.62  p95=5.56  p99=8.11
+  CPU busy %      : 76.4
+  AGENT           : p99=26.49 ms   tps=392.191334
+
+---- Phase C8 #2 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 3.973 ms
+  pgbench MAIN : tps = 4027.555421 (without initial connection time)
+  MAIN latency ms : p50=3.26  p95=8.66  p99=12.47
+  CPU busy %      : 83.8
+  AGENT           : p99=41.49 ms   tps=488.947480
+
+---- Phase A #2 (MAIN=16 AGENT=0 15s) ----
+  pgbench MAIN : latency average = 2.182 ms
+  pgbench MAIN : tps = 7331.523584 (without initial connection time)
+  MAIN latency ms : p50=2.10  p95=3.13  p99=3.74
+  CPU busy %      : 49.6
+
+---- Phase B2 #3 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.677 ms
+  pgbench MAIN : tps = 5977.186609 (without initial connection time)
+  MAIN latency ms : p50=2.47  p95=4.34  p99=6.06
+  CPU busy %      : 72.1
+  AGENT           : p99=70.88 ms   tps=61.829536
+
+---- Phase B4 #3 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 3.205 ms
+  pgbench MAIN : tps = 4992.427685 (without initial connection time)
+  MAIN latency ms : p50=2.86  p95=5.90  p99=7.98
+  CPU busy %      : 84.1
+  AGENT           : p99=80.32 ms   tps=101.750697
+
+---- Phase B8 #3 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 4.273 ms
+  pgbench MAIN : tps = 3744.039414 (without initial connection time)
+  MAIN latency ms : p50=3.69  p95=8.81  p99=12.22
+  CPU busy %      : 92.4
+  AGENT           : p99=121.48 ms   tps=140.102879
+
+---- Phase C1 #3 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.350 ms
+  pgbench MAIN : tps = 6809.929510 (without initial connection time)
+  MAIN latency ms : p50=2.22  p95=3.53  p99=4.90
+  CPU busy %      : 59.1
+  AGENT           : p99=15.06 ms   tps=127.873700
+
+---- Phase C2 #3 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 2.509 ms
+  pgbench MAIN : tps = 6378.159859 (without initial connection time)
+  MAIN latency ms : p50=2.33  p95=3.99  p99=5.49
+  CPU busy %      : 67.2
+  AGENT           : p99=15.27 ms   tps=263.735474
+
+---- Phase C4 #3 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 2.848 ms
+  pgbench MAIN : tps = 5617.375176 (without initial connection time)
+  MAIN latency ms : p50=2.56  p95=5.09  p99=6.93
+  CPU busy %      : 76.5
+  AGENT           : p99=21.09 ms   tps=422.319305
+
+---- Phase C8 #3 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 3.461 ms
+  pgbench MAIN : tps = 4622.619580 (without initial connection time)
+  MAIN latency ms : p50=2.96  p95=6.95  p99=9.66
+  CPU busy %      : 84.5
+  AGENT           : p99=37.42 ms   tps=539.614821
+
+---- Phase A #3 (MAIN=16 AGENT=0 15s) ----
+  pgbench MAIN : latency average = 2.184 ms
+  pgbench MAIN : tps = 7326.551117 (without initial connection time)
+  MAIN latency ms : p50=2.09  p95=3.14  p99=3.77
+  CPU busy %      : 49.6
+
+---- Phase B1 #3 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 2.351 ms
+  pgbench MAIN : tps = 6806.758217 (without initial connection time)
+  MAIN latency ms : p50=2.22  p95=3.53  p99=4.67
+  CPU busy %      : 60.8
+  AGENT           : p99=56.90 ms   tps=32.916829
+
+---- Phase B4 #4 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 2.950 ms
+  pgbench MAIN : tps = 5423.814699 (without initial connection time)
+  MAIN latency ms : p50=2.50  p95=5.68  p99=9.09
+  CPU busy %      : 83.4
+  AGENT           : p99=101.44 ms   tps=112.322564
+
+---- Phase B8 #4 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 3.773 ms
+  pgbench MAIN : tps = 4240.842704 (without initial connection time)
+  MAIN latency ms : p50=3.16  p95=7.90  p99=11.39
+  CPU busy %      : 92.2
+  AGENT           : p99=108.83 ms   tps=160.951311
+
+---- Phase C1 #4 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 1.858 ms
+  pgbench MAIN : tps = 8613.108313 (without initial connection time)
+  MAIN latency ms : p50=1.79  p95=2.65  p99=3.87
+  CPU busy %      : 53.8
+  AGENT           : p99=7.95 ms   tps=212.207475
+
+---- Phase C2 #4 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 1.990 ms
+  pgbench MAIN : tps = 8039.644331 (without initial connection time)
+  MAIN latency ms : p50=1.87  p95=3.01  p99=4.61
+  CPU busy %      : 61.2
+  AGENT           : p99=9.56 ms   tps=421.392670
+
+---- Phase C4 #4 (MAIN=16 AGENT=4 15s) ----
+  pgbench MAIN : latency average = 2.299 ms
+  pgbench MAIN : tps = 6961.009878 (without initial connection time)
+  MAIN latency ms : p50=2.04  p95=4.31  p99=5.90
+  CPU busy %      : 69.9
+  AGENT           : p99=12.97 ms   tps=676.090604
+
+---- Phase C8 #4 (MAIN=16 AGENT=8 15s) ----
+  pgbench MAIN : latency average = 2.764 ms
+  pgbench MAIN : tps = 5788.774035 (without initial connection time)
+  MAIN latency ms : p50=2.34  p95=5.64  p99=7.77
+  CPU busy %      : 83.0
+  AGENT           : p99=29.71 ms   tps=660.083952
+
+---- Phase A #4 (MAIN=16 AGENT=0 15s) ----
+  pgbench MAIN : latency average = 1.954 ms
+  pgbench MAIN : tps = 8187.390175 (without initial connection time)
+  MAIN latency ms : p50=1.82  p95=2.93  p99=4.47
+  CPU busy %      : 47.3
+
+---- Phase B1 #4 (MAIN=16 AGENT=1 15s) ----
+  pgbench MAIN : latency average = 1.892 ms
+  pgbench MAIN : tps = 8455.721496 (without initial connection time)
+  MAIN latency ms : p50=1.79  p95=2.80  p99=4.26
+  CPU busy %      : 57.5
+  AGENT           : p99=46.33 ms   tps=36.453694
+
+---- Phase B2 #4 (MAIN=16 AGENT=2 15s) ----
+  pgbench MAIN : latency average = 1.971 ms
+  pgbench MAIN : tps = 8118.153704 (without initial connection time)
+  MAIN latency ms : p50=1.88  p95=3.00  p99=4.00
+  CPU busy %      : 69.6
+  AGENT           : p99=44.72 ms   tps=74.021002
+
+==== SUMMARY (medians over 4 interleaved rounds) ====
+  M = concurrent INDEPENDENT branch Agents;  A = M=0 baseline
+
+  case      MAIN tps     dTps%    p50 ms    p95 ms    p99 ms Agent p99 ms      CPU%  Agent tps
+  A          7647.48         -      2.00      3.11      3.87            -     49.50          -
+  B1         7459.38     -2.46      2.00      3.38      4.44        51.21     60.05      33.70
+  B2         6277.85    -17.91      2.38      4.14      5.52        59.14     71.90      62.24
+  B4         4973.03    -34.97      2.88      5.95      8.54        81.67     84.70     101.53
+  B8         3647.48    -52.30      3.82      9.07     12.28       122.14     93.00     139.02
+  C1         7221.51     -5.57      2.10      3.37      4.53        13.14     58.40     140.74
+  C2         6864.92    -10.23      2.12      3.88      5.44        15.07     67.10     266.35
+  C4         5626.75    -26.42      2.56      5.10      6.78        20.37     76.45     421.99
+  C8         4641.62    -39.31      2.99      6.85      9.23        35.03     84.15     554.67
+
+  NOTE: no pass/fail here -- G05 thresholds are still OPEN (S04/S24,
+        review_260926.md section 12.6).  Read the SHAPE: watch for a
+        superlinear p99 knee, a dTps% that turns sharply negative, or a
+        CPU% plateau -- not the absolute numbers.

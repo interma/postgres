@@ -1,0 +1,74 @@
+==== mixed foreground-impact baseline (G05/S28) ====
+date        : 2026-10-30T10:23:32+00:00
+db          : ob_bench   port=5432   host=m4m-vm
+cpucores    : 8   MAIN_CLIENTS=100  AGENT_CLIENTS=1  DURATION=30s  REPEAT=4  WARMUP=5s
+max_conn    : 200
+
+agent branch : mi_impact_3940609 (created fresh)
+agent sql    : /home/ubuntu/workspace_ub/postgres/contrib/overlay_branch/test/bench/mixed_agent.sql
+
+warm-up: MAIN 100 x 5s ...
+
+---- Phase A #1 (MAIN=100 AGENT=0 30s) ----
+  pgbench: latency average = 10.658 ms
+  pgbench: tps = 9383.042554 (without initial connection time)
+  MAIN latency ms : p50=10.10  p95=18.90  p99=24.96
+  CPU busy %      : 90.6
+
+---- Phase B #1 (MAIN=100 AGENT=1 30s) ----
+  pgbench: latency average = 9.184 ms
+  pgbench: tps = 10889.048408 (without initial connection time)
+  MAIN latency ms : p50=8.49  p95=17.46  p99=22.75
+  CPU busy %      : 90.6
+  AGENT p99 ms    : 171.03
+
+---- Phase B #2 (MAIN=100 AGENT=1 30s) ----
+  pgbench: latency average = 9.070 ms
+  pgbench: tps = 11025.239842 (without initial connection time)
+  MAIN latency ms : p50=8.44  p95=16.96  p99=21.85
+  CPU busy %      : 90.8
+  AGENT p99 ms    : 260.83
+
+---- Phase A #2 (MAIN=100 AGENT=0 30s) ----
+  pgbench: latency average = 9.796 ms
+  pgbench: tps = 10208.373436 (without initial connection time)
+  MAIN latency ms : p50=9.42  p95=17.09  p99=21.36
+  CPU busy %      : 90.5
+
+---- Phase A #3 (MAIN=100 AGENT=0 30s) ----
+  pgbench: latency average = 9.785 ms
+  pgbench: tps = 10220.128226 (without initial connection time)
+  MAIN latency ms : p50=9.40  p95=17.09  p99=21.31
+  CPU busy %      : 91.5
+
+---- Phase B #3 (MAIN=100 AGENT=1 30s) ----
+  pgbench: latency average = 9.005 ms
+  pgbench: tps = 11105.118688 (without initial connection time)
+  MAIN latency ms : p50=8.39  p95=16.80  p99=21.59
+  CPU busy %      : 91.9
+  AGENT p99 ms    : 238.99
+
+---- Phase B #4 (MAIN=100 AGENT=1 30s) ----
+  pgbench: latency average = 10.101 ms
+  pgbench: tps = 9900.041079 (without initial connection time)
+  MAIN latency ms : p50=9.30  p95=19.06  p99=25.63
+  CPU busy %      : 91.5
+  AGENT p99 ms    : 311.44
+
+---- Phase A #4 (MAIN=100 AGENT=0 30s) ----
+  pgbench: latency average = 9.784 ms
+  pgbench: tps = 10220.499274 (without initial connection time)
+  MAIN latency ms : p50=9.37  p95=17.17  p99=21.60
+  CPU busy %      : 90.5
+
+==== SUMMARY (medians over 4 interleaved rounds) ====
+  A = MAIN only        B = MAIN + branch Agent        C = MAIN + control (no branch)
+  MAIN tps    : A=10214.25  B=10957.14   delta=+7.27%
+  MAIN p50 ms : A=9.41  B=8.46
+  MAIN p95 ms : A=17.13  B=17.21
+  MAIN p99 ms : A=21.48  B=22.30   delta=+3.82%
+  CPU busy %  : A=90.55  B=91.15
+  AGENT p99 ms: (branch Agent) 249.91
+
+  NOTE: no pass/fail here -- G05 thresholds are still OPEN
+        (must be frozen by S04/S24; review_260926.md section 12.6).

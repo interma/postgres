@@ -169,5 +169,5 @@ SELECT discard_branch(branch_name) FROM stale;
 | G02 ACL double-defense editor/committer/reviewer 三权 | ✅ MVP subset 4 helper + 5 wrapper 顶部 gate | [agent_workflow.md §1 3 roles](file:///home/ubuntu/work/postgres/contrib/overlay_branch/doc/agent_workflow.md#L1) |
 | G03 FAIL → BLOCKED SOP 书面流程 | ✅ MANIFEST 写入（本文件 §G03） | [G03 流程图 + 决策卡 A4](#g03-发布门禁-fail--blocked-书面处置-sop)（需真实 FAIL case 演练 1 次后升级 ✅ FIXED） |
 | G04 13d time box + manifest | ✅ MANIFEST 写入（历史 104 人时归档 + M4+ 模板） | [G04 manifest](#g04-13-工作日104-人时时间盒-manifest)（需下一轮真实负责人填入后升级 ✅） |
-| G05 MAIN 业务 CPU/IO/锁影响预算（S28 指标） | ⚡ OPEN（无 100 并发 baseline） | 冻结：S24 前不进入生产；真实接入时再补 100 OLTP + 1 Agent 基线 P999 |
+| G05 MAIN 业务 CPU/IO/锁影响预算（S28 指标） | ⚡ OPEN（阈值未冻结；**100 并发 baseline 已产出并验证 harness 无偏**） | 冻结：S24 前不进入生产；阈值由 S24 冻结（需先选定部署与目标 MAIN workload）。baseline：`test/bench/run_mixed_impact.sh`（详见 [test/bench/README.md](../test/bench/README.md)）。同机 100 OLTP + 1 Agent：null test（M=0）delta -0.05% 证明 harness 无偏；canonical A/B delta +7.27%（正向，非 overlay 读路径成本），3-case 显示 gap 追踪「额外客户端写到哪」而非 Agent 负载本身——故仍缺可判定的阈值 |
 | G06 草稿传播范围策略（pg_hba / publication / 备份） | ✅ MANIFEST 写入 3 配置 + 1 RPO/RTO | [G06 配置 SOP](#g06-dba-配置-sop草稿不随复制备份传播范围策略)（需 DBA 实机演练 1 次升级 ✅ FIXED） |

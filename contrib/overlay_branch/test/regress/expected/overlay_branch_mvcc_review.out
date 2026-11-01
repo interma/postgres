@@ -611,29 +611,33 @@ SET client_min_messages = WARNING;
 -- =====   Section R_VERSION (REVIEW-260926 S14/S17 R15 + R18) =====
 -- =====================================================================
 -- Motivation: overlay_tuple_version(rel, slot) builds the optimistic-CAS
--- token from "(ctid,xmin)" pair only.  On PostgreSQL HOT (heap-only-tuple)
--- updates the row stays at the SAME ctid / SAME xmin (because it's the
--- same inserting transaction), so MAIN updates committed OUTSIDE the
--- branch between branch-write and branch-apply do NOT change the token —
--- token compare passes, apply replays and SILENTLY OVERWRITES the
--- concurrent MAIN update → UNDETECTED DATA LOSS.
+-- token from the "(ctid,xmin)" pair only.  On PostgreSQL HOT
+-- (heap-only-tuple) updates the row stays at the SAME ctid / SAME xmin
+-- (same inserting transaction), so a MAIN update committed OUTSIDE the
+-- branch between branch-write and branch-apply could in principle leave
+-- the token constant.
 --
--- Guard: overlay_modify_update/delete now attach "_base" top-level key
--- to the tuple_data JSON blob containing the column values of MAIN at
--- the moment the branch wrote its UPDATE/DELETE.  apply_*_pass() runs a
--- SECONDARY check (apply_check_base_image_match) that re-locks the MAIN
--- row FOR UPDATE and compares the saved base image against the locked
--- MAIN current content using jsonb_object_agg(key, value ORDER BY key) —
--- mismatch raises 55000.
+-- PRIMARY guard (wired): the legacy token compare.  Any cross-session
+-- write to MAIN necessarily advances xmin (and usually ctid), so a token
+-- match means the branch's pre-image is still current.  CONFLICT-2 pins
+-- this down (non-HOT rewrite -> ctid/xmin move -> token mismatch -> 55000,
+-- MAIN race preserved).
 --
--- CONFLICT-1 verifies the new HOT-token-collision guard works:
---   MAIN baseline → create br_hot → branch UPDATE → exit → MAIN updates
---   the SAME row HOT-in-place (same ctid, same xmin) → re-enter branch
---   → apply → ERROR 55000 (guarded by _base match; token compare alone
---   would have allowed silent overwrite).
+-- SECONDARY guard (NOT wired in the current tree): overlay_modify_update /
+-- overlay_modify_delete were intended to attach a "_base" top-level key
+-- holding MAIN's column image at write time, with apply_*_pass() re-locking
+-- MAIN FOR UPDATE and comparing it (apply_check_base_image_match) before
+-- replay.  In the current code that write-side enrich has no caller
+-- (ob_delta_has_base_key returns early when the key is absent), so the
+-- _base comparison is effectively a NOP; the shared overlay_base_ver_*
+-- codec (see design.md / internals.md 4.6) is what keeps the token shape
+-- canonical across writer / apply / reader.
 --
--- CONFLICT-2 verifies the legacy xmin/ctid token compare guard still
--- catches the non-HOT rewrite case (MAIN update changes ctid/xmin).
+-- CONFLICT-1 therefore only exercises the HOT-collision SCENARIO; its
+-- preconditions (same ctid AND same xmin after the MAIN race) are a
+-- best-effort setup and may report INFO:R15_HOT_PREREQ_UNMET when the
+-- updater rewrites the tuple instead of going HOT-in-place.  The assertion
+-- that MUST hold regardless is CONFLICT-2's token-mismatch rejection.
 -- =====================================================================
 -- We use fillfactor=50 so the page has plenty of free space; this makes
 -- it extremely likely that MAIN's update of the row is stored as a
@@ -746,7 +750,7 @@ SELECT discard_branch('br_hot_conflict');
 -- Force a rewrite that changes xmin/ctid so the legacy token compare is
 -- the one that catches it.  This is the classic scenario (not R15-specific)
 -- but we include it here as a regression harness to ensure apply conflict
--- reporting still works end-to-end alongside the new _base guard.
+-- reporting still works end-to-end (this is the guard that is actually wired).
 UPDATE public.rv_t SET v = 'MAIN-pre-conflict2-' || id WHERE TRUE;  -- rewrite baseline
 ANALYZE public.rv_t;
 SELECT create_branch('br_token_conflict') AS id_br_token;
